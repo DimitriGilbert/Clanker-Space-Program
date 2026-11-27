@@ -1,7 +1,7 @@
 // Global balance constants. ALL tuning lives here (PLAN §8.3).
 // Named fields only — positional tuples drift silently under reordering.
 (
-    schema_version: 15,
+    schema_version: 17,
     // Physics bubble radius (PLAN §2.3): 20 km. Vessels go on rails at the
     // radius and rejoin at 90% (18 km) — the hysteresis is csp-sim logic,
     // not a second constant.
@@ -126,4 +126,28 @@
     // debit — mirrors the shipped `data/balance.ron` value.
     // Mirror: `csp_sim::economy::DEFAULT_COLONY_MODULE_REPAIR_FUNDS`.
     colony_module_repair_cost_funds: 5_000.0,
+    // Water physics: the ocean's density (kg/m³) and quadratic drag
+    // coefficient — mirror the shipped `data/balance.ron` values.
+    // Mirrors: `csp_phys::DEFAULT_WATER_DENSITY_KG_M3`,
+    // `csp_phys::DEFAULT_WATER_DRAG_CD`.
+    water_density_kg_m3: 1025.0,
+    water_drag_cd: 1.0,
+    // M4c landing: the touchdown absorption's crush distance (m) —
+    // mirrors the shipped `data/balance.ron` value.
+    // Mirror: `csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M`.
+    touchdown_crush_m: 0.5,
+    // §3.1 rule A: a deployed canopy steadies the craft that hangs from
+    // it with a couple proportional to its own pull — the restoring arm
+    // (m) turns the craft's axis onto the airflow, the damping (m·s)
+    // opposes its spin. Measured on the dry Stock Hopper (csp-sim's
+    // landing tests): 1.0 / 0.15 hang it within half a degree of the
+    // flow from every apogee from 20 km to 70 km and leave no spin at
+    // touchdown. A 2 m arm with 0.3 damping turns the stack so hard at
+    // the catch that the lower stack breaks off; with neither the stack
+    // swings under its canopy and tumbles in; and under a 0.3 m arm a
+    // pod alone hangs 10.5° off the flow where under 1 m it hangs 3.2°.
+    // Mirror: `csp_phys::DEFAULT_CANOPY_STEADY_ARM_M`,
+    // `DEFAULT_CANOPY_STEADY_DAMP_M_S`.
+    canopy_steady_arm_m: 1.0,
+    canopy_steady_damp_m_s: 0.15,
 )

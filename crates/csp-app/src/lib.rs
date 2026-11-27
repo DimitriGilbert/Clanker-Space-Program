@@ -9,6 +9,9 @@
 //!   target = warp.target_tick(clock, dt_wall)   // integer target
 //!   enqueue AdvanceTo(target)                   // §7.6: log is self-contained
 //!   Input → SimStep → Sync → Presentation → UiBuild → RenderExtract
+//!     (after SimStep: view.set_tick_fraction(warp.tick_fraction(reached))
+//!      — §2.5: Presentation draws each pose between its previous and
+//!      its current tick, so 60 fps over a 64 Hz sim does not hitch-step)
 //!   paint the UiBuild-produced FullOutput via egui-wgpu
 //! ```
 //!
@@ -51,7 +54,9 @@ use csp_render::{FRAME_LATENCY_MAX, FRAME_LATENCY_MIN, Gpu};
 use csp_view::flight::FlightEvent;
 use csp_view::map::MapKeyEvent;
 use csp_view::settings::{
-    KeyAction, RENDER_SCALE_MAX, RENDER_SCALE_MIN, Settings, UI_SCALE_MAX, UI_SCALE_MIN,
+    GraphicsSettings, KeyAction, ORBIT_SENSITIVITY_DEFAULT, ORBIT_SENSITIVITY_MAX,
+    ORBIT_SENSITIVITY_MIN, RENDER_SCALE_MAX, RENDER_SCALE_MIN, Settings, UI_SCALE_MAX,
+    UI_SCALE_MIN,
 };
 use csp_view::vab::VabEvent;
 use csp_view::{EventClass, ModeSelect, SimCommand, SourceClass, View, ViewMode};
@@ -92,7 +97,8 @@ const PROGRESSION_SOURCE_ID: u32 = 4;
 /// Map camera controls (M1-D, PLAN §5.1 R0): orbit-drag sensitivity is
 /// defined inside `csp_view::map` (`MapKeyEvent::Orbit` takes radians) —
 /// these are only the winit-side unit conversions.
-/// Radians of camera yaw/pitch per pixel of left-drag.
+/// Radians of camera yaw/pitch per pixel of left-drag at the default
+/// orbit sensitivity ([`orbit_delta`] scales it).
 const DRAG_RAD_PER_PX: f64 = 0.005;
 /// `ln` of the zoom factor per `MouseWheel::LineDelta` line.
 const ZOOM_LN_PER_LINE: f64 = 0.18;
@@ -223,6 +229,29 @@ impl FramePhaseSmoother {
         let present = self.present[..self.filled].iter().sum::<f64>() / n;
         Some((cpu, present))
     }
+}
+
+/// The orbit sensitivity the input layer applies — clamped into its
+/// range, with the same non-finite guard `ui_scale` gets: `f32::clamp`
+/// passes NaN, and a NaN gain would NaN every camera.
+fn orbit_sensitivity(graphics: &GraphicsSettings) -> f32 {
+    let raw = graphics.orbit_sensitivity;
+    if raw.is_finite() {
+        raw.clamp(ORBIT_SENSITIVITY_MIN, ORBIT_SENSITIVITY_MAX)
+    } else {
+        ORBIT_SENSITIVITY_DEFAULT
+    }
+}
+
+/// Pointer travel (logical px) of a left-drag → the orbit's yaw and
+/// pitch increments (rad): the one place the settings reach a camera
+/// drag. The sensitivity scales both axes, the invert flips the
+/// vertical one. At the defaults this is exactly [`DRAG_RAD_PER_PX`]
+/// per pixel on each axis.
+fn orbit_delta(dx_px: f64, dy_px: f64, graphics: &GraphicsSettings) -> (f64, f64) {
+    let gain = DRAG_RAD_PER_PX * f64::from(orbit_sensitivity(graphics));
+    let vertical = if graphics.invert_vertical { -1.0 } else { 1.0 };
+    (dx_px * gain, dy_px * gain * vertical)
 }
 
 /// Assemble the render-configuration log line — the support surface
@@ -539,6 +568,14 @@ struct App {
     /// the stale `AdvanceReport` from the pre-rebuild step is
     /// discarded rather than surfaced against the new world.
     world_rebuilt: bool,
+    /// Where a held session op stands against the loading screen
+    /// ([`Loading`]).
+    loading: Loading,
+    /// The frame that showed the window has been presented. The window
+    /// opens hidden ([`Self::create_window`]): what the player sees
+    /// first is a complete frame, never the clear colour or a
+    /// half-built scene.
+    window_shown: bool,
     /// Left-drag state for map camera orbit — pointer position at the
     /// last `CursorMoved`, and whether the left button is held.
     last_cursor: Option<(f64, f64)>,
@@ -867,6 +904,8 @@ impl App {
                 .join("saves"),
             session_op: None,
             world_rebuilt: false,
+            loading: Loading::Idle,
+            window_shown: false,
             last_cursor: None,
             map_dragging: false,
             lmb_press: None,
@@ -1243,9 +1282,13 @@ impl App {
         // `Resized` feeds `inner_size` straight back into it). A
         // hand-edited file with a degenerate size floors at 1 px.
         let [win_w, win_h] = self.settings.graphics.window_size;
+        // Hidden until a frame has been presented ([`Self::on_frame_presented`]).
+        // winit cannot hide a Wayland window — there the surface is
+        // simply not mapped until its first frame commits.
         let attrs = Window::default_attributes()
             .with_title("Clanker Space Program")
-            .with_inner_size(winit::dpi::PhysicalSize::new(win_w.max(1), win_h.max(1)));
+            .with_inner_size(winit::dpi::PhysicalSize::new(win_w.max(1), win_h.max(1)))
+            .with_visible(false);
 
         #[cfg(target_arch = "wasm32")]
         let attrs = {
@@ -1312,7 +1355,9 @@ impl App {
     /// [`csp_report_gpu_error`] so the demo shell can swap its loading
     /// screen for the styled fallback instead of hanging on a black
     /// canvas (the old path only `log::error!`ed — `init()` had long
-    /// resolved, so nothing ever reached JS).
+    /// resolved, so nothing ever reached JS). The page's loading screen
+    /// itself stays up until a frame has been presented
+    /// ([`Self::reveal`]).
     #[cfg(target_arch = "wasm32")]
     fn poll_gpu_init(&mut self) {
         let Some(rx) = &self.gpu_rx else {
@@ -1322,7 +1367,6 @@ impl App {
             Ok(Ok(gpu)) => {
                 self.gpu_rx = None;
                 self.finish_gpu_init(gpu);
-                csp_report_gpu_ready();
             }
             Ok(Err(e)) => {
                 self.gpu_rx = None;
@@ -1462,8 +1506,25 @@ impl App {
     /// The schedule half of the frame (§2.5): controller → commands →
     /// Input → SimStep → Sync → Presentation → UiBuild → RenderExtract.
     /// Ends with a complete `egui::FullOutput` staged for [`Self::paint`].
-    #[allow(clippy::too_many_lines)]
+    /// [`Self::advance_frame`] up to the drained boundary, then the
+    /// winit→egui bridge, then [`Self::finish_frame`].
     fn run_frame(&mut self, window: &Window, dt_wall: f64) {
+        self.advance_frame(dt_wall);
+        // Staged AFTER the drained boundary, not before it: a New Game
+        // there replaces the whole `View`, `EguiPass` included, and the
+        // loading screen that frame draws needs the real screen rect.
+        if let Some(egui_state) = &mut self.egui_state {
+            self.view.set_egui_input(egui_state.take_egui_input(window));
+        }
+        self.finish_frame();
+    }
+
+    /// The frame up to its drained boundary: last frame's panel
+    /// requests, the warp controller's target, the Input plumbing that
+    /// needs no window, one `sim_step`, and — on its success — the
+    /// queued session op. Window-free, so tests drive the real path.
+    #[allow(clippy::too_many_lines)]
+    fn advance_frame(&mut self, dt_wall: f64) {
         // UiBuild → next frame's Input (§2.5's accepted one-frame latency):
         // fold last frame's panel requests into the controller.
         let outbox = self.view.take_ui_outbox();
@@ -1531,11 +1592,7 @@ impl App {
             None
         };
 
-        // Input plumbing → resources the schedules consume. `take_egui_input`
-        // is the winit→egui bridge; the egui pass itself runs inside UiBuild.
-        if let Some(egui_state) = &mut self.egui_state {
-            self.view.set_egui_input(egui_state.take_egui_input(window));
-        }
+        // Input plumbing → resources the schedules consume.
         self.view.update_session(
             dt_wall * 1000.0,
             self.warp.requested_multiplier(),
@@ -1567,6 +1624,7 @@ impl App {
         // §2.5 order: Input → SimStep → Sync → Presentation → UiBuild →
         // RenderExtract. One sim_step call per frame, always.
         self.view.begin_frame();
+        let mut world_rebuilt = false;
         if let Some(target) = target {
             let step_start = Instant::now();
             match self.view.sim_step(target) {
@@ -1576,6 +1634,7 @@ impl App {
                     // run here; a world-replacing op discards the
                     // stale report rather than surfacing it.
                     self.run_session_op();
+                    world_rebuilt = self.world_rebuilt;
                     if self.world_rebuilt {
                         // The world under the warp controller was
                         // swapped (load/revert/new game): its banked
@@ -1612,6 +1671,15 @@ impl App {
         } else {
             self.last_tick_ms = 0.0;
         }
+        self.stage_tick_fraction(world_rebuilt);
+        // After `run_session_op`: New Game replaced the whole `View`,
+        // the mirror included.
+        self.view.set_loading(self.loading != Loading::Idle);
+    }
+
+    /// The frame past the drained boundary: the schedules from Sync to
+    /// RenderExtract, then the audio read of what they staged.
+    fn finish_frame(&mut self) {
         self.view.end_frame();
 
         // M10 audio (native only): the `FlightSfx` cue queue and the
@@ -1635,6 +1703,24 @@ impl App {
                 &self.settings.audio,
             );
         }
+    }
+
+    /// §2.5's interpolation input for the frame about to end: how far
+    /// past the tick the sim reached the warp accumulator sits — the
+    /// weight the view draws each pose between its previous and its
+    /// current tick with. Read whether or not this frame stepped: a
+    /// halted frame keeps handing over the last live remainder, so the
+    /// view holds the pose it froze on instead of jumping a tick. A
+    /// world swapped in this frame leaves the accumulator describing
+    /// the OLD world's clock — it names no fraction of the new one, so
+    /// the frame is handed none.
+    fn stage_tick_fraction(&mut self, world_rebuilt: bool) {
+        let frac = if world_rebuilt {
+            0.0
+        } else {
+            self.warp.tick_fraction(self.view.sim.clock().ticks())
+        };
+        self.view.set_tick_fraction(frac);
     }
 
     /// The Game menu / session-key verbs — drained from the outbox
@@ -1663,11 +1749,25 @@ impl App {
                 .flight_notice("saves are off while the session is read-only / in the web demo");
             return;
         }
+        // A world-replacing op stalls the frame it runs in: the
+        // loading screen goes up first ([`Loading`]).
+        if matches!(
+            op,
+            SessionOp::Load(_) | SessionOp::Revert | SessionOp::NewGame
+        ) {
+            self.loading = Loading::Presenting;
+        }
         self.session_op = Some(op);
     }
 
-    /// Apply this frame's queued session op at the drained boundary.
+    /// Apply this frame's queued session op at the drained boundary —
+    /// unless the loading screen's presenting frame is still to be
+    /// presented: the op then waits for the next boundary, under the
+    /// screen.
     fn run_session_op(&mut self) {
+        if self.loading == Loading::Presenting {
+            return;
+        }
         let Some(op) = self.session_op.take() else {
             return;
         };
@@ -2756,7 +2856,42 @@ impl App {
         if let Err(e) = gpu.device.poll(wgpu::PollType::Poll) {
             log::warn!("device poll failed: {e}");
         }
+        self.on_frame_presented(window);
         window.request_redraw();
+    }
+
+    /// A frame was presented. The first one shows the window, which
+    /// opened hidden so that this is what the player sees first.
+    fn on_frame_presented(&mut self, window: &Window) {
+        if !self.window_shown {
+            self.window_shown = true;
+            self.reveal(window);
+        }
+        self.presented();
+    }
+
+    /// What follows every presented frame: a held session op advances
+    /// one step, so the screen is on screen before the op stalls the
+    /// next frame — and lifts with the frame after it.
+    fn presented(&mut self) {
+        self.loading = match self.loading {
+            Loading::Presenting => Loading::Rebuilding,
+            _ => Loading::Idle,
+        };
+    }
+
+    /// Native: show the hidden window. The compositor holds the frame
+    /// just presented, so nothing blank precedes it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn reveal(&self, window: &Window) {
+        window.set_visible(true);
+    }
+
+    /// wasm: the canvas cannot be hidden — the page's own loading
+    /// screen covers it until this reports a presented frame.
+    #[cfg(target_arch = "wasm32")]
+    fn reveal(&self, _window: &Window) {
+        csp_report_gpu_ready();
     }
 
     /// One key-press event, resolved through the rebindable keymap
@@ -3779,10 +3914,8 @@ impl ApplicationHandler for App {
                     && self.map_dragging
                     && let Some(last) = self.last_cursor
                 {
-                    let (dyaw, dpitch) = (
-                        (pos.0 - last.0) * DRAG_RAD_PER_PX,
-                        (pos.1 - last.1) * DRAG_RAD_PER_PX,
-                    );
+                    let (dyaw, dpitch) =
+                        orbit_delta(pos.0 - last.0, pos.1 - last.1, &self.settings.graphics);
                     match self.view.mode() {
                         ViewMode::Map => self.view.map_event(MapKeyEvent::Orbit { dyaw, dpitch }),
                         ViewMode::Vab => self.view.vab_event(VabEvent::Orbit { dyaw, dpitch }),
@@ -4090,7 +4223,9 @@ pub fn run() {
 /// never propagate through `init()`'s promise — the page instead
 /// exposes `cspGpuInitFailed`/`cspGpuReady` hooks and reads the
 /// `__csp_gpu_*` globals this snippet sets. Both are set defensively:
-/// a page that only polls the globals still sees the outcome.
+/// a page that only polls the globals still sees the outcome. The
+/// ready half fires on the first presented frame, not on GPU init: the
+/// page's loading screen covers the canvas until there is a frame.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
     export function csp_report_gpu_error(msg) {
@@ -4109,7 +4244,8 @@ pub fn run() {
 extern "C" {
     /// Report a GPU-init failure to the page (reason string).
     fn csp_report_gpu_error(msg: &str);
-    /// Report that GPU init + renderer setup completed.
+    /// Report that a frame has been presented — the page's loading
+    /// screen comes down for it.
     fn csp_report_gpu_ready();
 }
 
@@ -4174,6 +4310,23 @@ enum SessionOp {
     Revert,
     /// Abandon the session and start a fresh world.
     NewGame,
+}
+
+/// The loading screen's progress around a world-replacing session op.
+/// The op stalls the frame it runs in — the whole `data/` tree and the
+/// backend's terrain bake for a new world, the restore for a snapshot —
+/// so it is held until the screen has been presented: one frame
+/// presents the screen, the next runs the op under it. The frame after
+/// that is the rebuilt world's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Loading {
+    /// Nothing is pending.
+    Idle,
+    /// Requested: this frame presents the screen, the op waits.
+    Presenting,
+    /// Presented: the op runs at this frame's drained boundary, under
+    /// the screen.
+    Rebuilding,
 }
 
 /// The `*.cspsave` slot-name rule — the craft-name rule's shape (no
@@ -4547,9 +4700,20 @@ mod tests {
             "no pad vessel at boot — the flight scene would be empty"
         );
         // …and the same craft is loaded in the VAB for editing —
-        // pod + tank + engine + canister + battery (W1.5-b).
+        // pod + tank + engine + canister + battery (W1.5-b) + the
+        // chute on the pod's top (M4c landing).
         app.view
-            .with_vab_session(|v| assert_eq!(v.session().len(), 5));
+            .with_vab_session(|v| assert_eq!(v.session().len(), 6));
+    }
+
+    /// Drive a queued world-replacing op the way the frame loop does:
+    /// the first drained boundary holds it for the loading screen's
+    /// presenting frame, that frame is presented, the next boundary
+    /// runs it under the screen.
+    fn run_session_op_under_the_screen(app: &mut App) {
+        app.run_session_op();
+        app.presented();
+        app.run_session_op();
     }
 
     /// C24-F1: the Game-menu verb, not just the constructor. The
@@ -4565,7 +4729,7 @@ mod tests {
         let dir = tempdir("new-game-op-seed");
         let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
         app.request_session_op(SessionOp::NewGame);
-        app.run_session_op();
+        run_session_op_under_the_screen(&mut app);
         app.view.begin_frame();
         app.view.sim_step(1).unwrap();
         app.view.end_frame();
@@ -4577,7 +4741,271 @@ mod tests {
         // …and the VAB session carries the starter craft, not a blank
         // editor (the seed's `seed_pad_craft` half).
         app.view
-            .with_vab_session(|v| assert_eq!(v.session().len(), 5));
+            .with_vab_session(|v| assert_eq!(v.session().len(), 6));
+    }
+
+    /// The frame's egui pass, flattened in paint order — `None` when
+    /// no pass was built.
+    fn frame_leaves(app: &mut App) -> Option<Vec<egui::Shape>> {
+        fn flat(shape: &egui::Shape, out: &mut Vec<egui::Shape>) {
+            match shape {
+                egui::Shape::Vec(inner) => inner.iter().for_each(|s| flat(s, out)),
+                s => out.push(s.clone()),
+            }
+        }
+        let mut out = app.view.take_ui_frame()?;
+        let mut leaves = Vec::new();
+        for clipped in &out.shapes {
+            flat(&clipped.shape, &mut leaves);
+        }
+        out.textures_delta.clear();
+        Some(leaves)
+    }
+
+    /// The line the frame's egui pass ended on, when that is the
+    /// loading screen — its backdrop and line are the last two shapes
+    /// drawn — else `None`.
+    fn screen_line_of(leaves: &[egui::Shape]) -> Option<String> {
+        match leaves
+            .len()
+            .checked_sub(2)
+            .map(|i| (&leaves[i], &leaves[i + 1]))
+        {
+            Some((egui::Shape::Rect(r), egui::Shape::Text(t)))
+                if r.fill == csp_ui::LOADING_BACKDROP =>
+            {
+                Some(t.galley.text().to_owned())
+            }
+            _ => None,
+        }
+    }
+
+    fn screen_line(app: &mut App) -> Option<String> {
+        screen_line_of(&frame_leaves(app)?)
+    }
+
+    /// The alpha the top bar's title was painted at — `None` on the
+    /// pass that lays it out, which paints nothing. egui fades a new
+    /// `Area` in by fading its colors, so the title's color reads how
+    /// far the entrance has run.
+    fn title_alpha(leaves: &[egui::Shape]) -> Option<u8> {
+        let title = leaves.iter().find_map(|shape| match shape {
+            egui::Shape::Text(text) if text.galley.text() == "Clanker Space Program" => Some(text),
+            _ => None,
+        })?;
+        Some(
+            title
+                .override_text_color
+                .unwrap_or(title.fallback_color)
+                .a(),
+        )
+    }
+
+    /// One presented frame of `run_frame` without its window: the
+    /// drained boundary, the egui input staged on the `View` that
+    /// boundary leaves — as the winit→egui bridge hands it over, the
+    /// session time so far as its clock stamp, and the window's rect —
+    /// the frame's end, and the presented edge. Returns the frame's
+    /// shapes.
+    fn host_frame(app: &mut App, time: &mut f64) -> Vec<egui::Shape> {
+        app.advance_frame(1.0 / 60.0);
+        app.view.set_egui_input(egui::RawInput {
+            time: Some(*time),
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            ..Default::default()
+        });
+        app.finish_frame();
+        app.presented();
+        *time += 1.0 / 60.0;
+        frame_leaves(app).expect("UiBuild ran")
+    }
+
+    /// The screen over a fresh `View` under the host's clock, from the
+    /// `View`'s first pass: the top bar's title alpha on every covered
+    /// frame, on the frame the screen lifted, and thirty frames later.
+    struct Entrance {
+        covered: Vec<Option<u8>>,
+        lift: Option<u8>,
+        settled: Option<u8>,
+    }
+
+    fn entrance(app: &mut App, time: &mut f64) -> Entrance {
+        let mut covered = Vec::new();
+        let lift = loop {
+            assert!(covered.len() < 64, "the screen never lifted");
+            let leaves = host_frame(app, time);
+            if screen_line_of(&leaves).is_some() {
+                covered.push(title_alpha(&leaves));
+            } else {
+                break title_alpha(&leaves);
+            }
+        };
+        let mut settled = None;
+        for _ in 0..30 {
+            settled = title_alpha(&host_frame(app, time));
+        }
+        Entrance {
+            covered,
+            lift,
+            settled,
+        }
+    }
+
+    /// The screen over a fresh `View` under the host's clock: up for
+    /// the first pass and the twelve that fade the panels in
+    /// (`Style::animation_time` is 0.2 s, a 1/60 s step a frame), the
+    /// lift decided on the frame after — so the top bar is at rest when
+    /// the screen lifts, and still fading on the third frame, where an
+    /// entrance counted from the host's epoch lifted.
+    fn assert_entrance(entrance: &Entrance) {
+        let settled = entrance
+            .settled
+            .expect("the title is drawn once the entrance is over");
+        assert_eq!(
+            entrance.covered.len(),
+            13,
+            "covered frames, the first pass and twelve of entrance: {:?}",
+            entrance.covered
+        );
+        assert!(
+            entrance.covered[1..11]
+                .iter()
+                .all(|alpha| alpha.is_some_and(|alpha| alpha < settled)),
+            "the top bar must still be fading under frames 2 to 11: {:?}",
+            entrance.covered
+        );
+        assert!(
+            entrance.covered[2].is_some_and(|alpha| alpha < settled / 2),
+            "on the third frame the top bar is more transparent than not: {:?}",
+            entrance.covered
+        );
+        assert_eq!(
+            entrance.covered[12],
+            Some(settled),
+            "the entrance is over on the thirteenth frame: {:?}",
+            entrance.covered
+        );
+        assert_eq!(
+            entrance.lift,
+            Some(settled),
+            "the screen lifted before the top bar was at rest"
+        );
+    }
+
+    /// The entrance is timed from where it starts, not from the host's
+    /// clock — after New Game, through the real host path. The winit→egui
+    /// bridge is created once and stamps every frame with the session
+    /// time so far; New Game replaces the `View` with a fresh egui
+    /// context that reads 0.0, so the rebuilt world's first pass is
+    /// stamped with the whole session. Counted as an age, that ended the
+    /// entrance on the second pass, and the third showed the HUD, the
+    /// top bar and the tutorial card fading in over the new scene. The
+    /// first pass is now where the entrance begins, whatever the stamp
+    /// — at startup too, where the stamp is the time spent before the
+    /// first frame.
+    #[test]
+    fn new_game_entrance_is_timed_from_its_first_pass() {
+        let dir = tempdir("new-game-entrance");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        // The host's clock: 1.5 s of init before the first frame.
+        let mut time = 1.5;
+        assert_entrance(&entrance(&mut app, &mut time));
+
+        app.request_session_op(SessionOp::NewGame);
+        // The presenting frame: the old world's, the screen up, the op
+        // held.
+        let leaves = host_frame(&mut app, &mut time);
+        assert!(matches!(app.session_op, Some(SessionOp::NewGame)));
+        assert_eq!(
+            screen_line_of(&leaves).as_deref(),
+            Some(csp_ui::LOADING_SESSION),
+            "the presenting frame is the loading screen"
+        );
+        // The next frame runs the op under the screen. Its stall took
+        // the host's clock to 100 s, and the rebuilt View's first pass
+        // is stamped with that.
+        time = 100.0;
+        let rebuilt = entrance(&mut app, &mut time);
+        assert!(app.session_op.is_none(), "the op ran under the screen");
+        assert!(
+            app.view.flight_focus().is_some(),
+            "the frames past the lift are the rebuilt world's — the starter craft on the pad"
+        );
+        assert_entrance(&rebuilt);
+    }
+
+    /// The in-frame cold load, through the real frame path. New Game
+    /// stalls the frame it runs in, so the op is held for one presented
+    /// frame — the loading screen's — and runs under the screen; the
+    /// world it builds has presented nothing, so its own frame is the
+    /// screen too. The player sees the screen, then the pad: never the
+    /// frozen old frame across the stall, never the fresh world's bare
+    /// first frame.
+    #[test]
+    fn new_game_runs_under_the_loading_screen() {
+        let dir = tempdir("new-game-loading-screen");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        let frame = |app: &mut App| {
+            app.advance_frame(1.0 / 60.0);
+            app.finish_frame();
+        };
+        frame(&mut app);
+        let old_ticks = app.view.sim.clock().ticks();
+        app.request_session_op(SessionOp::NewGame);
+        // The presenting frame: the old world still steps, the screen
+        // is up, the op has not run.
+        frame(&mut app);
+        assert!(
+            app.view.sim.clock().ticks() > old_ticks,
+            "the op must wait for the screen's frame"
+        );
+        assert!(matches!(app.session_op, Some(SessionOp::NewGame)));
+        assert_eq!(
+            screen_line(&mut app).as_deref(),
+            Some(csp_ui::LOADING_SESSION),
+            "the presenting frame is the loading screen"
+        );
+        app.presented();
+        // The next boundary runs it, under the screen.
+        frame(&mut app);
+        assert!(app.session_op.is_none(), "the op ran once presented");
+        assert!(
+            app.view.sim.clock().ticks() < old_ticks,
+            "the world was replaced"
+        );
+        assert_eq!(
+            screen_line(&mut app).as_deref(),
+            Some(csp_ui::LOADING_SESSION),
+            "the rebuilt world's first frame is the loading screen"
+        );
+        app.presented();
+        // The screen then lifts onto the rebuilt world: the first frame
+        // without it stages the starter craft on the pad, and it never
+        // returns.
+        let mut covered = 0;
+        loop {
+            frame(&mut app);
+            if screen_line(&mut app).is_none() {
+                break;
+            }
+            covered += 1;
+            assert!(covered < 64, "the screen never lifted");
+        }
+        assert!(covered > 0, "the panels arrive under the screen");
+        assert!(
+            app.view.flight_focus().is_some(),
+            "the first frame without the screen is the rebuilt world's — the starter craft on the pad"
+        );
+        for _ in 0..20 {
+            frame(&mut app);
+            assert!(
+                screen_line(&mut app).is_none(),
+                "nothing is pending — the screen must not come back"
+            );
+        }
     }
 
     /// C25-F1: New Game must not drop the M10 "max time warp" cap. The
@@ -4599,7 +5027,7 @@ mod tests {
         // is what must preserve it.
         assert!(app.warp.capped_below_ladder_top());
         app.request_session_op(SessionOp::NewGame);
-        app.run_session_op();
+        run_session_op_under_the_screen(&mut app);
         // The seed delivered the starter craft surface-latched, so the
         // §2.6.2 rails predicate is vacuous and presses reach the
         // ceiling check.
@@ -4667,8 +5095,9 @@ mod tests {
     /// The Apply path end-to-end: staged settings become the live set,
     /// persist to the injected file, and reach their live targets —
     /// `ui_scale` sets the egui zoom factor, `max_warp_multiplier` caps
-    /// the controller's ladder, and the app-tracked `window_size`
-    /// survives the staged copy's stale value.
+    /// the controller's ladder, the orbit controls are what the next
+    /// drag reads, and the app-tracked `window_size` survives the
+    /// staged copy's stale value.
     #[test]
     fn settings_apply_persists_and_reaches_live_targets() {
         let dir = tempdir("apply");
@@ -4677,6 +5106,8 @@ mod tests {
         app.settings.graphics.window_size = [1920, 1080]; // a resize landed
         let mut staged = app.view.staged_settings();
         staged.graphics.ui_scale = 1.5;
+        staged.graphics.orbit_sensitivity = 2.0;
+        staged.graphics.invert_vertical = true;
         staged.gameplay.max_warp_multiplier = 100;
         staged.graphics.window_size = [1280, 720]; // stale staged value
         app.view.stage_settings(&staged);
@@ -4694,6 +5125,10 @@ mod tests {
         assert_eq!(app.warp.requested_multiplier(), 100);
         // The tracked window size won over the stale staged copy.
         assert_eq!(app.settings.graphics.window_size, [1920, 1080]);
+        // The applied orbit controls are what the next drag reads:
+        // twice the yaw, the vertical half inverted.
+        let (dyaw, dpitch) = orbit_delta(10.0, 10.0, &app.settings.graphics);
+        assert!((dyaw - 0.1).abs() < 1.0e-15 && (dpitch + 0.1).abs() < 1.0e-15);
         // Persisted: the injected path now holds the applied file.
         let (on_disk, _) = settings_io::load_settings_from(&path);
         assert_eq!(on_disk.gameplay.max_warp_multiplier, 100);
@@ -5110,6 +5545,112 @@ mod tests {
         assert_eq!(app.clamped_render_scale(), 1.0);
         app.settings.graphics.render_scale = f32::INFINITY;
         assert_eq!(app.clamped_render_scale(), 1.0);
+    }
+
+    /// The orbit drag at the default settings is the shipped one to the
+    /// last digit: 0.005 rad per pixel on each axis. The sensitivity
+    /// scales both axes, the invert flips only the vertical one, and
+    /// the multiplier is held to 0.25…4 with a non-finite value reset.
+    #[test]
+    fn orbit_delta_defaults_scale_and_invert() {
+        let mut graphics = GraphicsSettings::default();
+        for (dx, dy) in [(37.0, -12.0), (-0.5, 0.25), (200.0, 133.0)] {
+            assert_eq!(
+                orbit_delta(dx, dy, &graphics),
+                (dx * DRAG_RAD_PER_PX, dy * DRAG_RAD_PER_PX)
+            );
+        }
+        let near = |got: (f64, f64), want: (f64, f64)| {
+            assert!(
+                (got.0 - want.0).abs() < 1.0e-15 && (got.1 - want.1).abs() < 1.0e-15,
+                "{got:?} vs {want:?}"
+            );
+        };
+        graphics.orbit_sensitivity = 2.0;
+        near(orbit_delta(10.0, -4.0, &graphics), (0.1, -0.04));
+        graphics.invert_vertical = true;
+        near(orbit_delta(10.0, -4.0, &graphics), (0.1, 0.04));
+        graphics.orbit_sensitivity = 0.0;
+        near(orbit_delta(10.0, -4.0, &graphics), (0.0125, 0.005));
+        graphics.orbit_sensitivity = 100.0;
+        near(orbit_delta(10.0, -4.0, &graphics), (0.2, 0.08));
+        graphics.orbit_sensitivity = f32::NAN;
+        near(orbit_delta(10.0, -4.0, &graphics), (0.05, 0.02));
+        graphics.orbit_sensitivity = f32::INFINITY;
+        near(orbit_delta(10.0, -4.0, &graphics), (0.05, 0.02));
+    }
+
+    /// The orbit controls load like the other graphics fields: a file
+    /// written before they existed gives the shipped feel, a multiplier
+    /// outside 0.25…4 is clamped and a non-finite one reset — each with
+    /// a note — and both survive the salvage of a partly unreadable
+    /// Graphics section.
+    #[test]
+    fn load_defaults_clamps_and_salvages_the_orbit_controls() {
+        let dir = tempdir("orbit");
+        let path = dir.join("settings.ron");
+        std::fs::write(&path, "(graphics: (ui_scale: 1.25))").unwrap();
+        let (loaded, notes) = settings_io::load_settings_from(&path);
+        assert_eq!(loaded.graphics.orbit_sensitivity, 1.0);
+        assert!(!loaded.graphics.invert_vertical);
+        assert_eq!(loaded.graphics.ui_scale, 1.25);
+        // (The file carries no keymap, so the backfill note is expected.)
+        assert!(
+            notes.iter().all(|n| !n.contains("orbit")),
+            "the shipped value needs no repair: {notes:?}"
+        );
+
+        // One repair of the orbit controls, one note naming it.
+        let orbit_notes = |notes: &[String]| {
+            notes
+                .iter()
+                .filter(|n| n.contains("orbit_sensitivity"))
+                .count()
+        };
+        std::fs::write(
+            &path,
+            "(graphics: (orbit_sensitivity: 12.0, invert_vertical: true))",
+        )
+        .unwrap();
+        let (loaded, notes) = settings_io::load_settings_from(&path);
+        assert_eq!(loaded.graphics.orbit_sensitivity, ORBIT_SENSITIVITY_MAX);
+        assert!(loaded.graphics.invert_vertical);
+        assert_eq!(orbit_notes(&notes), 1, "{notes:?}");
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("orbit_sensitivity") && n.contains("clamped")),
+            "{notes:?}"
+        );
+
+        std::fs::write(&path, "(graphics: (orbit_sensitivity: 0.05))").unwrap();
+        let (loaded, notes) = settings_io::load_settings_from(&path);
+        assert_eq!(loaded.graphics.orbit_sensitivity, ORBIT_SENSITIVITY_MIN);
+        assert_eq!(orbit_notes(&notes), 1, "{notes:?}");
+
+        std::fs::write(&path, "(graphics: (orbit_sensitivity: NaN))").unwrap();
+        let (loaded, notes) = settings_io::load_settings_from(&path);
+        assert_eq!(loaded.graphics.orbit_sensitivity, ORBIT_SENSITIVITY_DEFAULT);
+        assert!(
+            notes.iter().any(|n| n.contains("not a finite number")),
+            "{notes:?}"
+        );
+
+        // An unknown quality tier fails the strict parse; the two new
+        // leaves are still salvaged from the Graphics section.
+        std::fs::write(
+            &path,
+            "(graphics: (quality: ultra, orbit_sensitivity: 3.0, invert_vertical: true))",
+        )
+        .unwrap();
+        let (loaded, notes) = settings_io::load_settings_from(&path);
+        assert_eq!(loaded.graphics.orbit_sensitivity, 3.0);
+        assert!(loaded.graphics.invert_vertical);
+        assert_eq!(loaded.graphics.quality, GraphicsSettings::default().quality);
+        assert!(
+            notes.iter().any(|n| n.contains("partially unreadable")),
+            "{notes:?}"
+        );
     }
 
     /// §6.3 demo mode: the app flag comes from the view, craft-file
@@ -6344,7 +6885,7 @@ mod tests {
         // F9 — the world under the axis is swapped; the state machine
         // must reset with it.
         app.request_session_op(SessionOp::Load("latched".into()));
-        app.run_session_op();
+        run_session_op_under_the_screen(&mut app);
         assert_eq!(
             app.throttle_axis, 0.0,
             "a stale axis value must not survive the world swap"
@@ -6447,6 +6988,7 @@ mod tests {
                 Ok(report) => app.on_step_report(&report),
                 Err(e) => app.on_sim_fatal(e),
             }
+            app.stage_tick_fraction(false);
             app.view.end_frame();
         };
         let boot_clock = app.view.sim.clock().ticks();
@@ -6511,6 +7053,55 @@ mod tests {
         }
         app.release_edge(&shift.0, &shift.1);
         assert!(app.throttle_held.is_empty());
+    }
+
+    /// §2.5's interpolation plumbing: every frame hands the view the
+    /// warp controller's fractional tick remainder for the tick the
+    /// step reached — the weight `flight_interp` draws each pose
+    /// between its previous and its current tick with — and a frame
+    /// that swapped the world hands it none.
+    #[test]
+    fn frames_hand_the_view_their_tick_fraction() {
+        // The injected settings path, under `target/` — inside the repo.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/app-test-tick-fraction");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        let handed = |app: &App| app.view.world.resource::<csp_view::TickFraction>().0;
+        // `run_frame`'s step → hand-off → end, at a fixed wall dt.
+        // Returns the frames that advanced two ticks and none.
+        let drive = |app: &mut App, dt: f64, frames: usize| {
+            let (mut two, mut zero) = (0, 0);
+            for _ in 0..frames {
+                let before = app.view.sim.clock().ticks();
+                let target = app.warp.target_tick(before, dt);
+                app.view.begin_frame();
+                app.view.sim_step(target).unwrap();
+                app.stage_tick_fraction(false);
+                let frac = handed(app);
+                assert!((0.0..1.0).contains(&frac), "fraction {frac} left [0, 1)");
+                assert_eq!(frac, app.warp.tick_fraction(app.view.sim.clock().ticks()));
+                app.view.end_frame();
+                match app.view.sim.clock().ticks() - before {
+                    2 => two += 1,
+                    0 => zero += 1,
+                    _ => {}
+                }
+            }
+            (two, zero)
+        };
+        // 60 fps over the 64 Hz sim: one frame in fifteen carries two
+        // ticks' worth of motion.
+        let (two, zero) = drive(&mut app, 1.0 / 60.0, 300);
+        assert!(two > 0, "300 frames at 60 fps carry two-tick frames");
+        assert_eq!(zero, 0);
+        // 240 fps: three frames in four carry none.
+        let (two, zero) = drive(&mut app, 1.0 / 240.0, 300);
+        assert_eq!(two, 0);
+        assert!(zero > 0, "300 frames at 240 fps carry zero-tick frames");
+        // A world swapped this frame: the accumulator still describes
+        // the old world's clock — no fraction of the new one exists.
+        app.stage_tick_fraction(true);
+        assert_eq!(handed(&app), 0.0);
     }
 
     /// The guard the rail-deliver must not blow through: a

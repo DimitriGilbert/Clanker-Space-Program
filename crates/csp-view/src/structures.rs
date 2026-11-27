@@ -942,10 +942,13 @@ fn shadow_quad(
         let [Some(c0), Some(c1), Some(c2)] = [a, b, cc].map(|q| project_into(vp, eye, q)) else {
             continue;
         };
-        for pos in [c0, c1, c2] {
+        // `world` is real, as the flight stream's other unlit vertices':
+        // `flight.wgsl` measures the water in front of the quad by it.
+        for (pos, q) in [(c0, a), (c1, b), (c2, cc)] {
+            let w = q - eye;
             v.push(csp_render::flight::FlightVertex {
                 pos,
-                world: [0.0; 3],
+                world: [w.x as f32, w.y as f32, w.z as f32],
                 nrm: [0.0; 3],
                 color,
                 mat: [0.0; 3],

@@ -49,8 +49,10 @@
   // browser promises spawned onto the winit loop — so csp-app reports
   // the outcome through the `cspGpuInitFailed`/`cspGpuReady` hooks
   // below (it also sets `__csp_gpu_init_error`/`__csp_gpu_ready` for
-  // anything that prefers polling). Until the ready hook fires the
-  // loading screen stays up; the failure hook swaps in #fallback.
+  // anything that prefers polling). The ready hook fires on the first
+  // PRESENTED frame, not at GPU init: until then the loading screen
+  // stays up, so the canvas is never seen half-drawn; the failure hook
+  // swaps in #fallback.
   const fail = (msg) => {
     document.getElementById('loading')?.remove();
     const f = document.getElementById('fallback');
@@ -79,7 +81,8 @@
       await init();
       // Watchdog: hooks are installed before this resolves and fire on
       // the app's own loop — silence for 30 s means the GPU promise
-      // never landed, which is the black-void failure mode.
+      // never landed or no frame was ever presented, which is the
+      // black-void failure mode.
       setTimeout(() => {
         if (!window.__csp_gpu_ready && !window.__csp_gpu_init_error) {
           fail('GPU init never resolved — the demo could not start its renderer.');

@@ -219,8 +219,9 @@ bug-report bundle (§8).
    `csp-view/src/lib.rs → ProgramMirror`).
 2. **Sync schedule** (single-threaded): `sync_mirrors`, `map::sync_map`, `flight::sync_flight` —
    write `Clock`, `WarpMirror`, `FrameStats`, flight snapshot mirrors.
-3. **Presentation schedule**: `map::map_present`, `vab::vab_present`, `flight::flight_present`,
-   `tutorial::tutorial_drive` — interpolation, camera solve, VFX cue emission (`FlightSfx`).
+3. **Presentation schedule**: `map::map_present`, `vab::vab_present`, `flight::flight_interp`,
+   `flight::flight_camera`, `flight::flight_present`, `tutorial::tutorial_drive` —
+   interpolation, camera solve, VFX cue emission (`FlightSfx`).
 4. **UiBuild schedule**: `build_ui` (+ `map_pointer_input`) — the entire egui pass. Panels from
    `csp-ui` are called with plain-data mirrors; their outputs land in **`UiOutbox`**
    (`launch`, `program: Vec<SimCommand>`, `maneuver`, `craft_save/load`, `settings_apply`,
@@ -419,7 +420,7 @@ One codebase; differences are `cfg`-gated:
 | Audio | subprocess backend | absent (module is `cfg(not(wasm))`) |
 | Data set | `data/` via `FsDataSource` (`View::new`) | embedded reduced set via `csp_data::EmbeddedSource` (`View::new_demo`, `csp-view/src/demo.rs`) |
 | Saves/craft IO | `saves/*.cspsave`, `crafts/*.cspcraft` | refused (demo policy gates `UiOutbox` verbs) |
-| GPU init | synchronous (pollster) | deferred browser promises; page hooks `cspGpuReady`/`cspGpuInitFailed` |
+| GPU init | synchronous (pollster) | deferred browser promises; page hooks `cspGpuInitFailed` (at once) and `cspGpuReady` (on the first presented frame — the page's loading screen covers the canvas until then) |
 
 `bevy_ecs` features: `["std"]` baseline, `+ ["multi_threaded", "async_executor"]` on native.
 Rhai is pinned `=1.27.0` with `default-features = false, features = ["no_std"]` — the feature set

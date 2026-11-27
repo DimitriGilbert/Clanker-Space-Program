@@ -216,26 +216,39 @@ impl Default for WeldedBody {
 }
 
 /// One decelerator drag site on a [`WeldedBody`] — a §3.1 `Parachute`
-/// part's additive analytic-drag channel (`F = −½·ρ·CdA·|v_rel|·v_rel`
-/// applied at the site point, torque about the CoM like a force
-/// site's `r×F`). The world rebuilds the body's site list each tick;
+/// part's additive analytic-drag channel (`F = −½·ρ·CdA·|v_rel|·v_rel`),
+/// in two terms that do not act on the craft alike. The **packed**
+/// canister's drag acts at the site point (`local_pos`), where the
+/// canister is. The **canopy's** pull acts on the craft's axis, at
+/// `axis_pos` (§3.1 rule A) — for the craft's rigid-body motion and
+/// for every joint but the chute's own mount, whose reef is what bounds
+/// it. The world rebuilds the body's site list each tick;
 /// `deployed_at_s` is the sim-time stamp the deploy apply recorded —
 /// `None` while packed; `open_at_s` is the first stamp at which BOTH
 /// catch gates (`deploy_alt_m`, `deploy_speed_mps`) held under flow —
 /// the `deploy_time_s` inflation ramp's anchor, so a deploy-early
 /// command cannot pre-complete inflation before the flow can hold the
-/// canopy (C14-F1). `reef_n` bounds the canopy load the mount was
-/// authored for. Gates and reef are evaluated per tick by the
-/// backend's force accumulation against the body's own altitude,
-/// speed, and density.
+/// canopy (C14-F1). The reef bounds the canopy at what its own mount
+/// takes: `reef_n` on the force. Each term is then capped, on its own,
+/// at what every other joint of the craft takes of it where it acts
+/// (`packed_budget_n`, `canopy_budget_n`). Gates and reef are evaluated
+/// per tick by the backend's force accumulation against the body's own
+/// altitude, speed, and density.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DecelSite {
     /// Owning graph node — bookkeeping for the per-part force
-    /// attribution in `external_loads` (the site's drag loads its
-    /// own attachment).
+    /// attribution in `external_loads`.
     pub node: PartNodeId,
-    /// Application point, body frame — the node's resolved CoM.
+    /// The canister, body frame — the node's resolved CoM. Its own
+    /// packed drag acts here.
     pub local_pos: DVec3,
+    /// Where the craft takes the canopy's pull, body frame: the site
+    /// projected onto the craft's longitudinal axis (§3.1 rule A) —
+    /// the mount point does not lever the stack.
+    pub axis_pos: DVec3,
+    /// The craft's longitudinal axis, unit, body frame — the direction
+    /// a deployed canopy steers onto the flow ([`CanopySteering`]).
+    pub axis_dir: DVec3,
     /// Packed drag area Cd·A (m²) — applies whenever the site is in
     /// the flow, deployed or not.
     pub packed_drag_area_m2: f64,
@@ -253,11 +266,31 @@ pub struct DecelSite {
     /// `None` until the flow can hold the canopy. The ramp opens from
     /// here, not from `deployed_at_s`.
     pub open_at_s: Option<f64>,
-    /// Canopy load bound (N) — the site's reefed ceiling on
-    /// `½·ρ·v²·A_canopy`, derived from the mount's authored
-    /// `StructuralDef` (weakest reachable channel). `f64::INFINITY`-class
-    /// values (an unlimited mount) leave the canopy unreefed.
+    /// Canopy force bound (N) — the weaker of the mount's authored
+    /// axial and shear ratings, derated: the ceiling on the reefed
+    /// `½·ρ·v²·A_canopy`. `f64::INFINITY`-class values (an unlimited
+    /// mount) leave the canopy unreefed.
     pub reef_n: f64,
+    /// The packed term's budget: the greatest packed drag (N) the site
+    /// may apply this tick without loading any joint of the craft but
+    /// its own mount past the working-load derate —
+    /// [`crate::structural::JointModel::pull_budgets`], which the world
+    /// computes before each step from the tick's other loads, every
+    /// term of the body at once (each takes its own budget times the
+    /// one scale that keeps the joints inside the derate with all of
+    /// them pulling). The canister's own drag acts where it is, so off
+    /// the craft's axis it is a pitch moment on everything below it —
+    /// at 250 m/s it overloads the Stock Hopper's pod-to-canister joint
+    /// before the canopy ever opens. `f64::INFINITY` when nothing
+    /// beside the mount feels it — a pod-alone chute.
+    pub packed_budget_n: f64,
+    /// The canopy term's budget, the same way: its pull acts on the
+    /// craft's axis, so what it levers is the hang — a canopy catching
+    /// on a craft leaning 18° turns the whole stack about the CoM, and
+    /// the joints below carry the turn. Aligned, a canopy is far past
+    /// anything the mount's reef lets through and the budget never
+    /// binds. `f64::INFINITY` when nothing beside the mount feels it.
+    pub canopy_budget_n: f64,
 }
 
 impl WeldedBody {

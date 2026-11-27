@@ -979,12 +979,24 @@ impl TerrainRenderer {
         // instead of being rejected by depth the ocean wrote before the
         // craft existed (C11-F3). The `dir0_kind.w` discriminator still
         // selects the ocean shading branch in `fs_terrain`.
+        //
+        // Premultiplied: the surface is a thin layer over the seabed or
+        // hull already in the target, and `fs_terrain` tone-maps the
+        // layer's own light (`col × alpha`) — with straight alpha it
+        // could only tone-map the unweighted layer colour and weight it
+        // after, which lifts a 2 % sky reflection into 2 % of the
+        // tone-mapped sky.
+        let ocean_targets = [Some(wgpu::ColorTargetState {
+            format: surface_format,
+            blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
         let ocean = pipe(
             "ocean",
             "vs_terrain",
             "fs_terrain",
             &[Some(GridVertex::LAYOUT), Some(TerrainInstance::LAYOUT)],
-            &terrain_targets,
+            &ocean_targets,
             wgpu::DepthStencilState {
                 depth_write_enabled: Some(false),
                 ..depth_state.clone()
@@ -1966,6 +1978,25 @@ impl TerrainInstance {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// C16-F3's rule for what the build cannot share: the water block
+    /// is one text in `terrain.wgsl` and `flight.wgsl` — from its
+    /// heading to the end of `water_path` — so a seabed and a hull on
+    /// it are absorbed by the same numbers. The build has no WGSL
+    /// include; this is the include.
+    #[test]
+    fn water_block_is_one_text_in_both_shaders() {
+        fn block(src: &str) -> &str {
+            let from = src.find("// --- water ---").expect("a water block");
+            let last = from + src[from..].find("fn water_path").expect("`water_path`");
+            let to = last + src[last..].find("\n}\n").expect("`water_path`'s end") + 3;
+            &src[from..to]
+        }
+        let terrain = block(include_str!("terrain.wgsl"));
+        let flight = block(include_str!("flight.wgsl"));
+        assert_eq!(terrain, flight);
+        assert!(terrain.starts_with("// --- water ---") && terrain.ends_with("\n}\n"));
+    }
 
     /// §2.3's far-field draw on a real device (the pin the split-ring
     /// gate's diagnosis demanded): a 600 km flat-datum body viewed

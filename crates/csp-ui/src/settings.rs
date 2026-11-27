@@ -116,7 +116,22 @@ pub struct GraphicsSettings {
     /// `Resized` and persisted, so the next launch restores it. Not a
     /// panel-edited value: the window itself is the editor.
     pub window_size: [u32; 2],
+    /// Orbit-drag sensitivity — the multiplier every camera orbit drag
+    /// (flight, map, VAB) is scaled by. Clamped into
+    /// [`ORBIT_SENSITIVITY_MIN`]..=[`ORBIT_SENSITIVITY_MAX`] when applied.
+    pub orbit_sensitivity: f32,
+    /// Reverse the vertical half of an orbit drag, in every camera
+    /// (flight, map, VAB).
+    pub invert_vertical: bool,
 }
+
+/// The lower bound [`GraphicsSettings::orbit_sensitivity`] applies at.
+pub const ORBIT_SENSITIVITY_MIN: f32 = 0.25;
+/// The upper bound [`GraphicsSettings::orbit_sensitivity`] applies at.
+pub const ORBIT_SENSITIVITY_MAX: f32 = 4.0;
+/// The sensitivity that reproduces the shipped drag
+/// ([`GraphicsSettings::orbit_sensitivity`]'s default).
+pub const ORBIT_SENSITIVITY_DEFAULT: f32 = 1.0;
 
 /// The lower bound [`GraphicsSettings::ui_scale`] applies at — under
 /// this the panels become unreadable.
@@ -142,6 +157,8 @@ impl Default for GraphicsSettings {
             render_scale: 1.0,
             ui_scale: 1.0,
             window_size: [1280, 720],
+            orbit_sensitivity: ORBIT_SENSITIVITY_DEFAULT,
+            invert_vertical: false,
         }
     }
 }
@@ -904,9 +921,9 @@ pub fn settings_panel(
 
 /// The Graphics section's rows — extracted from `settings_panel`'s
 /// body (P1 grew it past the complexity budget): vsync, render scale,
-/// ui scale, and the read-only window size. Every row's behavior note
-/// is the row's own documentation — the two P1 controls explain
-/// exactly when they take effect.
+/// ui scale, the orbit controls, and the read-only window size. Every
+/// row's behavior note is the row's own documentation — the two P1
+/// controls explain exactly when they take effect.
 fn graphics_section(ui: &mut egui::Ui, state: &mut SettingsPanelState) {
     // No `quality` row: the field has zero consumers (P14-F1) — an
     // interactive control that steers nothing is a lie. It stays in
@@ -938,6 +955,25 @@ fn graphics_section(ui: &mut egui::Ui, state: &mut SettingsPanelState) {
             UI_SCALE_MIN..=UI_SCALE_MAX,
         )
         .text("ui scale"),
+    );
+    ui.add(
+        egui::Slider::new(
+            &mut state.settings.graphics.orbit_sensitivity,
+            ORBIT_SENSITIVITY_MIN..=ORBIT_SENSITIVITY_MAX,
+        )
+        .text("orbit sensitivity"),
+    );
+    ui.label(
+        "scales every camera orbit drag (flight, map, VAB); 1.0 is the shipped \
+         feel, lower is finer, higher is quicker",
+    );
+    ui.checkbox(
+        &mut state.settings.graphics.invert_vertical,
+        "invert vertical orbit",
+    );
+    ui.label(
+        "reverses the vertical half of an orbit drag in all three cameras \
+         (flight, map, VAB)",
     );
     ui.label(format!(
         "window: {}×{} px (restored at launch)",
@@ -995,6 +1031,8 @@ mod tests {
         s.graphics.render_scale = 0.75;
         s.graphics.ui_scale = 1.25;
         s.graphics.window_size = [1600, 900];
+        s.graphics.orbit_sensitivity = 2.5;
+        s.graphics.invert_vertical = true;
         s.difficulty.life_support_enabled = true;
         s.difficulty.dormant_stress = false;
         s.gameplay.max_warp_multiplier = 1_000;
@@ -1013,6 +1051,28 @@ mod tests {
             text.contains("render_scale"),
             "render_scale missing from the round trip:\n{text}"
         );
+        assert!(
+            text.contains("orbit_sensitivity: 2.5") && text.contains("invert_vertical: true"),
+            "the orbit controls missing from the round trip:\n{text}"
+        );
+    }
+
+    /// The orbit controls default to the shipped feel — sensitivity 1.0,
+    /// vertical not inverted — and a file written before they existed
+    /// loads with exactly those values.
+    #[test]
+    fn orbit_controls_default_to_the_shipped_feel_and_old_files_load() {
+        let defaults = GraphicsSettings::default();
+        assert_eq!(defaults.orbit_sensitivity, 1.0);
+        assert!(!defaults.invert_vertical);
+        assert_eq!(ORBIT_SENSITIVITY_MIN, 0.25);
+        assert_eq!(ORBIT_SENSITIVITY_MAX, 4.0);
+        let text = r#"(
+            graphics: (quality: high, ui_scale: 1.0, window_size: (1024, 768)),
+        )"#;
+        let s: Settings = ron::from_str(text).unwrap();
+        assert_eq!(s.graphics.orbit_sensitivity, 1.0);
+        assert!(!s.graphics.invert_vertical);
     }
 
     /// P1's presentation fields default the way the pre-P1 build

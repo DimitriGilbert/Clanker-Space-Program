@@ -5371,6 +5371,7 @@ mod tests {
                     longitude_rad: 0.000001,
                     altitude_m: 0.0,
                     orientation: csp_core::DQuat::IDENTITY,
+                    afloat: false,
                 }),
                 aero_mask: csp_phys::ConfigMask::ALL,
                 thermal,
@@ -5447,6 +5448,7 @@ mod tests {
                     longitude_rad: 0.000001,
                     altitude_m: 0.0,
                     orientation: csp_core::DQuat::IDENTITY,
+                    afloat: false,
                 }),
                 aero_mask: csp_phys::ConfigMask::ALL,
                 thermal,
@@ -5878,6 +5880,7 @@ mod tests {
                 longitude_rad: 0.5,
                 altitude_m: 0.0,
                 orientation: csp_core::DQuat::IDENTITY,
+                afloat: false,
             });
         w.enqueue(
             SourceClass::Ui,
@@ -6065,7 +6068,9 @@ mod tests {
                 friction_mu: 0.5,
                 drag_cd: 1.0,
                 convective_heat_fraction: csp_phys::DEFAULT_CONVECTIVE_HEAT_FRACTION,
+                touchdown_crush_m: csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M,
                 terrain: None,
+                ocean: None,
             },
             dominant: BodyId::from("terra"),
             bubble_radius_m: crate::DEFAULT_BUBBLE_RADIUS_M,

@@ -300,6 +300,65 @@ fn trans_between(ha: f32, hb: f32, mua: f32, mub: f32) -> vec3<f32> {
     return clamp(trans(ha, mua) / max(tb, vec3<f32>(1.0e-4)), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+// --- water ---------------------------------------------------------------
+// C16-F3's rule: one text, two files — this block stands verbatim in
+// `terrain.wgsl` and in `flight.wgsl`, and `water_block_is_one_text_in_both_shaders`
+// keeps it so.
+// The ocean's absorption, per metre of path, red, green, blue. The path
+// that leaves a hundredth of each: 15 m, 92 m, 230 m.
+const WATER_ABSORB: vec3<f32> = vec3<f32>(0.30, 0.05, 0.02);
+// What an endless path in the water converges to, before its lighting.
+const WATER_BODY: vec3<f32> = vec3<f32>(0.006, 0.042, 0.115);
+// Water against air.
+const WATER_IOR: f32 = 1.33;
+
+// Sunlight reaching `depth_m` under the surface. Entering the water the
+// sun's ray bends toward the vertical, to within 48.8° of it whatever its
+// height, so its path is at most 1.52 times the depth.
+fn water_sun(depth_m: f32, sun_up: f32) -> vec3<f32> {
+    let su = clamp(sun_up, 0.0, 1.0);
+    let cos_t = sqrt(1.0 - (1.0 - su * su) / (WATER_IOR * WATER_IOR));
+    return exp(-WATER_ABSORB * (depth_m / cos_t));
+}
+
+// A fragment `depth_m` under the surface, shaded `col` as if in air and
+// seen through `path_m` of water: the sun's way down to it and the eye's
+// way to it each absorb it, red first, and what the path scatters toward
+// the eye takes the lost share — the water body, lit as the surface is
+// (`sun_up`, the sun's height there, times `vis`, the share of the sun
+// that reaches it).
+fn water_fog(col: vec3<f32>, depth_m: f32, path_m: f32, sun_up: f32, vis: f32) -> vec3<f32> {
+    let through = exp(-WATER_ABSORB * path_m);
+    let body = WATER_BODY * (0.10 + 0.90 * sun_up * vis);
+    return col * water_sun(depth_m, sun_up) * through + body * (1.0 - through);
+}
+
+// The length of the part of the eye→fragment segment that is in the
+// water: its overlap with the ocean, the sphere of radius `ocean_r` about
+// the body centre, the eye at `pa` and the fragment at `pb` — both from
+// the centre. Zero without an ocean, or where the segment misses it.
+fn water_path(ocean_r: f32, pa: vec3<f32>, pb: vec3<f32>) -> f32 {
+    if (ocean_r <= 0.0) {
+        return 0.0;
+    }
+    let seg = pb - pa;
+    let dist = max(length(seg), 1.0e-3);
+    let ray = seg / dist;
+    let b = dot(pa, ray);
+    let eye_r = length(pa);
+    let c = (eye_r - ocean_r) * (eye_r + ocean_r);
+    let disc = b * b - c;
+    if (disc <= 0.0) {
+        return 0.0;
+    }
+    let s = sqrt(disc);
+    // Both roots in the form that keeps their small ones exact: the
+    // difference of two numbers the size of the body is not one.
+    let into = select(c / (s - b), -(s + b), b >= 0.0);
+    let out_of = select(-c / (s + b), s - b, b <= 0.0);
+    return max(min(out_of, dist) - max(into, 0.0), 0.0);
+}
+
 // Per-pixel march jitter — decorrelates the fixed step lattice so the
 // aerial-perspective integral doesn't band. Only `view_inscatter` (the
 // terrain pass) uses it: `fs_sky`'s march is deterministic per ray, since
@@ -1041,6 +1100,12 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
 
     var col: vec3<f32>;
     var alpha = 1.0;
+    // The eye is in the water: inside the ocean sphere. Nothing it sees
+    // has air between, so no aerial perspective is applied.
+    let eye_under = u.planet.z > 0.0 && length(pa) < u.planet.z;
+    // The part of the view ray that is in the water before the fragment;
+    // the air it crosses is the rest.
+    var water_path_m = 0.0;
     // Direct-lit fraction of the surface (macro facet only — see the
     // aerial shade gate below). Smooth by construction: no bump octave
     // and no cascade detail rides it, so the gate can never imprint
@@ -1049,8 +1114,7 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
     if (i.kind > 0.5) {
         // --- ocean ----------------------------------------------------
         // Water depth under the fragment: ocean datum minus the seabed
-        // radius — drives the colour, the shoreline foam and the
-        // see-through alpha.
+        // radius — where the shoreline foam lies.
         let seabed = u.planet.x + height_at(dir_fix) * u.planet.w;
         let depth = max(u.planet.z - seabed, 0.0);
         // Wave normal: a long swell plus chop octaves over the
@@ -1104,23 +1168,7 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
         let n = rot_axis(u.spin.xyz, u.spin.w, n_fix);
 
         let v = -ray;
-        let fres = 0.02 + 0.98 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
         let sun_up = max(dot(dir, sun), 0.0);
-        // Depth body colour — teal shelf to near-black basin.
-        var water = mix(vec3<f32>(0.045, 0.26, 0.30), vec3<f32>(0.006, 0.042, 0.115),
-                        clamp(depth / 60.0, 0.0, 1.0));
-        water = mix(vec3<f32>(0.10, 0.32, 0.26), water, smoothstep(0.4, 6.0, depth));
-        // Approximate reflected sky: horizon haze at grazing, deep
-        // blue at the zenith, a warm forward-scatter lobe sun-side.
-        let r = reflect(ray, n);
-        let rup = clamp(dot(r, dir), 0.0, 1.0);
-        let rsun = max(dot(r, sun), 0.0);
-        var skyc = mix(vec3<f32>(0.38, 0.52, 0.74), vec3<f32>(0.045, 0.095, 0.24),
-                       pow(rup, 0.6));
-        skyc = skyc + vec3<f32>(0.55, 0.38, 0.20) * pow(rsun, 5.0);
-        if (!has_atmo) {
-            skyc = vec3<f32>(0.015, 0.02, 0.05);
-        }
         // Sun glint: a tight sparkle lobe (the wave noise makes it
         // glitter) plus a broad sheen — both killed by terrain/vessel
         // shadow and the atmosphere's sun transmittance.
@@ -1133,23 +1181,67 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
                                  seg, n, dist);
         let vis = occ * (1.0 - blob_shadow(dir));
         lit_frac = clamp(dot(dir, sun), 0.0, 1.0);
-        // Sun glitter: the tight sparkle lobe rides the wave-normal
-        // map (Foam002's squiggly foam pattern) — at the old 2.6 gain
-        // every glint texel clipped to a glowing white worm. Keep the
-        // sparkle but at a gain that survives tonemapping.
-        let spec = pow(rsun, 700.0) * 1.1 + pow(rsun, 48.0) * 0.14;
-        col = mix(water * (0.10 + 0.90 * sun_up * vis),
-                  skyc * (0.22 + 0.78 * sun_up), fres)
-              + sun_lum * vis * spec;
-        // Shoreline foam: a noise-broken band where the seabed meets
-        // the surface.
-        let foam_n = smoothstep(0.35, 0.85, 0.5 + 0.5 * vnoise3w(dir_fix, 5400.0));
-        let foam = (1.0 - smoothstep(0.2, 2.6, depth)) * foam_n;
-        col = mix(col, vec3<f32>(0.80, 0.85, 0.87) * (0.10 + 0.90 * sun_up * vis),
-                  clamp(foam, 0.0, 1.0) * 0.75);
-        // Shallow water goes translucent — the drawn seabed shows
-        // through at the shoreline.
-        alpha = clamp(0.62 + 0.38 * (depth / 25.0), 0.62, 1.0);
+        let lit = 0.10 + 0.90 * sun_up * vis;
+        if (eye_under) {
+            // From below the surface is a mirror only: it keeps the
+            // share of the pixel a ray coming up from the eye reflects
+            // back into the water (`mirror`: 2 % straight up, all of it
+            // past 48.8° from the vertical, where nothing above the
+            // surface is visible), and shows the water body in it. What
+            // lies beyond — the sky, bent away from the vertical by
+            // `fs_sky`, a hull above the surface — the pass behind drew
+            // already absorbed over the eye's way to the surface.
+            let cos_i = clamp(dot(n, ray), 0.0, 1.0);
+            let sin_t = WATER_IOR * sqrt(max(1.0 - cos_i * cos_i, 0.0));
+            var mirror = 1.0;
+            if (sin_t < 1.0) {
+                let cos_t = sqrt(1.0 - sin_t * sin_t);
+                let rs = (WATER_IOR * cos_i - cos_t) / (WATER_IOR * cos_i + cos_t);
+                let rp = (WATER_IOR * cos_t - cos_i) / (WATER_IOR * cos_t + cos_i);
+                mirror = 0.5 * (rs * rs + rp * rp);
+            }
+            alpha = mirror;
+            col = WATER_BODY * lit;
+        } else {
+            // From above. The surface is layers over what the passes
+            // behind drew — the seabed, a hull — each of which its own
+            // shader already carried through its way in the water
+            // (`water_fog`), so the hull shows as far as the water lets
+            // it. `alpha` is the share of the pixel the layers keep: the
+            // sun's glint, then the shoreline foam, then the reflectance
+            // of the bare water (`fres`: 2 % straight down, all of it
+            // toward the horizon). The opacity is the water's own; it
+            // does not grow with the sea's depth.
+            let fres = 0.02 + 0.98 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
+            // Approximate reflected sky: horizon haze at grazing, deep
+            // blue at the zenith, a warm forward-scatter lobe sun-side.
+            let r = reflect(ray, n);
+            let rup = clamp(dot(r, dir), 0.0, 1.0);
+            let rsun = max(dot(r, sun), 0.0);
+            var skyc = mix(vec3<f32>(0.38, 0.52, 0.74), vec3<f32>(0.045, 0.095, 0.24),
+                           pow(rup, 0.6));
+            skyc = skyc + vec3<f32>(0.55, 0.38, 0.20) * pow(rsun, 5.0);
+            if (!has_atmo) {
+                skyc = vec3<f32>(0.015, 0.02, 0.05);
+            }
+            // Sun glitter: the tight sparkle lobe rides the wave-normal
+            // map (Foam002's squiggly foam pattern) — at the old 2.6 gain
+            // every glint texel clipped to a glowing white worm. Keep the
+            // sparkle but at a gain that survives tonemapping.
+            let spec = pow(rsun, 700.0) * 1.1 + pow(rsun, 48.0) * 0.14;
+            let glint = clamp(sun_lum * vis * spec, vec3<f32>(0.0), vec3<f32>(1.0));
+            let sparkle = max(glint.r, max(glint.g, glint.b));
+            // Shoreline foam: a noise-broken band where the seabed meets
+            // the surface.
+            let foam_n = smoothstep(0.35, 0.85, 0.5 + 0.5 * vnoise3w(dir_fix, 5400.0));
+            let foam = clamp((1.0 - smoothstep(0.2, 2.6, depth)) * foam_n, 0.0, 1.0) * 0.75;
+            let water = foam + (1.0 - foam) * fres;
+            alpha = sparkle + (1.0 - sparkle) * water;
+            let kept = glint
+                     + (1.0 - sparkle) * (vec3<f32>(0.80, 0.85, 0.87) * lit * foam
+                                          + skyc * (0.22 + 0.78 * sun_up) * (water - foam));
+            col = kept / alpha;
+        }
     } else {
         // --- terrain --------------------------------------------------
         let n_macro = terrain_normal_fix(dir_fix, basis);
@@ -1274,20 +1366,38 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
             amb = vec3<f32>(0.016, 0.018, 0.030);
         }
         col = alb * (amb + lam * vis * sun_lum);
+        // Seen through water — the ground under the surface, or any
+        // ground with the eye in the water — it is absorbed on the sun's
+        // way down to it and the eye's way to it, red first, toward the
+        // water body.
+        if (u.planet.z > 0.0) {
+            water_path_m = water_path(u.planet.z, pa, pb);
+            if (water_path_m > 0.0) {
+                let depth_under = max(u.planet.z - length(pb), 0.0);
+                col = water_fog(col, depth_under, water_path_m, clamp(dot(dir, sun), 0.0, 1.0), vis);
+            }
+        }
     }
 
-    if (has_atmo) {
+    // The air the view ray crosses before the fragment — up to where it
+    // enters the water over an underwater fragment, and none with the
+    // eye in the water.
+    if (has_atmo && !eye_under) {
         let R = u.planet.x;
         let alt_a = max(length(pa) - R, 0.0);
         let alt_b = max(length(pb) - R, 0.0);
         let mua = dot(ray, pa / max(length(pa), 1.0));
         let mub = dot(ray, pb / max(length(pb), 1.0));
         let t_view = trans_between(alt_a, alt_b, mua, mub);
-        let ins = view_inscatter(pa, pb, ray, dist, i.clip.xy)
+        let ins = view_inscatter(pa, pb, ray, dist - water_path_m, i.clip.xy)
                 * mix(SHADE_K, 1.0, lit_frac);
         col = col * t_view + ins;
     }
-    return vec4<f32>(tone_map(col), alpha);
+    // The ocean blends premultiplied (`ocean_pipe`): `col × alpha` is
+    // the light its layer itself brings, and the tone curve takes that —
+    // a 2 % share of a reflected sky is a dark radiance in the curve's
+    // toe, not 2 % of the tone-mapped sky. The terrain's alpha is 1.
+    return vec4<f32>(tone_map(col * alpha), alpha);
 }
 
 // --- sky pass: fullscreen triangle, per-pixel scattering ray ----------
@@ -1596,14 +1706,44 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
     let sun = u.sun_dir.xyz;
     // View-space ray → body frame (view_rot columns are the view axes).
     let v = vec3<f32>(i.ndc.x * u.misc.x, i.ndc.y * u.misc.y, -1.0);
-    let rd = normalize((u.view_rot * vec4<f32>(v, 0.0)).xyz);
+    var rd = normalize((u.view_rot * vec4<f32>(v, 0.0)).xyz);
     // The framebuffer pixel fs_sky is storing into — the dither's seed.
     let px = vec2<u32>(i.clip.xy);
 
     let R = u.planet.x;
     let alt_a = max(length(pa) - R, 0.0);
-    let mu_eye = dot(rd, pa / max(length(pa), 1.0));
-    let t_bg = trans(alt_a, mu_eye); // 1.0 on vacuum bodies
+
+    // `pr` is the per-pixel ray footprint (tan(half-fov)·ndc/px) —
+    // the star profile floor. It must be computed HERE, in uniform
+    // control flow: fwidth is forbidden inside the data-dependent
+    // branches below that now gate `star_field` (C16-F4).
+    let pr = u.misc.y * fwidth(i.ndc.y);
+
+    // The eye in the water. Its ray to where it leaves the surface is
+    // `to_surface` metres of water, which absorb whatever this pass
+    // shades; leaving, the ray bends away from the vertical (water →
+    // air), so the sky shaded is the one in the refracted direction. The
+    // ocean surface drawn over this pass reflects the water body into the
+    // rest of the pixel and lets this through.
+    var to_surface = 0.0;
+    var sun_up_surface = 0.0;
+    if (u.planet.z > 0.0 && length(pa) < u.planet.z) {
+        let far = pa + rd * (4.0 * R);
+        to_surface = water_path(u.planet.z, pa, far);
+        let up = normalize(pa + rd * to_surface);
+        let cos_i = clamp(dot(rd, up), 0.0, 1.0);
+        let sun_up = max(dot(up, sun), 0.0);
+        // Past 48.8° from the vertical the ray does not leave the water
+        // at all: nothing above the surface reaches the eye, and this
+        // pass holds the water body alone.
+        let sin_t = WATER_IOR * sqrt(max(1.0 - cos_i * cos_i, 0.0));
+        if (sin_t >= 1.0) {
+            return sky_output(WATER_BODY * (0.10 + 0.90 * sun_up), px);
+        }
+        let cos_t = sqrt(1.0 - sin_t * sin_t);
+        rd = normalize(WATER_IOR * rd + (cos_t - WATER_IOR * cos_i) * up);
+        sun_up_surface = sun_up;
+    }
 
     // Space: near-black + the sun disc, all attenuated by the
     // atmosphere along the view ray. The starfield stays out of
@@ -1612,13 +1752,10 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
     // only), so they must be addable separately.
     let disc = pow(max(dot(rd, sun), 0.0), 4000.0) * 24.0;
     let halo = pow(max(dot(rd, sun), 0.0), 16.0) * 0.10;
-    // `pr` is the per-pixel ray footprint (tan(half-fov)·ndc/px) —
-    // the star profile floor. It must be computed HERE, in uniform
-    // control flow: fwidth is forbidden inside the data-dependent
-    // branches below that now gate `star_field` (C16-F4).
-    let pr = u.misc.y * fwidth(i.ndc.y);
     let space_bg = vec3<f32>(0.004, 0.006, 0.014)
                  + vec3<f32>(1.0, 0.95, 0.85) * (disc + halo);
+    let mu_eye = dot(rd, pa / max(length(pa), 1.0));
+    let t_bg = trans(alt_a, mu_eye); // 1.0 on vacuum bodies
 
     if (u.planet.y <= 0.0) {
         // Vacuum bodies see the raw night sky — nothing scatters
@@ -1746,6 +1883,9 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
         // so the ungated night sky stands (the old `col = space`
         // initializer's case, made an explicit arm).
         col = space_bg + sky_stars(rd, sun, pr);
+    }
+    if (to_surface > 0.0) {
+        col = water_fog(col, 0.0, to_surface, sun_up_surface, 1.0);
     }
     return sky_output(col, px);
 }

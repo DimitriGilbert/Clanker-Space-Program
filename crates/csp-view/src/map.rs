@@ -3467,7 +3467,9 @@ mod tests {
             friction_mu: 0.4,
             drag_cd: 1.0,
             convective_heat_fraction: csp_phys::DEFAULT_CONVECTIVE_HEAT_FRACTION,
+            touchdown_crush_m: csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M,
             terrain: None,
+            ocean: None,
         };
         let mut sim = SimWorld::with_physics(
             test_system(),

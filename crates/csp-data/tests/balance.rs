@@ -169,3 +169,204 @@ fn balance_economy_rates_are_gated() {
         "authored economy rates rejected: {errs:#?}"
     );
 }
+
+/// The v16 water tunables — `water_density_kg_m3` and `water_drag_cd`
+/// — are strictly positive: zero is as useless as a negative value
+/// (water with no density floats nothing; water with no drag does not
+/// slow a splashdown), so both report `PartNonPositive` at `0` and
+/// below, NaN reports `PartNonFinite`, and the authored file stays
+/// green at 1025 kg/m³ and 1.0.
+#[test]
+fn balance_water_tunables_are_gated() {
+    let fields = ["water_density_kg_m3", "water_drag_cd"];
+    for bad in [0.0, -1025.0] {
+        let mut b = csp_data::load_balance(&repo_root().join("data/balance.ron")).unwrap();
+        b.water_density_kg_m3 = bad;
+        b.water_drag_cd = bad;
+        let errs = csp_data::validate_balance(&b, &resources());
+        for field in fields {
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    csp_data::ValidationError::PartNonPositive { field: f, value, .. }
+                        if *f == field && *value == bad
+                )),
+                "{field} = {bad}: {errs:#?}"
+            );
+        }
+    }
+
+    let mut b = csp_data::load_balance(&repo_root().join("data/balance.ron")).unwrap();
+    b.water_density_kg_m3 = f64::NAN;
+    b.water_drag_cd = f64::NAN;
+    let errs = csp_data::validate_balance(&b, &resources());
+    for field in fields {
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                csp_data::ValidationError::PartNonFinite { field: f, .. } if *f == field
+            )),
+            "{field} NaN: {errs:#?}"
+        );
+    }
+
+    let b = csp_data::load_balance(&repo_root().join("data/balance.ron")).unwrap();
+    assert_eq!(b.water_density_kg_m3, 1025.0);
+    assert_eq!(b.water_drag_cd, 1.0);
+    let errs = csp_data::validate_balance(&b, &resources());
+    assert!(
+        !errs.iter().any(|e| matches!(
+            e,
+            csp_data::ValidationError::PartNonPositive { field, .. }
+            | csp_data::ValidationError::PartNonFinite { field, .. }
+                if fields.contains(field)
+        )),
+        "authored water tunables rejected: {errs:#?}"
+    );
+}
+
+/// The v17 touchdown tunable — `touchdown_crush_m` — is gated to
+/// (0, 5] m: zero is as useless as a negative value (the crush
+/// distance divides the spread load, so either makes every landing the
+/// solver's one-tick stop; `PartNonPositive`), NaN reports
+/// `PartNonFinite`, and past 5 m it reports `BadBalance` — a range
+/// failure, not a sign one — because the absorption would spread any
+/// impact short of 640 m/s over five metres. The authored file stays
+/// green at 0.5 m, and the bound itself is inside the gate (the
+/// `csp-phys` mirror is pinned from `csp-bench`, which can reach both).
+#[test]
+fn balance_touchdown_crush_is_gated() {
+    let path = repo_root().join("data/balance.ron");
+    for bad in [0.0, -0.5] {
+        let mut b = csp_data::load_balance(&path).unwrap();
+        b.touchdown_crush_m = bad;
+        let errs = csp_data::validate_balance(&b, &resources());
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                csp_data::ValidationError::PartNonPositive { field: f, value, .. }
+                    if *f == "touchdown_crush_m" && *value == bad
+            )),
+            "touchdown_crush_m = {bad}: {errs:#?}"
+        );
+    }
+
+    let mut b = csp_data::load_balance(&path).unwrap();
+    b.touchdown_crush_m = f64::NAN;
+    let errs = csp_data::validate_balance(&b, &resources());
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            csp_data::ValidationError::PartNonFinite { field: f, .. }
+                if *f == "touchdown_crush_m"
+        )),
+        "touchdown_crush_m NaN: {errs:#?}"
+    );
+
+    // Past 5 m the bound reports as a range failure.
+    for over in [5.5, 50.0] {
+        let mut b = csp_data::load_balance(&path).unwrap();
+        b.touchdown_crush_m = over;
+        let errs = csp_data::validate_balance(&b, &resources());
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                csp_data::ValidationError::BadBalance { field: f, .. }
+                    if *f == "touchdown_crush_m"
+            )),
+            "touchdown_crush_m = {over}: {errs:#?}"
+        );
+    }
+
+    let no_touchdown_error = |errs: &[csp_data::ValidationError]| {
+        !errs.iter().any(|e| {
+            matches!(
+                e,
+                csp_data::ValidationError::PartNonPositive { field: f, .. }
+                | csp_data::ValidationError::PartNonFinite { field: f, .. }
+                | csp_data::ValidationError::BadBalance { field: f, .. }
+                    if *f == "touchdown_crush_m"
+            )
+        })
+    };
+    // The bound itself is inside the gate.
+    let mut b = csp_data::load_balance(&path).unwrap();
+    b.touchdown_crush_m = 5.0;
+    let errs = csp_data::validate_balance(&b, &resources());
+    assert!(
+        no_touchdown_error(&errs),
+        "touchdown_crush_m = 5 m rejected: {errs:#?}"
+    );
+
+    let b = csp_data::load_balance(&path).unwrap();
+    assert_eq!(b.touchdown_crush_m, 0.5);
+    let errs = csp_data::validate_balance(&b, &resources());
+    assert!(
+        no_touchdown_error(&errs),
+        "authored touchdown crush rejected: {errs:#?}"
+    );
+}
+
+/// §3.1 rule A's canopy steering — `canopy_steady_arm_m` and
+/// `canopy_steady_damp_m_s` — is gated to finite and non-negative: zero
+/// is legal (it leaves the hang to the pull's own pendulum, the spin to
+/// the air), a negative value reports `PartNonPositive`, NaN
+/// `PartNonFinite`. There is no ceiling to gate — `csp-phys` cuts the
+/// couple to what the craft's inertia can follow in a tick. The authored
+/// file stays green at 1.0 m and 0.15 m·s, and a v17 file that predates
+/// the block — the frozen `flight-launch` fixture, pinned byte for byte
+/// by its golden — loads at the same values.
+#[test]
+fn balance_canopy_steering_is_gated() {
+    let path = repo_root().join("data/balance.ron");
+    let fields = ["canopy_steady_arm_m", "canopy_steady_damp_m_s"];
+    for bad in [-0.1, -2.0] {
+        let mut b = csp_data::load_balance(&path).unwrap();
+        b.canopy_steady_arm_m = bad;
+        b.canopy_steady_damp_m_s = bad;
+        let errs = csp_data::validate_balance(&b, &resources());
+        for field in fields {
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    csp_data::ValidationError::PartNonPositive { field: f, value, .. }
+                        if *f == field && *value == bad
+                )),
+                "{field} = {bad}: {errs:#?}"
+            );
+        }
+    }
+
+    let mut b = csp_data::load_balance(&path).unwrap();
+    b.canopy_steady_arm_m = f64::NAN;
+    b.canopy_steady_damp_m_s = f64::NAN;
+    let errs = csp_data::validate_balance(&b, &resources());
+    for field in fields {
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                csp_data::ValidationError::PartNonFinite { field: f, .. } if *f == field
+            )),
+            "{field} NaN: {errs:#?}"
+        );
+    }
+
+    // Zero is a legal way to author the steadying off.
+    let mut b = csp_data::load_balance(&path).unwrap();
+    b.canopy_steady_arm_m = 0.0;
+    b.canopy_steady_damp_m_s = 0.0;
+    assert!(csp_data::validate_balance(&b, &resources()).is_empty());
+
+    let authored = csp_data::load_balance(&path).unwrap();
+    let frozen =
+        csp_data::load_balance(&repo_root().join("data/test-fixtures/flight-launch/balance.ron"))
+            .unwrap();
+    for b in [&authored, &frozen] {
+        assert_eq!(b.canopy_steady_arm_m, 1.0);
+        assert_eq!(b.canopy_steady_damp_m_s, 0.15);
+        assert!(
+            csp_data::validate_balance(b, &resources()).is_empty(),
+            "authored canopy steering rejected"
+        );
+    }
+}

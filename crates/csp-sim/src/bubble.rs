@@ -256,6 +256,11 @@ impl StableDiscriminant for VesselState {
 /// origin (its `pos` point); `orientation` is the vessel's inertial
 /// `rot` expressed in the fixed frame, so unlatch reproduces the pose
 /// at any later tick's phase exactly.
+///
+/// `afloat` records what the vessel settled on: water, rather than
+/// ground. It is the simulation's `Splashed`-versus-`Landed` decision
+/// at the latch, kept because the pose alone cannot re-derive it —
+/// altitude says nothing about whether there is seabed under the keel.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SurfacePose {
     /// The body the vessel is latched to — the environment's dominant.
@@ -268,6 +273,11 @@ pub struct SurfacePose {
     pub altitude_m: f64,
     /// Body-fixed orientation: `R(axis, −ω·t_latch) ∘ rot` at capture.
     pub orientation: DQuat,
+    /// Held up by water at the latch — floating, not grounded. A
+    /// pre-water save decodes as grounded, which is what every vessel
+    /// in it was.
+    #[serde(default)]
+    pub afloat: bool,
 }
 
 /// The spin-phase rotation `R(axis, angle)` as a quaternion — callers
@@ -282,7 +292,8 @@ fn phase_quat(axis: DVec3, angle_rad: f64) -> DQuat {
 
 /// Capture `body`'s pose as a §2.6.4 surface record at `tick`.
 /// `dominant` names the body the record is relative to (the
-/// environment's central body).
+/// environment's central body); `afloat` records that the vessel
+/// settled on water rather than ground.
 ///
 /// `p_fix = R(axis, −ω·t)·(pos − body_center)`, then spherical: the
 /// record lives in the rotating frame so a latched vessel parked on a
@@ -294,6 +305,7 @@ pub fn surface_pose_capture(
     dominant: &BodyId,
     body: &WeldedBody,
     tick: SimTime,
+    afloat: bool,
 ) -> SurfacePose {
     let omega = env.body_spin.norm();
     let (axis, seconds) = if omega > 0.0 {
@@ -325,6 +337,7 @@ pub fn surface_pose_capture(
         longitude_rad,
         altitude_m,
         orientation,
+        afloat,
     }
 }
 

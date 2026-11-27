@@ -657,15 +657,9 @@ pub struct FlightHudInput<'a> {
     /// the build runs for minutes — without a persistent row the
     /// scene reads as a dead void.
     pub builds: &'a [crate::program::BuildRow],
-    /// The dominant body's terrain heightfield is still baking — the
-    /// flight scene draws sky/craft only until it lands (M5 §5.2-R2
-    /// arrival polish; the view never shows a flat datum stand-in).
-    /// `true` adds the chip's "GENERATING SURFACE" wait row.
-    pub terrain_pending: bool,
     /// P1's FPS readout — the host's smoothed wall-clock frame rate
     /// over its ~10-frame window. `0.0` = not yet measured (the row
-    /// hides — the same absent-until-real convention as
-    /// [`Self::terrain_pending`]); a real figure is always `> 0`.
+    /// hides); a real figure is always `> 0`.
     pub fps: f64,
     /// The same window's mean frame time (ms) — the CPU-or-GPU
     /// question the pair answers together.
@@ -886,6 +880,56 @@ pub fn notice_overlay(ctx: &egui::Context, lines: &[String]) -> Option<egui::Rec
     Some(shown.response.rect)
 }
 
+/// The loading screen's line while the flight scene's terrain is still
+/// being generated — a body the simulation has not baked for.
+pub const LOADING_TERRAIN: &str = "GENERATING SURFACE …";
+
+/// The loading screen's line while the host rebuilds the world.
+pub const LOADING_SESSION: &str = "LOADING …";
+
+/// The loading screen's backdrop — opaque, and the web shell's page
+/// colour, so the page's own loading screen hands over without a
+/// flash.
+pub const LOADING_BACKDROP: egui::Color32 = egui::Color32::from_rgb(5, 6, 10);
+
+/// The loading screen's line — light on the dark backdrop.
+pub const LOADING_TEXT: egui::Color32 = egui::Color32::from_rgb(198, 206, 222);
+
+/// The loading screen: an opaque backdrop over the whole viewport and
+/// one centred line, on the layer above every panel ([`LOADING_TERRAIN`]
+/// while the flight scene's terrain is generated, [`LOADING_SESSION`]
+/// while the host rebuilds the world or the panels make their entrance).
+/// The host keeps building the panels under it — egui lays a new `Area`
+/// out invisibly for a frame and then fades it in, and that is what the
+/// screen hides. Painted through a child `Ui` on a tooltip-order layer,
+/// never an `Area` of its own: an Area is invisible for its first frame,
+/// and the session line has exactly one presented frame to be seen in —
+/// the host holds the op for it. The backdrop is one clickable widget on
+/// that top layer, so a press during the wait never reaches the panels
+/// or the scene beneath it. Returns the covered rect, for the host's
+/// masks.
+pub fn loading_screen(ui: &mut egui::Ui, line: &str) -> egui::Rect {
+    let screen = ui.ctx().viewport_rect();
+    let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("loading_screen"));
+    let screen_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .scope_id(layer.id)
+            .layer_id(layer)
+            .max_rect(screen),
+    );
+    // The clickable backdrop: the topmost widget, so it takes the press.
+    screen_ui.interact(screen, layer.id, egui::Sense::click());
+    let painter = screen_ui.painter();
+    painter.rect_filled(screen, 0.0, LOADING_BACKDROP);
+    let galley = painter.layout_no_wrap(
+        line.to_owned(),
+        egui::FontId::proportional(16.0),
+        LOADING_TEXT,
+    );
+    painter.galley(screen.center() - galley.size() / 2.0, galley, LOADING_TEXT);
+    screen
+}
+
 /// The flight footer's keybind hint line — every binding derives
 /// through `Keymap::hint_labeled`, so a rebind can never leave a
 /// printed key stale (the help-panel rule). Pure so the format — and
@@ -948,22 +992,6 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
                 // Area's whole-rect move widget are hit-tested on top of
                 // it — a selectable label claims the drag press, so the
                 // panel cannot be grabbed by its own text (C23-F1).
-                //
-                // The terrain-bake wait row first, in BOTH branches below:
-                // while the dominant body's heightfield bakes the scene
-                // draws sky/craft only (never a flat datum sphere — M5
-                // §5.2-R2 arrival polish), and this line is the only
-                // on-screen cue for why the ground is missing.
-                if input.terrain_pending {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new("GENERATING SURFACE …")
-                                .font(egui::FontId::monospace(14.0))
-                                .color(egui::Color32::from_rgb(228, 192, 118)),
-                        )
-                        .selectable(false),
-                    );
-                }
                 if !input.has_vessel {
                     ui.add(
                         egui::Label::new(
@@ -1999,7 +2027,6 @@ mod tests {
             t_pe_s: None,
             period_s: None,
             builds: &[],
-            terrain_pending: false,
             fps: 0.0,
             frame_ms: 0.0,
             propellant,
@@ -2172,50 +2199,91 @@ mod tests {
         );
     }
 
-    /// M5 §5.2-R2 arrival polish: while the dominant body's heightfield
-    /// bakes, the flight scene draws sky/craft only and the HUD chip
-    /// carries the one-line "GENERATING SURFACE" wait row — the only
-    /// on-screen cue for the missing ground. `terrain_pending` must
-    /// add exactly that row: the chip grows by one label's height and
-    /// keeps its parked position (an Area that re-flowed into a
-    /// different corner would read as a mode change, not a wait).
+    /// The loading screen on the frame it is FIRST asked for: an opaque
+    /// backdrop covering the viewport and one centred line, ABOVE every
+    /// panel the host built under it — a `Foreground` Area drawn first
+    /// ends up beneath the screen and takes no click through it. No
+    /// `Area` carries the screen — egui lays a new Area out invisibly
+    /// for a frame before it shows — because the host holds a
+    /// world-replacing op for exactly one presented frame; a screen
+    /// that arrived a frame later would never be seen. It replaces the
+    /// "GENERATING SURFACE …" row the HUD chip used to carry, which drew
+    /// the HUD over a sky-only scene.
     #[test]
-    fn terrain_pending_row_appears_in_the_chip() {
-        let keys = settings::Keymap::default();
-        let key_labels = BTreeMap::new();
-        let prop: [PropellantGauge; 0] = [];
-        let mut input = hud_input(&keys, &key_labels, &prop);
-        let (ctx, raw) = hud_rig(960.0, 600.0);
-        let hud_id = egui::Id::unique("flight_hud");
-        // Warm the Area to its parked rect (see the drag test: the
-        // first pass records a stale rect before the off-screen
-        // correction), then measure the chip calm vs pending.
-        for _ in 0..3 {
-            run_frame(&ctx, raw.clone(), &input);
+    fn loading_screen_covers_the_viewport_and_the_panels_under_it() {
+        fn flat(shape: &egui::Shape, out: &mut Vec<egui::Shape>) {
+            match shape {
+                egui::Shape::Vec(inner) => inner.iter().for_each(|s| flat(s, out)),
+                s => out.push(s.clone()),
+            }
         }
-        let calm = ctx
-            .memory(|m| m.area_rect(hud_id))
-            .expect("hud area registered");
-        input.terrain_pending = true;
-        run_frame(&ctx, raw.clone(), &input);
-        let pending = ctx
-            .memory(|m| m.area_rect(hud_id))
-            .expect("hud area registered");
+        let (ctx, raw) = hud_rig(960.0, 600.0);
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(960.0, 600.0));
+        let on_button = egui::pos2(412.0, 292.0);
+        let click = |mut raw: egui::RawInput, covered: bool| {
+            raw.events = vec![
+                egui::Event::PointerMoved(on_button),
+                press(on_button, true),
+                press(on_button, false),
+            ];
+            let mut pressed = false;
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::Area::new(egui::Id::unique("under_test"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(egui::pos2(400.0, 280.0))
+                    .show(ui.ctx(), |ui| {
+                        pressed = ui.button("UNDER").clicked();
+                    });
+                if covered {
+                    assert_eq!(loading_screen(ui, LOADING_SESSION), screen);
+                }
+            });
+            out.textures_delta.clear();
+            let mut leaves = Vec::new();
+            for clipped in &out.shapes {
+                flat(&clipped.shape, &mut leaves);
+            }
+            (pressed, leaves)
+        };
+        // Frame 1 lays the Area out (its invisible sizing pass).
+        click(raw.clone(), false);
+        // Frame 2: the screen goes up over the laid-out panel.
+        let (pressed, leaves) = click(raw.clone(), true);
         assert!(
-            pending.height() > calm.height(),
-            "the wait row must add a line to the chip (calm {calm:?} vs pending {pending:?})"
+            !pressed,
+            "a press went through the screen to the panel under it"
         );
         assert!(
-            (pending.min - calm.min).length() < 1.0,
-            "the chip must not move while pending ({calm:?} → {pending:?})"
+            matches!(
+                leaves.as_slice(),
+                [.., egui::Shape::Rect(r), egui::Shape::Text(t)]
+                    if r.fill == LOADING_BACKDROP && r.rect == screen && t.galley.text() == LOADING_SESSION
+            ),
+            "the backdrop and its line are the last thing drawn: {leaves:?}"
+        );
+        assert!(
+            leaves
+                .iter()
+                .any(|s| matches!(s, egui::Shape::Text(t) if t.galley.text() == "UNDER")),
+            "the panel is built under the screen"
+        );
+        // Frame 3: the control — the same press reaches the panel once
+        // the screen is gone.
+        let (pressed, leaves) = click(raw, false);
+        assert!(pressed, "the press position is on the panel's button");
+        assert!(
+            !leaves
+                .iter()
+                .any(|s| matches!(s, egui::Shape::Rect(r) if r.fill == LOADING_BACKDROP)),
+            "no backdrop without the screen"
         );
     }
 
-    /// P1: the frame-timing row — `fps > 0` adds the readout line the
-    /// same way `terrain_pending` adds its wait row (one line of
-    /// height, no reflow), and a plausible figure formats as
-    /// fps + ms/frame. The plumbing contract this pins: the field is
-    /// absent-until-real (0.0 hides the row), never a placeholder.
+    /// P1: the frame-timing row — `fps > 0` adds the readout line to
+    /// the chip (one line of height, no reflow), and a plausible figure
+    /// formats as fps + ms/frame. The plumbing contract this pins: the
+    /// field is absent-until-real (0.0 hides the row), never a
+    /// placeholder.
     #[test]
     fn fps_row_appears_in_the_chip() {
         let keys = settings::Keymap::default();

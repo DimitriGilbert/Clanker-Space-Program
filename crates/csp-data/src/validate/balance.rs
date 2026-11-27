@@ -1,6 +1,9 @@
 //! The §8.3 `balance.ron` rules: `schema_version` and every numeric
 //! tunable inside the domain its `csp-sim` `*Config::is_valid` mirror
-//! gates at restore.
+//! gates at restore, plus the two water tunables `csp-phys`'s `Ocean`
+//! carries into the tick verbatim, the touchdown crush distance its
+//! joint-load evaluation reads, and the canopy steering its decelerator
+//! force model hangs a craft by.
 
 use crate::resource::ResourceFile;
 
@@ -306,5 +309,34 @@ pub fn validate_balance(
         b.reliability_bench_seconds_per_unit,
         &mut out,
     );
+    // Water physics — `Ocean`'s two authored tunables. The density is
+    // the mass a part displaces per submerged cubic metre: zero or
+    // negative water would leave "lighter than water" with no meaning
+    // (nothing could ever float). The drag coefficient is positive:
+    // zero would author water that does not slow a splashdown.
+    pos("water_density_kg_m3", b.water_density_kg_m3, &mut out);
+    pos("water_drag_cd", b.water_drag_cd, &mut out);
+    // M4c touchdown absorption — the crush distance divides the
+    // spread load `m·Δv²/(2·s)`: zero would make every landing the
+    // solver's one-tick stop again, by a division the data author
+    // never sees; and it is at most 5 m. The absorption spreads a stop
+    // the crush distance can hold (`|Δv|·dt < 2·s`) — 64 m/s at half a
+    // metre, 640 m/s at five — so a longer one would read an orbital
+    // impact as five metres of structure folding, and nothing would
+    // break on touchdown.
+    pos("touchdown_crush_m", b.touchdown_crush_m, &mut out);
+    if b.touchdown_crush_m > 5.0 {
+        out.push(ValidationError::BadBalance {
+            field: "touchdown_crush_m",
+            reason: "> 5 m — the absorption would spread any impact short of 640 m/s over five metres (|Δv|·dt < 2·s at dt = 1/64 s), and nothing would break on touchdown",
+        });
+    }
+    // §3.1 rule A — a deployed canopy's steadying. Both are magnitudes
+    // that may be authored off (`0` leaves the hang to the pull's own
+    // pendulum, the spin to the air), and neither has a stability
+    // ceiling to gate: `csp-phys` cuts the couple to what the craft's
+    // inertia can follow in a tick (`CANOPY_STEER_RATE_LIMIT_PER_S`).
+    nonneg("canopy_steady_arm_m", b.canopy_steady_arm_m, &mut out);
+    nonneg("canopy_steady_damp_m_s", b.canopy_steady_damp_m_s, &mut out);
     out
 }

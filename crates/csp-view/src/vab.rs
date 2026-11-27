@@ -1372,6 +1372,18 @@ mod tests {
         // reaches the scene.
         view.set_tutorial_active(false);
         view.set_vab_viewport(800.0, 600.0);
+        // The probe clicks on the next frame: a fresh view opens under
+        // the loading screen, which takes it.
+        crate::settle_ui(
+            &mut view,
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+        );
         let tank = csp_data::PartId::from("csp.tank.s320");
         view.with_vab_session(|v| {
             v.apply(csp_ui::vab::VabAction::SetRoot(tank.clone()))
@@ -1521,6 +1533,18 @@ mod tests {
         view.set_mode(crate::ViewMode::Vab);
         view.set_tutorial_active(false);
         view.set_vab_viewport(800.0, 600.0);
+        // The probe clicks on the next frame: a fresh view opens under
+        // the loading screen, which takes it.
+        crate::settle_ui(
+            &mut view,
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+        );
         let tank = csp_data::PartId::from("csp.tank.s320");
         view.with_vab_session(|v| {
             v.apply(csp_ui::vab::VabAction::SetRoot(tank.clone()))

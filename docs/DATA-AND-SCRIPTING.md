@@ -31,7 +31,7 @@ root; `cargo xtask …` is NOT an alias — always `cargo run -p xtask -- …`.
 | `data/systems/<sys>/colonies.ron` | Authored starting colonies (one Rask mining outpost) | `ColonyFile`/`ColonyDef` (`colony.rs`), `COLONY_SCHEMA_VERSION = 2` | `load_colonies` |
 | `data/contracts/<id>.ron` | Contract templates — **8 files** | `ContractTemplate` (`contract.rs`), v1 | `load_contracts` |
 | `data/techtree/<name>.ron` | Tech-tree fragments (`home.ron`: **4 nodes + 5 upgrade tracks**) | `TechTreeDef`/`TechNode`/`UpgradeTrack` (`techtree.rs`), v1 | `load_techtree` |
-| `data/balance.ron` | ~45 global tunables (physics caps, science, economy, reliability, `script_op_budget`) | `BalanceDef` (`balance.rs`), `BALANCE_SCHEMA_VERSION = 11` | `load_balance` |
+| `data/balance.ron` | 54 global tunables (physics caps, water, science, economy, reliability, `script_op_budget`) | `BalanceDef` (`balance.rs`), `BALANCE_SCHEMA_VERSION = 16` | `load_balance` |
 | `data/loc/en.ron` | English string table every `LocKey` resolves against | `LocFile` (`loc.rs`), v1 | `load_loc` |
 | `data/eval-scenarios/*.ron` | 5 `csp-eval` scenario files (§5.8) | `csp_bench::scenario` types | csp-eval bin |
 | `data/test-fixtures/<scenario>/` | Frozen golden-replay data sets + artifacts (§2) | — | csp-bench |
@@ -84,7 +84,7 @@ convention). `sites.ron`/`colonies.ron` are optional per system. `resources.ron`
 #### PartDef — `data/parts/<id>.ron` (`csp-data/src/part.rs::PartDef`)
 
 Field order: identity → economics → shape → scaling → physics → functionality →
-reliability → gating. A complete real example: `data/parts/csp.chute.s125.ron` (78
+reliability → gating. A complete real example: `data/parts/csp.chute.s125.ron` (118
 lines, includes a `Parachute` module); an engine example: `csp.engine.sparc.ron`.
 
 - `schema_version`, `id`, `family` (upgrade/qualification family, e.g.
@@ -101,6 +101,13 @@ lines, includes a `Parachute` module); an engine example: `csp.engine.sparc.ron`
   exponents are per-stat-family `s^e` (mass/cost/thrust/capacity/structural, bounded [0,4]).
   Discrete-scaled parts may not carry `Tank`/`Engine` modules (a size menu cannot scale their stats).
 - `collider: ColliderDef` — `Box{half_extents_m}` | `Cylinder{radius_m, half_height_m}` | `Convex{points}`.
+  The collider is also **what floats the part**: in water a part displaces the collider's
+  volume below the waterline (`csp-phys/src/water.rs`), and floats iff its mass is under
+  `water_density_kg_m3` × that volume. The volume is derived from the collider as authored —
+  a `Box` exactly, a `Cylinder` as the true cylinder (`π·radius²·2·half_height`, not the
+  16 contact points it tessellates into for ground contact), a `Convex` set as its own
+  polytope. Buoyancy acts at the centroid of the submerged part, so where a craft's weight
+  sits decides whether it floats upright.
 - `aero: {cd_curve, cl_curve, ref_len_m}` — piecewise-linear in Mach, clamped outside.
 - `thermal: {heat_capacity_j_per_k, max_temp_k, emissivity, conduction_w_per_k}`
   (validator: conduction ≤ capacity — thermal-Euler stability).
@@ -154,7 +161,9 @@ lines, includes a `Parachute` module); an engine example: `csp.engine.sparc.ron`
 `tilt_rad, orbit: Option<KeplerElements>` (incl. a redundant authored `period_s` the
 validator checks against `2π√(a³/μ_parent)` to 1e-9 — `PERIOD_REL_TOL`), `atmosphere:
 Option<AtmosphereDef>` (exponential `p0·exp(−h/H)` to a hard cut at `top_m`, plus a
-piecewise-linear temperature table), `ocean: Option<{datum_radius_m}>`, `terrain:
+piecewise-linear temperature table), `ocean: Option<{datum_radius_m}>` (where `Some`, water fills the body from its
+seabed up to that sphere — buoyancy and drag, `csp-phys/src/water.rs`; the water's density and
+drag come from `balance.ron`), `terrain:
 {noise_seed, heightmap, amplitude_frac, relief}` (v2: the M5 §5.2-R2 authored
 amplitude `radius_m·amplitude_frac` and `ReliefProfile` — Legacy/Mountain, with
 serde defaults so v1 files load unchanged), `biome_map: Option<{png, legend}>`,
@@ -216,15 +225,41 @@ still costs its own science. `data/techtree/home.ron` ships 4 nodes (`tech.start
 0 → `tech.science.1` 15 → `tech.rocketry.2` 30 → `tech.rocketry.3` 60) and 5 tracks.
 (Note: the review map's "9-node techtree" counts nodes+tracks; the file has 4 nodes.)
 
-#### balance.ron — `BalanceDef` (`balance.rs`, v11)
+#### balance.ron — `BalanceDef` (`balance.rs`, v17)
 
-~45 named tunables, each a mirror of a sim-side default: bubble radius 20 km,
+57 named tunables, each a mirror of a sim-side default: bubble radius 20 km,
 `advance_to_max_events_per_frame` 2000, object caps, docking capture thresholds,
 transfer radius/rate, science soft-cap `k` and `lab_science_per_data`,
 `transmit_ec_per_data_unit`, `starting_funds_micros`, salary cadence, hire cost,
 recovery efficiency 0.9, `contract_offer_slots`, `manufacture_rate_kg_per_s`, life
 support rates, **`script_op_budget: 20_000`**, and the reliability block (dormant
-scale, ignition hazard, bench costs). ALL tuning lives here (PLAN §8.3).
+scale, ignition hazard, bench costs), and the water block (v16): **`water_density_kg_m3`
+(1025)** — the mass a part displaces per submerged cubic metre of its collider, so a part
+floats iff its own density is lower; **`water_drag_cd` (1.0)** — the quadratic drag
+coefficient on every part in water, over the submerged share of its projected area. The
+M4c landing adds (v17) **`touchdown_crush_m` (0.5)** — the crush distance the §2.4
+joint-load evaluation spreads a touchdown's ground stop over: an inline joint carries
+`m·Δv²/(2·s)` instead of the solver's one-tick `m·Δv/dt` (mirror:
+`csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M`; `SIMULATION.md` §5, "Structural breakup"). The
+three are strictly positive in the validator (zero or negative reports `PartNonPositive`,
+NaN `PartNonFinite`), and `touchdown_crush_m` is capped at 5 m (above it `BadBalance`: a
+longer crush would spread any impact short of 640 m/s); all must be mirrored in every
+`balance.ron` — `data/`, the `flight-launch` fixture and `apps/demo/data/` — along with the
+schema pin in `xtask/src/lint_deps.rs`. ALL tuning lives here (PLAN §8.3).
+
+§3.1 rule A's **canopy steering** rides the same v17: **`canopy_steady_arm_m` (1.0)** and
+**`canopy_steady_damp_m_s` (0.15)** — how a deployed canopy steadies the craft hanging from
+it, as a couple proportional to its own pull: the arm (m) turns the craft's axis onto the
+airflow, the damping (m·s) opposes its spin (`csp_phys::CanopySteering`;
+`SIMULATION.md` §5, "Canopy steering"). Mirrors: `csp_phys::DEFAULT_CANOPY_STEADY_ARM_M`,
+`DEFAULT_CANOPY_STEADY_DAMP_M_S`. Both are finite and non-negative in the validator —
+zero is legal, it authors a share off — and neither has a ceiling to gate, since `csp-phys`
+cuts the couple to what the craft's inertia can follow in a tick. They are the one block a
+`balance.ron` may omit: additive under the same `schema_version` with serde defaults
+(`csp_data::balance::DEFAULT_CANOPY_STEADY_*`, pinned to the `csp-phys` mirrors by a
+`csp-bench` test), because the frozen `flight-launch` fixture is pinned byte for byte by
+its golden and predates them — a file that carries neither field loads the shipped values,
+and a world restored from a §7.6 artifact runs the build's.
 
 ### 1.4 Loading pipeline — loaders → validator → game wiring
 

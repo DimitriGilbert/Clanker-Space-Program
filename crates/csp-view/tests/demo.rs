@@ -155,8 +155,9 @@ fn new_demo_builds_scenario_and_enforces_constraints() {
         assert_eq!(v.part_limit(), Some(demo::DEMO_PART_LIMIT));
         assert!(!v.file_io());
         // W1.5-b: pod + tank + engine + canister + battery — the
-        // science leg ships on the starter.
-        assert_eq!(v.session().len(), 5, "the seeded starter craft");
+        // science leg ships on the starter — and the chute on the
+        // pod's top node (M4c landing).
+        assert_eq!(v.session().len(), 6, "the seeded starter craft");
         assert_eq!(v.session().name(), "Demo Hopper");
     });
 

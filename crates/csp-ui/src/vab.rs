@@ -927,6 +927,44 @@ impl VabSession {
         self.body_xforms = self.session.body_transforms();
     }
 
+    /// The Staging list, highest stage first: every listed stage (see
+    /// `CraftSession::listed_stages`) with the parts assigned to it and
+    /// its readout figures, when the analysis resolved.
+    fn stage_rows(&self) -> Vec<StageRow> {
+        let session = self.session();
+        let readout = |stage: u32| {
+            self.analysis()
+                .and_then(|a| a.stages.iter().find(|st| st.stage == stage))
+        };
+        session
+            .listed_stages()
+            .into_iter()
+            .map(|stage| {
+                let st = readout(stage);
+                StageRow {
+                    stage,
+                    // The loc display name (palette/notices convention);
+                    // `node_label` falls back to the part id when no loc
+                    // table is installed.
+                    parts: session
+                        .parts_in_stage(stage)
+                        .into_iter()
+                        .map(|id| (id, self.node_label(id)))
+                        .collect(),
+                    n_severed: st.map_or(0, |st| st.separated_ids.len()),
+                    stats: st.filter(|st| !st.engine_ids.is_empty()).map(|st| {
+                        (
+                            st.delta_v_m_per_s,
+                            st.twr_surface,
+                            st.burn_time_s,
+                            st.thrust_vac_n,
+                        )
+                    }),
+                }
+            })
+            .collect()
+    }
+
     /// Apply one [`VabAction`] — the shared entry for panels, input
     /// events, and (later) session-class tools. Mutations mark the
     /// session dirty for the next `recompute`; every call lands a
@@ -1123,11 +1161,14 @@ impl VabSession {
                 Some(format!("inserted stage {at}"))
             }
             VabAction::RemoveStage(at) => {
+                let had_parts = !self.session.parts_in_stage(at).is_empty();
                 self.session.remove_stage(at);
                 self.dirty = true;
-                Some(format!(
-                    "removed stage {at} — its parts folded down a stage"
-                ))
+                Some(if had_parts {
+                    format!("removed stage {at} — its parts folded down a stage")
+                } else {
+                    format!("removed empty stage {at}")
+                })
             }
             VabAction::CompactStages => {
                 self.session.compact_stages().map_err(VabError::Session)?;
@@ -3503,22 +3544,48 @@ fn craft_section(
     }
 }
 
+/// The highest stage the editor's controls reach — the inspector's
+/// numeric field and the Staging list's "up" and "+ stage" buttons stop
+/// here together.
+const STAGE_MAX: i32 = 64;
+
+/// One row of the Staging list.
+struct StageRow {
+    stage: u32,
+    /// Every part assigned to the stage, ascending id.
+    parts: Vec<(PartNodeId, String)>,
+    n_severed: usize,
+    /// `(Δv, TWR, burn time, thrust)` on a stage that has engines.
+    stats: Option<(f64, f64, f64, f64)>,
+}
+
 /// The stage column: firing order rows (highest stage fires first)
-/// with each stage's parts and its live readout line.
+/// with each stage's parts and its live readout line. A row lists the
+/// parts ASSIGNED to its stage, so every part appears exactly once
+/// wherever an earlier firing drops it, and the selected part's row
+/// carries the buttons that move it a stage up or down.
 fn staging_section(ui: &mut egui::Ui, vab: &mut VabSession) {
     ui.heading("Staging");
+    // The highest listed stage: "+ stage" opens the one above it and
+    // "− stage" removes it. With no listed stage there is neither, and
+    // "+ stage" stops at `STAGE_MAX` like "up" and the inspector's
+    // number — the session's own cap is far higher.
+    let top = vab.session().listed_stages().first().copied();
     ui.horizontal(|ui| {
-        if ui.small_button("+ stage").clicked() {
-            let top = vab
-                .session()
-                .populated_stages()
-                .last()
-                .copied()
-                .unwrap_or(0);
-            let _ = vab.apply(VabAction::InsertStage(top.saturating_add(1)));
+        if ui
+            .add_enabled(
+                top.is_some_and(|top| top < STAGE_MAX as u32),
+                egui::Button::new("+ stage").small(),
+            )
+            .clicked()
+            && let Some(next) = top.map(|top| top.saturating_add(1))
+        {
+            let _ = vab.apply(VabAction::InsertStage(next));
         }
-        if ui.small_button("− stage").clicked()
-            && let Some(top) = vab.session().populated_stages().last().copied()
+        if ui
+            .add_enabled(top.is_some(), egui::Button::new("− stage").small())
+            .clicked()
+            && let Some(top) = top
         {
             let _ = vab.apply(VabAction::RemoveStage(top));
         }
@@ -3526,44 +3593,17 @@ fn staging_section(ui: &mut egui::Ui, vab: &mut VabSession) {
             let _ = vab.apply(VabAction::CompactStages);
         }
     });
-    // Snapshot the stage rows — the labels below mutate `vab` through
-    // `apply`, so no borrow of the analysis may cross them.
-    type StageRow = (
-        u32,
-        Vec<(PartNodeId, String)>,
-        usize,
-        Option<(f64, f64, f64, f64)>,
-    );
-    let stage_rows: Vec<StageRow> = vab
-        .analysis()
-        .map(|a| {
-            a.stages
-                .iter()
-                .map(|st| {
-                    let parts = st
-                        .part_ids
-                        .iter()
-                        // The loc display name (palette/notices
-                        // convention); `node_label` falls back to the
-                        // part id when no loc table is installed.
-                        .map(|id| (*id, vab.node_label(*id)))
-                        .collect();
-                    let stats = (!st.engine_ids.is_empty()).then_some((
-                        st.delta_v_m_per_s,
-                        st.twr_surface,
-                        st.burn_time_s,
-                        st.thrust_vac_n,
-                    ));
-                    (st.stage, parts, st.separated_ids.len(), stats)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    for (stage_idx, parts, n_severed, stats) in &stage_rows {
+    // Owned rows — the widgets below mutate `vab` through `apply`, so
+    // no borrow of the session may outlive this call.
+    for row in vab.stage_rows() {
         ui.separator();
-        ui.label(format!("stage {stage_idx}"));
-        for (id, name) in parts {
-            let id = *id;
+        ui.horizontal(|ui| {
+            ui.label(format!("stage {}", row.stage));
+            if row.parts.is_empty() {
+                ui.weak("(empty)");
+            }
+        });
+        for (id, name) in row.parts {
             let is_sel = vab.selected() == Some(id);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
@@ -3573,17 +3613,65 @@ fn staging_section(ui: &mut egui::Ui, vab: &mut VabSession) {
                 {
                     let _ = vab.apply(VabAction::Select(Some(id)));
                 }
+                if is_sel {
+                    stage_move_buttons(ui, vab, id, row.stage);
+                }
             });
         }
-        if *n_severed > 0 {
-            ui.weak(format!("  severs {n_severed} part(s)"));
+        if row.n_severed > 0 {
+            ui.weak(format!("  severs {} part(s)", row.n_severed));
         }
-        if let Some((dv, twr, burn, thrust)) = stats {
+        if let Some((dv, twr, burn, thrust)) = row.stats {
             ui.monospace(format!(
                 "  Δv {dv:>7.0} m/s  TWR {twr:>5.2}  burn {burn:>5.0} s  F {:.0} kN",
                 thrust / 1000.0,
             ));
         }
+    }
+}
+
+/// The selected part's stage movers — one stage up (`stage + 1`, fires
+/// earlier) or down (`stage − 1`, fires later) per press. Both end in
+/// the same `SetStage` the inspector's numeric field issues.
+fn stage_move_buttons(ui: &mut egui::Ui, vab: &mut VabSession, id: PartNodeId, stage: u32) {
+    // `then_some` evaluates eagerly: every target must be safe to form
+    // even where the button is disabled.
+    stage_step(
+        ui,
+        vab,
+        id,
+        "up",
+        (stage < STAGE_MAX as u32).then_some((stage.saturating_add(1), "fires earlier")),
+    );
+    stage_step(
+        ui,
+        vab,
+        id,
+        "down",
+        (stage > 0).then_some((stage.saturating_sub(1), "fires later")),
+    );
+}
+
+/// One stage mover: live while `target` is a stage the part can move
+/// to, greyed out past the top or at the stage-0 floor.
+fn stage_step(
+    ui: &mut egui::Ui,
+    vab: &mut VabSession,
+    id: PartNodeId,
+    label: &str,
+    target: Option<(u32, &str)>,
+) {
+    let button = egui::Button::new(label).small();
+    let Some((stage, effect)) = target else {
+        ui.add_enabled(false, button);
+        return;
+    };
+    if ui
+        .add(button)
+        .on_hover_text(format!("move to stage {stage} — {effect}"))
+        .clicked()
+    {
+        let _ = vab.apply(VabAction::SetStage { node: id, stage });
     }
 }
 
@@ -3639,7 +3727,7 @@ fn selected_section(ui: &mut egui::Ui, vab: &mut VabSession) {
     ui.horizontal(|ui| {
         ui.label("stage");
         if ui
-            .add(egui::DragValue::new(&mut stage).range(0..=64))
+            .add(egui::DragValue::new(&mut stage).range(0..=STAGE_MAX))
             .changed()
         {
             let _ = vab.apply(VabAction::SetStage {
@@ -5756,6 +5844,275 @@ mod tests {
             out.launch,
             "a click on the strip's rightmost control {launch_rect:?} \
              must emit VabUiOutput::launch"
+        );
+    }
+
+    /// A tank root with an engine under it — two stage-0 parts to move.
+    fn stack_vab() -> (VabSession, PartNodeId, PartNodeId) {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.eng"),
+            parent: root,
+        })
+        .unwrap();
+        let eng = vab.selected().unwrap();
+        (vab, root, eng)
+    }
+
+    /// The Staging list as `(stage, parts)` — what the panel shows,
+    /// top row first.
+    fn listed(vab: &VabSession) -> Vec<(u32, Vec<PartNodeId>)> {
+        vab.stage_rows()
+            .into_iter()
+            .map(|r| (r.stage, r.parts.into_iter().map(|(id, _)| id).collect()))
+            .collect()
+    }
+
+    /// The Staging section alone in a frameless window at a fixed
+    /// place, for the pass it is called in. Returns the window rect.
+    fn staging_window(ctx: &egui::Context, vab: &mut VabSession) -> egui::Rect {
+        egui::Window::new("staging")
+            .title_bar(false)
+            .resizable(false)
+            .fixed_pos(egui::pos2(100.0, 100.0))
+            .show(ctx, |ui| staging_section(ui, vab))
+            .map_or(egui::Rect::NOTHING, |r| r.response.rect)
+    }
+
+    /// One pass drawing the Staging section, with `events` pending for
+    /// it. Returns the window rect.
+    fn draw_staging(
+        ctx: &egui::Context,
+        vab: &mut VabSession,
+        events: Vec<egui::Event>,
+    ) -> egui::Rect {
+        let mut window = egui::Rect::NOTHING;
+        ctx.run_pass(egui_input(events), |ctx| {
+            window = staging_window(ctx, vab);
+        })
+        .drop_without_applying_deltas();
+        window
+    }
+
+    /// The widgets the last pass drew inside `window`, grouped into
+    /// rows top to bottom, left to right inside a row. Disabled
+    /// widgets take no input, so they are not listed.
+    fn widget_rows(ctx: &egui::Context, window: egui::Rect) -> Vec<Vec<egui::Rect>> {
+        let mut widgets: Vec<egui::Rect> = ctx
+            .interactive_rects_last_pass()
+            .into_iter()
+            .filter(|r| window.contains(r.center()) && *r != window)
+            .collect();
+        widgets.sort_by(|a, b| a.center().y.total_cmp(&b.center().y));
+        let mut rows: Vec<Vec<egui::Rect>> = Vec::new();
+        for r in widgets {
+            match rows.last_mut() {
+                Some(row) if (row[0].center().y - r.center().y).abs() < 8.0 => row.push(r),
+                _ => rows.push(vec![r]),
+            }
+        }
+        for row in &mut rows {
+            row.sort_by(|a, b| a.left().total_cmp(&b.left()));
+        }
+        rows
+    }
+
+    /// How many widgets each drawn row holds, top to bottom.
+    fn row_widths(rows: &[Vec<egui::Rect>]) -> Vec<usize> {
+        rows.iter().map(Vec::len).collect()
+    }
+
+    /// A primary click on the Staging widget at `pos`.
+    fn click_staging(ctx: &egui::Context, vab: &mut VabSession, pos: egui::Pos2) {
+        draw_staging(
+            ctx,
+            vab,
+            vec![
+                egui::Event::PointerMoved(pos),
+                primary_button(pos, true),
+                primary_button(pos, false),
+            ],
+        );
+    }
+
+    /// Every text run one pass of `draw` puts on screen.
+    fn drawn_texts(ctx: &egui::Context, draw: impl FnMut(&egui::Context)) -> Vec<String> {
+        fn collect(shape: &egui::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => texts.push(t.galley.text().to_owned()),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, texts)),
+                _ => {}
+            }
+        }
+        let output = ctx.run_pass(egui_input(Vec::new()), draw);
+        let mut texts = Vec::new();
+        for cs in &output.shapes {
+            collect(&cs.shape, &mut texts);
+        }
+        output.drop_without_applying_deltas();
+        texts
+    }
+
+    /// The Staging panel's own controls, clicked for real: "+ stage"
+    /// lists an empty stage, the selected part's row moves it up and
+    /// down one stage per press — the list follows, and so does the
+    /// inspector's stage number — and "− stage" removes the stage.
+    ///
+    /// Row 0 of the drawn widgets is the heading, row 1 the three
+    /// header buttons; below them each stage draws a "stage N" label
+    /// row and then a row per part.
+    #[test]
+    fn staging_panel_moves_a_part_between_listed_stages() {
+        let ctx = egui::Context::default();
+        let (mut vab, root, eng) = stack_vab();
+        vab.apply(VabAction::Select(Some(eng))).unwrap();
+        let mut window = egui::Rect::NOTHING;
+        for _ in 0..3 {
+            window = draw_staging(&ctx, &mut vab, Vec::new());
+        }
+        // A stage-0 part has no "down" to press, so its row is the
+        // label and "up".
+        let rows = widget_rows(&ctx, window);
+        assert_eq!(row_widths(&rows), vec![1, 3, 1, 1, 2], "{rows:?}");
+
+        // "+ stage" is the header's leftmost button.
+        click_staging(&ctx, &mut vab, rows[1][0].center());
+        assert_eq!(
+            listed(&vab),
+            vec![(1, vec![]), (0, vec![root, eng])],
+            "the new stage is listed, empty, above the parts"
+        );
+        let texts = drawn_texts(&ctx, |ctx| {
+            staging_window(ctx, &mut vab);
+        });
+        assert!(
+            texts.iter().any(|t| t == "(empty)"),
+            "the empty stage is not marked: {texts:?}"
+        );
+
+        // "up" sits right of the selected part's label: stage 0 → 1.
+        window = draw_staging(&ctx, &mut vab, Vec::new());
+        let rows = widget_rows(&ctx, window);
+        assert_eq!(row_widths(&rows), vec![1, 3, 2, 1, 1, 2], "{rows:?}");
+        click_staging(&ctx, &mut vab, rows[5][1].center());
+        assert_eq!(
+            listed(&vab),
+            vec![(1, vec![eng]), (0, vec![root])],
+            "the part moved into the new stage"
+        );
+        assert_eq!(vab.session().stage_of(eng), Some(1));
+        let texts = drawn_texts(&ctx, |ctx| {
+            staging_window(ctx, &mut vab);
+        });
+        assert!(
+            !texts.iter().any(|t| t == "(empty)"),
+            "a stage holding the part is not empty: {texts:?}"
+        );
+
+        // Moved up, the part's row gains "down" and rises with it.
+        window = draw_staging(&ctx, &mut vab, Vec::new());
+        let rows = widget_rows(&ctx, window);
+        assert_eq!(row_widths(&rows), vec![1, 3, 1, 3, 1, 1], "{rows:?}");
+        click_staging(&ctx, &mut vab, rows[3][2].center());
+        assert_eq!(
+            listed(&vab),
+            vec![(1, vec![]), (0, vec![root, eng])],
+            "the part moved back down; the stage stays listed"
+        );
+        assert_eq!(vab.session().stage_of(eng), Some(0));
+        window = draw_staging(&ctx, &mut vab, Vec::new());
+        let rows = widget_rows(&ctx, window);
+        click_staging(&ctx, &mut vab, rows[5][1].center());
+        assert_eq!(vab.session().stage_of(eng), Some(1), "and up again");
+
+        // The inspector reads the same stage: its line for the part
+        // names it, and its numeric field shows it. A window egui has
+        // not laid out before paints from its second pass on, so read
+        // the last of a few.
+        let mut texts = Vec::new();
+        for _ in 0..3 {
+            texts = drawn_texts(&ctx, |ctx| {
+                let mut out = VabUiOutput::default();
+                inspector_panel(ctx, &mut vab, &[], &mut out);
+            });
+        }
+        assert!(
+            texts.iter().any(|t| t.starts_with("stage 1 · scale")),
+            "the inspector's stage line did not follow: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.trim() == "1"),
+            "the inspector's stage number did not follow: {texts:?}"
+        );
+
+        // "− stage" removes the stage; its part folds down a stage.
+        window = draw_staging(&ctx, &mut vab, Vec::new());
+        let rows = widget_rows(&ctx, window);
+        click_staging(&ctx, &mut vab, rows[1][1].center());
+        assert_eq!(listed(&vab), vec![(0, vec![root, eng])]);
+        assert_eq!(vab.session().stage_of(eng), Some(0));
+    }
+
+    /// Nothing staged, nothing to add above or remove: on an empty craft
+    /// only "compact" takes input.
+    #[test]
+    fn stage_buttons_are_disabled_on_an_empty_craft() {
+        let ctx = egui::Context::default();
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        let mut window = egui::Rect::NOTHING;
+        for _ in 0..3 {
+            window = draw_staging(&ctx, &mut vab, Vec::new());
+        }
+        let rows = widget_rows(&ctx, window);
+        assert_eq!(row_widths(&rows), vec![1, 1], "{rows:?}");
+        assert!(listed(&vab).is_empty(), "an empty craft lists no stage");
+    }
+
+    /// "+ stage" stops at `STAGE_MAX`, where "up" and the inspector's
+    /// number already do: one stage under the cap it still opens the
+    /// top stage; at the cap it greys out and takes no click, while
+    /// "− stage" and "compact" stay live.
+    #[test]
+    fn stage_button_stops_at_the_stage_cap() {
+        let ctx = egui::Context::default();
+        let (mut vab, root, eng) = stack_vab();
+        let cap = STAGE_MAX as u32;
+        vab.apply(VabAction::SetStage {
+            node: eng,
+            stage: cap - 1,
+        })
+        .unwrap();
+        let mut window = egui::Rect::NOTHING;
+        for _ in 0..3 {
+            window = draw_staging(&ctx, &mut vab, Vec::new());
+        }
+        let rows = widget_rows(&ctx, window);
+        assert_eq!(row_widths(&rows)[1], 3, "{rows:?}");
+        click_staging(&ctx, &mut vab, rows[1][0].center());
+        assert_eq!(
+            listed(&vab)[0].0,
+            cap,
+            "the stage under the cap opens one more"
+        );
+
+        for _ in 0..3 {
+            window = draw_staging(&ctx, &mut vab, Vec::new());
+        }
+        let rows = widget_rows(&ctx, window);
+        assert_eq!(
+            row_widths(&rows)[1],
+            2,
+            "at the cap the header offers no \"+ stage\": {rows:?}"
+        );
+        // The header's leftmost live button is "− stage".
+        click_staging(&ctx, &mut vab, rows[1][0].center());
+        assert_eq!(
+            listed(&vab),
+            vec![(cap - 1, vec![eng]), (0, vec![root])],
+            "\"− stage\" removed the opened stage at the cap"
         );
     }
 }

@@ -143,6 +143,17 @@ pub use csp_ui::settings;
 #[derive(Resource, Default)]
 pub struct Clock(pub SimTime);
 
+/// The frame's fractional tick remainder — how far past [`Clock`] the
+/// frame is, in ticks, `[0, 1)`. `csp-app`'s warp controller is the one
+/// source ([`View::set_tick_fraction`], every frame); the schedules
+/// read it here and never touch the clock's fraction themselves. It is
+/// what `flight_interp` interpolates the staged poses with (§2.5). The
+/// default `0` carries no fractional time: every pose is drawn exactly
+/// as staged at the clock's tick. Presentation data only — never read
+/// by the sim, never part of any hash.
+#[derive(Resource, Default)]
+pub struct TickFraction(pub f64);
+
 /// Proof-of-life stats shown in the debug panel — written by [`sync_mirrors`]
 /// from the last [`AdvanceReport`](csp_sim::AdvanceReport), never by the sim
 /// path directly (Appendix A item 1).
@@ -345,6 +356,8 @@ pub struct SessionMirror {
 ///   `csp-app`; the pass itself is the [`build_ui`] system.
 /// - `output`: the completed `egui::FullOutput`, consumed by `csp-app`'s
 ///   painter (platform output, tessellation, textures delta).
+/// - `arrival`: the panels' entrance clock — the loading screen's
+///   arrival half (`UiArrival`).
 #[derive(Resource, Default)]
 pub struct EguiPass {
     /// The egui context — lives here so `UiBuild` can run the pass.
@@ -353,6 +366,58 @@ pub struct EguiPass {
     pub input: egui::RawInput,
     /// The completed pass — `Some` after `UiBuild` ran this frame.
     pub output: Option<egui::FullOutput>,
+    /// The panels' entrance on this context.
+    arrival: UiArrival,
+}
+
+/// The panels' entrance — the loading screen's arrival half. egui lays
+/// every `Area` out invisibly on its first pass (the sizing pass) and
+/// fades it in over `Style::animation_time`; a screen lifted before that
+/// uncovers a frame with no HUD, and the HUD then fades in after the
+/// scene. So the panels are built under the screen, and the screen stays
+/// until they have been built for that long. The clock is egui's frame
+/// time (`InputState::time`), and only the steps between passes count:
+/// the first pass on a context is where the entrance starts, never an
+/// age. A fresh context reads 0.0, so a host stamping the time from its
+/// own epoch hands that first pass the whole session so far (New Game
+/// replaces the `View` under the one `egui_winit::State`) or the time
+/// spent before the first frame — an offset, not an elapsed time. The
+/// time is the host's wall clock, presentation only (§2.5) — the
+/// predicted frame time when a headless host feeds no clock. Not sim
+/// state.
+#[derive(Default)]
+struct UiArrival {
+    /// The egui time of the last panel pass — `None` until one was built.
+    at: Option<f64>,
+    /// The egui time the passes after the first have spanned.
+    age: f32,
+}
+
+impl UiArrival {
+    /// A panel pass was built at egui time `time`. The first pass
+    /// starts the clock; each later one ages it by its step from the
+    /// pass before.
+    fn pass_built(&mut self, time: f64) {
+        if let Some(prev) = self.at.replace(time) {
+            self.age += (time - prev) as f32;
+        }
+    }
+
+    /// Whether the panels built so far are past their entrance: a pass
+    /// has been built — the first is every panel's sizing pass, covered
+    /// whatever the style's `animation_time` — and the passes after it
+    /// span `animation_time`.
+    fn settled(&self, animation_time: f32) -> bool {
+        self.at.is_some() && self.age >= animation_time
+    }
+}
+
+impl EguiPass {
+    /// Whether the panels are past their entrance — the loading
+    /// screen's arrival half.
+    fn arrived(&self) -> bool {
+        self.arrival.settled(self.ctx.global_style().animation_time)
+    }
 }
 
 impl Drop for EguiPass {
@@ -525,6 +590,9 @@ struct MapUi<'w> {
 struct FlightScene<'w> {
     /// The mirrored flight scene — the pick targets.
     snap: Res<'w, flight::FlightSnapshot>,
+    /// The poses that scene is drawn at this frame — where the parts
+    /// are on screen under the solved camera.
+    drawn: Res<'w, flight::DrawnScene>,
     /// The solved chase camera — the projection.
     cam: Res<'w, flight::FlightCameraF64>,
     /// The flight-focus pin/override — the shared resolver.
@@ -563,6 +631,19 @@ fn build_ui(
     } else {
         csp_ui::ModeSelect::Flight
     };
+    // The loading screen covers the frame while anything is still
+    // pending — the flight scene's terrain, a world-replacing session op
+    // the host holds, or the panels' own entrance — and what it lifts
+    // onto is the finished frame: a panel popping in over a half-built
+    // scene is what it replaces. Map and VAB draw no terrain, so the
+    // terrain half is flight-only.
+    let loading_line = if mode == csp_ui::ModeSelect::Flight && flight_ui.terrain_pending {
+        Some(csp_ui::LOADING_TERRAIN)
+    } else if flight_ui.session_loading || !egui.arrived() {
+        Some(csp_ui::LOADING_SESSION)
+    } else {
+        None
+    };
     let input = csp_ui::DebugPanelInput {
         adapter_name: &session.adapter,
         backend: &session.backend,
@@ -592,13 +673,18 @@ fn build_ui(
         prev.textures_delta.clear();
     }
     let files = craft_files.0.clone(); // Vec<String> — cheap, frees the Res borrow
-    egui.output = Some(ctx.run_ui(raw, |ctx| {
+    let output = ctx.run_ui(raw, |ctx| {
         // The VAB's click-through mask: every floating window drawn
         // over the 3D build area pushes its rect here, and the pointer
         // pass runs LAST so the set is complete before any gesture
         // resolves — a press on a UI card must never reach the craft
-        // behind it (C14-F2).
-        let mut ui_masks: Vec<egui::Rect> = Vec::with_capacity(8);
+        // behind it (C14-F2). The loading screen's rect leads it: the
+        // panels are still built under the screen, so their hotkey and
+        // pointer passes still run.
+        let mut ui_masks: Vec<egui::Rect> = Vec::with_capacity(9);
+        if let Some(line) = loading_line {
+            ui_masks.push(csp_ui::loading_screen(ctx, line));
+        }
         ui_masks.push(csp_ui::vab::top_bar(
             ctx,
             mode,
@@ -694,10 +780,6 @@ fn build_ui(
                     t_pe_s: flight_ui.t_pe_s,
                     period_s: flight_ui.period_s,
                     builds: &flight_ui.builds,
-                    // M5 §5.2-R2 arrival polish: the heightfield bake
-                    // wait — the chip shows a one-line "generating
-                    // surface" row while the terrain pass is sky-only.
-                    terrain_pending: flight_ui.terrain_pending,
                     // P1: the app's smoothed frame timing — fps + ms
                     // over its ~10-frame window; 0.0 hides the row.
                     fps: flight_ui.fps,
@@ -754,9 +836,10 @@ fn build_ui(
             if let Some(pos) = rclick
                 && !over_ui
             {
+                let focus = scene.focus.resolve(&scene.snap.vessels);
                 let (node, open) = match flight::pick_part(
                     &scene.cam,
-                    scene.focus.resolve(&scene.snap.vessels),
+                    focus.map(|f| (f, scene.drawn.pose_of(f))),
                     ctx.content_rect(),
                     pos,
                 ) {
@@ -868,7 +951,9 @@ fn build_ui(
         if mode == csp_ui::ModeSelect::Vab {
             csp_ui::vab::vab_pointer_input(ctx, &mut vab.0, &ui_masks, palette_rect);
         }
-    }));
+        egui.arrival.pass_built(ctx.input(|i| i.time));
+    });
+    egui.output = Some(output);
     // The top bar's Tutorial button re-opens the checklist — session
     // state, folded back here rather than riding the app outbox.
     if vab_out.tutorial {
@@ -1659,15 +1744,8 @@ pub struct View {
     /// evicted entries carry older ticks and can never resurface.
     /// Session state only — never sim state.
     notice_cursor: Option<(u64, u32)>,
-    /// The launch snapshot for revert-to-launch (PLAN:1180 —
-    /// "revert is not a reroll": the same pre-drawn θ records ride the
-    /// restore, so the same parts still fail at the same Λ). Captured
-    /// in `launch_craft` before the order's commands enqueue, then
-    /// recaptured at the delivery boundary (see [`RevertCapture`]) —
-    /// `launch_craft` itself can only ever see the pre-ORDER world,
-    /// its own commands still being pending. `Err` text records why
-    /// no revert point exists (a §7.4 snapshot refusal).
-    pre_launch: Option<Result<WorldSnapshot, String>>,
+    /// The launch revert point — see [`RevertPoint`].
+    pre_launch: Option<RevertPoint>,
     /// A launch awaiting its delivery-boundary recapture — see
     /// [`RevertCapture`]. Session state tied to this session's launch
     /// press: `rebuild_from_snapshot` clears it alongside `pre_launch`
@@ -1733,23 +1811,69 @@ enum RevertCapture {
     Delivered,
 }
 
+/// The revert-to-launch point (PLAN:1180 — "revert is not a reroll":
+/// the same pre-drawn θ records ride the restore, so the same parts
+/// still fail at the same Λ). Captured in `launch_craft` before the
+/// order's commands enqueue, then recaptured at the delivery boundary
+/// (see [`RevertCapture`]) — `launch_craft` itself can only ever see
+/// the pre-ORDER world, its own commands still being pending.
+///
+/// The stage plans ride beside the snapshot: they are session state
+/// the snapshot cannot hold, and they name the very `VesselId`s the
+/// restore brings back. A point taken without them reverts onto a
+/// craft whose stages are gone.
+struct RevertPoint {
+    /// The captured world; `Err` text records why no revert point
+    /// exists (a §7.4 snapshot refusal).
+    snapshot: Result<WorldSnapshot, String>,
+    /// [`flight::StagePlans`] as they stood when the snapshot was taken,
+    /// each plan bound to the vessel it fires at in that snapshot
+    /// ([`flight::StagePlans::captured_for_revert`]) — stored unbound, a
+    /// plan came back with the revert and bound to the next launch of
+    /// the same craft.
+    plans: flight::StagePlans,
+}
+
+/// How [`rebuild_from_snapshot`] refills the stage plans it resets.
+enum Restage {
+    /// A load: a save holds no plans, so each restored craft gets the
+    /// one its own parts imply ([`flight::StagePlans::from_restored_world`]).
+    FromRestoredCrafts,
+    /// A revert: the plans as they stood when the point was captured.
+    Captured(flight::StagePlans),
+}
+
+/// §2.5's interpolation resources — installed with the flight view's
+/// (`View::with_sim`): the frame's fractional tick remainder, the
+/// flight view's previous-tick poses, and what the frame draws.
+fn insert_interp_resources(world: &mut World) {
+    world.insert_resource(TickFraction::default());
+    world.insert_resource(flight::PoseHistory::default());
+    world.insert_resource(flight::DrawnScene::default());
+}
+
 /// Replace the session's sim with a world rebuilt from `snapshot`,
 /// re-installing the originating world's own config channels
 /// ([`SimWorld::install_config`]) and the control engines the
 /// snapshot cannot carry (`RhaiHost`/`AscentAutopilot` — the same
 /// pair `from_source` installs). Resets every sim-keyed session
-/// mirror (`StagePlans`, `MapPlanning`, the focus pin, the latched
-/// weld cache, the script log, the notice cursor) and lands the
-/// session in Flight — the restored world is a different vessel set,
-/// so no stale binding may survive.
+/// mirror (`MapPlanning`, the focus pin, the latched weld cache, the
+/// script log, the notice cursor) and lands the session in Flight —
+/// the restored world is a different vessel set, so no stale binding
+/// may survive. The stage plans are the one mirror that comes back
+/// here, because the restored crafts do need theirs: `restage` says
+/// whether they are derived from those crafts (a load) or put back as
+/// captured (a revert).
 fn rebuild_from_snapshot(
     view: &mut View,
     snapshot: WorldSnapshot,
+    restage: Restage,
 ) -> Result<Vec<String>, SimError> {
     // C02-F2: the focus record rides the snapshot — read it before
     // `restore` consumes the struct, then re-anchor the session on it
     // below instead of falling to `vessels.last()`'s newest-spawn rule.
     let restored_focus = snapshot.active_vessel;
+    let canopy_steering = view.sim.canopy_steering();
     let config = view.sim.config();
     let mut sim = SimWorld::restore(
         csp_sim::orbit::PatchedConics::new(config.orbits.clone()),
@@ -1757,6 +1881,12 @@ fn rebuild_from_snapshot(
         snapshot,
     )?;
     sim.install_config(&config);
+    // The canopy steering is construction config the snapshot and the
+    // config it restores under cannot carry (`SimpleBackend`'s, not the
+    // `Environment`'s): the world being replaced hands it on.
+    if let Some(steering) = canopy_steering {
+        sim.set_canopy_steering(steering);
+    }
     sim.set_script_engine(Box::new(csp_script::RhaiHost::new()));
     sim.set_autopilot_driver(Box::new(csp_ai::AscentAutopilot::new()));
     let warnings: Vec<String> = sim
@@ -1765,6 +1895,9 @@ fn rebuild_from_snapshot(
         .map(|c| format!("restored world is missing config channel `{c}`"))
         .collect();
     view.sim = sim;
+    // The restored backend prewarmed the same field: hand it to the
+    // cache before the rebuilt world's first frame asks.
+    view.adopt_terrain();
     view.notice_cursor = None;
     // The revert point belongs to the world being replaced — a load
     // must never let F10/Game-menu revert resurrect the previous
@@ -1777,9 +1910,23 @@ fn rebuild_from_snapshot(
     view.revert_capture = None;
     view.world
         .insert_resource(flight::LatchedWeldCache::default());
-    view.world.insert_resource(flight::StagePlans::default());
+    let plans = match restage {
+        Restage::FromRestoredCrafts => flight::StagePlans::from_restored_world(&view.sim),
+        Restage::Captured(plans) => plans,
+    };
+    view.world.insert_resource(plans);
     view.world.insert_resource(map::MapPlanning::default());
     view.world.insert_resource(ScriptLogMirror::default());
+    // The restored vessels' previous-tick poses belong to the replaced
+    // world — a drawn pose interpolated from them would slide the
+    // restored craft in from where the old one flew.
+    view.world.insert_resource(flight::PoseHistory::default());
+    // The chase camera's anchor belongs to it as well: left in place,
+    // the restored focus reads as a focus CHANGE and the camera travels
+    // to the loaded craft from wherever the replaced session orbited.
+    view.world
+        .resource_mut::<flight::FlightInput>()
+        .forget_anchor();
     // The restored `active_vessel` becomes the session's focus: the
     // quiet flight pin (no lease re-arm — the restored record carries
     // its own leases) re-anchors the camera/HUD — a rails record
@@ -1935,6 +2082,16 @@ fn build_sim_from_dataset(d: &LoadedDataset, save_seed: u64) -> Result<SimWorld,
     // C14-F3: the convective-heating η is authored — `for_body`
     // stamps the no-data default; the balance file overrides it.
     environment.convective_heat_fraction = balance.convective_heat_fraction;
+    // Water physics: the ocean's density and drag are authored the same
+    // way. One ocean, one water — a body's `ocean` says where the
+    // surface is; `balance.ron` says what the water is.
+    if let Some(ocean) = environment.ocean.as_mut() {
+        ocean.density_kg_m3 = balance.water_density_kg_m3;
+        ocean.drag_cd = balance.water_drag_cd;
+    }
+    // M4c landing: the touchdown absorption's crush distance — the
+    // §2.4 evaluation reads a landing's stop as spread over it.
+    environment.touchdown_crush_m = balance.touchdown_crush_m;
     let mut sim = SimWorld::with_physics(
         orbits,
         csp_sim::PhysicsConfig {
@@ -1965,6 +2122,14 @@ fn build_sim_from_dataset(d: &LoadedDataset, save_seed: u64) -> Result<SimWorld,
     sim.set_docking_config(csp_sim::DockingConfig::from_balance(balance))
         .map_err(ViewError::Sim)?;
     sim.set_transfer_config(csp_sim::TransferConfig::from_balance(balance));
+    // §3.1 rule A: how a deployed canopy steadies the craft that hangs
+    // from it — authored the same way, on the backend's own channel (a
+    // world restored from a snapshot runs the build's values until
+    // `rebuild_from_snapshot` carries these over).
+    sim.set_canopy_steering(csp_phys::CanopySteering {
+        steady_arm_m: balance.canopy_steady_arm_m,
+        steady_damp_m_s: balance.canopy_steady_damp_m_s,
+    });
     // M9b §3.4: the reliability tunables — dormant scale,
     // ignition window, effect magnitudes, test-stand economics.
     sim.set_reliability_config(csp_sim::ReliabilityConfig::from_balance(balance));
@@ -2129,6 +2294,7 @@ impl View {
         let d = load_validated_dataset(src, root)?;
         let sim = build_sim_from_dataset(&d, save_seed)?;
         let mut view = Self::with_sim(sim);
+        view.adopt_terrain();
         // M3 VAB: the part catalog + resource registry are data-derived
         // constants for the session model (like BodyTable — §7.3's
         // re-derived-on-load class). The §3.1 aggregate rides along so
@@ -2155,6 +2321,22 @@ impl View {
         let defs: Vec<csp_data::BodyDef> = d.system.bodies.iter().map(|b| b.def.clone()).collect();
         install_program_resources(&mut view, &d.system.bodies, &defs, &d.loc);
         Ok(view)
+    }
+
+    /// The simulation bakes the dominant body's heightfield when its
+    /// backend is built; the view takes that allocation
+    /// ([`terrain::TerrainCache::adopt`]) instead of baking a second
+    /// identical field on its own thread. Called before the first frame
+    /// reads the cache — after [`Self::with_sim`], and after a snapshot
+    /// restore rebuilt the backend — so the first frame's request for
+    /// the field is answered at once.
+    fn adopt_terrain(&mut self) {
+        let surface = self.sim.environment().and_then(|e| e.terrain.as_ref());
+        if let (Some(body), Some(surface)) = (self.sim.dominant_body(), surface) {
+            self.world
+                .resource_mut::<terrain::TerrainCache>()
+                .adopt(body.as_str(), surface);
+        }
     }
 
     /// The §6.3 web demo — the fixed scenario over the embedded reduced
@@ -2207,6 +2389,7 @@ impl View {
 
     /// The shell around an explicit sim world — the headless/test
     /// constructor (`new` is the data-loading startup path).
+    #[allow(clippy::too_many_lines)] // a constructor: one resource insert per line, no branches
     pub fn with_sim(sim: SimWorld) -> Self {
         let mut world = World::new();
         world.insert_resource(Clock::default());
@@ -2272,12 +2455,19 @@ impl View {
         world.insert_resource(flight::FlightInputEvents::default());
         world.insert_resource(flight::FlightSyncInput::default());
         world.insert_resource(flight::FlightSnapshot::default());
+        insert_interp_resources(&mut world);
         // The non-debris vessel count across all residences — the
         // tutorial's alive-or-lost mirror (P12-F2).
         world.insert_resource(flight::LiveVesselCount::default());
         // The rails-staged id set — the C19-F2 focus handoff's mirror
         // (same standalone-resource pattern as `LiveVesselCount`).
         world.insert_resource(flight::RailsStaged::default());
+        // The staged bounding radii — the chase camera's framing input
+        // (same standalone-resource pattern).
+        world.insert_resource(flight::CraftRadii::default());
+        // The open canopies the frame draws — the same pattern; the
+        // canopy-open cue and the chase camera read the focus's rows.
+        world.insert_resource(flight::CanopiesStaged::default());
         // The propulsion walk mirror — the HUD's live TWR/Δv/
         // burn-time figures (same standalone-resource pattern as
         // `LiveVesselCount`: `FlightSnapshot` cannot grow).
@@ -2336,6 +2526,11 @@ impl View {
         presentation.add_systems((
             map::map_present,
             vab::vab_present,
+            // §2.5: the drawn poses exist before anything solves
+            // against them (the chase camera, the extract).
+            flight::flight_interp.before(flight::flight_camera),
+            flight::flight_camera,
+            flight::flight_terrain_pending,
             flight::flight_present,
             // M10: the tutorial's progress observer — reads the
             // Sync-written snapshot directly, so it stays independent
@@ -2529,7 +2724,17 @@ impl View {
         if matches!(self.revert_capture, Some(RevertCapture::Delivered))
             && let Ok(snap) = self.sim.snapshot()
         {
-            self.pre_launch = Some(Ok(snap));
+            // The plans go with the snapshot BOUND to the craft this
+            // launch berthed (`StagePlans::captured_for_revert`): this
+            // world is the one a revert restores, and every plan in it
+            // must name the vessel it fires at there.
+            self.pre_launch = Some(RevertPoint {
+                snapshot: Ok(snap),
+                plans: self
+                    .world
+                    .resource::<flight::StagePlans>()
+                    .captured_for_revert(&self.sim),
+            });
             self.revert_capture = None;
         }
         // The focus pin's drain-reject release (P04-F2): `end_frame`
@@ -2725,7 +2930,12 @@ impl View {
                 }
             }
             let art = self.world.resource::<art::ArtAssets>().clone();
+            // Last frame's canopy rows go back to the capture emptied:
+            // it refills their buffer, so a canopy that stays open
+            // stages without an allocation.
+            let rows = std::mem::take(&mut self.world.resource_mut::<flight::CanopiesStaged>().0);
             let mut cache = self.world.resource_mut::<flight::LatchedWeldCache>();
+            cache.canopy_rows = rows;
             flight::capture_sync_input(&self.sim, &mut cache, &art, &rails_hint)
         };
         self.world.insert_resource(staged_flight);
@@ -2939,6 +3149,15 @@ impl View {
         r.present_ms = present_ms;
     }
 
+    /// Hand the frame its fractional tick remainder (§2.5 interpolation)
+    /// — `csp-app` calls this every frame, between the step and
+    /// [`Self::end_frame`], with its warp controller's figure for the
+    /// tick the step reached. The next `end_frame` draws every staged
+    /// pose between its previous and current tick at that fraction.
+    pub fn set_tick_fraction(&mut self, frac: f64) {
+        self.world.resource_mut::<TickFraction>().0 = frac;
+    }
+
     /// Update only the §2.13 halt mirror — for the frame a `Fatal` is
     /// produced inside `sim_step`, so `UiBuild` sees it immediately rather
     /// than a frame later.
@@ -2993,6 +3212,17 @@ impl View {
     pub fn toggle_debug_panel(&mut self) {
         let mut r = self.world.resource_mut::<PanelFlags>();
         r.debug = !r.debug;
+    }
+
+    /// Raise or lower the loading screen's session half
+    /// ([`flight::FlightUiData::session_loading`]) — raised, the frame
+    /// shows the screen over the panels, which keep being built under
+    /// it. The host sets it every frame around a world-replacing
+    /// session op: New Game replaces the whole `View`, mirror included.
+    pub fn set_loading(&mut self, loading: bool) {
+        self.world
+            .resource_mut::<flight::FlightUiData>()
+            .session_loading = loading;
     }
 
     /// Toggle the controls-help card (the `ToggleHelp` binding, the
@@ -3575,6 +3805,7 @@ impl View {
                 longitude_rad: lon,
                 altitude_m: site_alt + PAD_CLEARANCE_M - z_min,
                 orientation: csp_sim::bubble::surface_upright(lat, lon),
+                afloat: false,
             },
             |s| csp_sim::manufacture::berth_pose(s, z_min - PAD_CLEARANCE_M),
         );
@@ -3623,8 +3854,17 @@ impl View {
         // replaces this point when the launch berths — a revert retries
         // the flying, never un-pays the launch. A §7.4 refusal here is
         // still recorded verbatim: the revert verb then names its own
-        // refusal instead of silently missing.
-        self.pre_launch = Some(self.sim.snapshot().map_err(|e| e.to_string()));
+        // refusal instead of silently missing. The stage plans go with
+        // the snapshot (`RevertPoint`), bound to the vessels they name
+        // in this world: this launch's own is pushed below, after this
+        // capture.
+        self.pre_launch = Some(RevertPoint {
+            snapshot: self.sim.snapshot().map_err(|e| e.to_string()),
+            plans: self
+                .world
+                .resource::<flight::StagePlans>()
+                .captured_for_revert(&self.sim),
+        });
         // The parked build clears the pad before the new craft berths
         // — the recovery is a normal logged command that
         // credits its value back, then the launch proceeds.
@@ -3645,11 +3885,11 @@ impl View {
         // The staged craft's firing plan rides session state (the
         // spawned graph drops stage metadata); `fire_stage` drains it
         // one set per press. The plan binds to THIS launch's vessel —
-        // captured before the enqueue so `min_id` bounds the binding
-        // to ids minted after this point (the `LaunchCraft` apply
-        // mints the `VesselId` inside the drain — `StagePlan`'s
-        // `(min_id, fingerprint)` binding tolerates exactly this late
-        // materialization).
+        // captured before the enqueue so its launch window opens at
+        // the next id (the `LaunchCraft` apply mints the `VesselId`
+        // inside the drain — `StagePlan`'s lazy binding tolerates
+        // exactly this late materialization) and closes where the next
+        // launch's opens.
         let plan = flight::StagePlan::for_launch(stage_plan, &self.sim, &craft);
         if let Some(site) = site.filter(|_| !craft.part_ids.is_empty()) {
             // §3.5's honest path: the LAUNCH click is `LaunchCraft` —
@@ -3753,46 +3993,55 @@ impl View {
     /// Restore the world from a decoded save — full §7.3 config
     /// re-install, then reset every sim-keyed session mirror. Returns
     /// the post-restore warnings (missing config channels, which the
-    /// caller renders as notices).
+    /// caller renders as notices). A save stores no stage plans, so
+    /// each restored craft's is rebuilt from its own parts — a chute
+    /// becomes a deploy stage, a decoupler's subtree a drop stage.
     pub fn load_game(&mut self, snapshot: WorldSnapshot) -> Result<Vec<String>, SimError> {
-        rebuild_from_snapshot(self, snapshot)
+        rebuild_from_snapshot(self, snapshot, Restage::FromRestoredCrafts)
     }
 
     /// Whether a revert point exists — the Game menu gates its
     /// Revert button on this.
     pub fn revert_available(&self) -> bool {
-        matches!(&self.pre_launch, Some(Ok(_)))
+        matches!(&self.pre_launch, Some(point) if point.snapshot.is_ok())
     }
 
     /// The revert point's sim tick for the prompt; `None` when no
     /// captured snapshot exists (the `Err` arm's reason reads via
     /// [`Self::revert_to_launch`]).
     pub fn revert_tick(&self) -> Option<u64> {
-        match &self.pre_launch {
-            Some(Ok(snap)) => Some(snap.clock_ticks),
-            _ => None,
-        }
+        self.pre_launch
+            .as_ref()?
+            .snapshot
+            .as_ref()
+            .ok()
+            .map(|snap| snap.clock_ticks)
     }
 
     /// Why no revert point exists — the §7.4 capture refusal text,
     /// for the menu's disabled-button hover.
     pub fn revert_reason(&self) -> Option<&str> {
         match &self.pre_launch {
-            Some(Err(r)) => Some(r.as_str()),
-            _ => None,
+            Some(point) => point.snapshot.as_ref().err().map(String::as_str),
+            None => None,
         }
     }
 
-    /// PLAN:1180 — revert-to-launch. Restores the pre-launch snapshot
-    /// captured at `launch_craft` — the same pre-drawn θ records ride
-    /// the restore (it is a retry of the flying, never a reroll; the
-    /// UI says so at the prompt). `Err` when no revert point exists.
+    /// PLAN:1180 — revert-to-launch. Restores the point captured at
+    /// `launch_craft` — the snapshot and the stage plans that went with
+    /// it, so the craft back on the pad stages as it did at launch —
+    /// the same pre-drawn θ records ride the restore (it is a retry of
+    /// the flying, never a reroll; the UI says so at the prompt). `Err`
+    /// when no revert point exists.
     pub fn revert_to_launch(&mut self) -> Result<Vec<String>, SimError> {
-        let snapshot = match &self.pre_launch {
-            Some(Ok(snap)) => snap.clone(),
+        let (snapshot, plans) = match &self.pre_launch {
+            Some(RevertPoint {
+                snapshot: Ok(snapshot),
+                plans,
+            }) => (snapshot.clone(), plans.clone()),
             // The capture's refusal text is surfaced through
             // `revert_reason`, not smuggled in the static SimError.
-            Some(Err(_)) => {
+            Some(_) => {
                 return Err(SimError::Recoverable(
                     "revert point could not be captured at launch",
                 ));
@@ -3809,8 +4058,12 @@ impl View {
         // repeatable, a second press returning to the same pad-bound
         // state rather than reporting "nothing launched yet" while the
         // delivered craft sits on the pad.
-        let warnings = rebuild_from_snapshot(self, snapshot.clone())?;
-        self.pre_launch = Some(Ok(snapshot));
+        let warnings =
+            rebuild_from_snapshot(self, snapshot.clone(), Restage::Captured(plans.clone()))?;
+        self.pre_launch = Some(RevertPoint {
+            snapshot: Ok(snapshot),
+            plans,
+        });
         Ok(warnings)
     }
 
@@ -3907,10 +4160,11 @@ impl View {
             }
         }
         if ambiguous {
-            // P05-F1: two same-craft mints ≥ min_id — the plan can
-            // never name its vessel honestly, so a firing now would
-            // hit a random one. Retire it like the gone-vessel branch
-            // rather than leaving a loaded trap for the next press.
+            // P05-F1: two same-craft mints inside the plan's launch
+            // window — the plan can never name its vessel honestly, so
+            // a firing now would hit a random one. Retire it like the
+            // gone-vessel branch rather than leaving a loaded trap for
+            // the next press.
             {
                 let mut plans = self.world.resource_mut::<flight::StagePlans>();
                 let plan = &mut plans.plans[idx];
@@ -3978,15 +4232,17 @@ impl View {
                 SimCommand::JettisonPart { vessel, node },
             );
         }
-        // The cue names what the firing actually did — a chute-only
-        // stage reads "DEPLOYED", not "0 PART(S) JETTISONED". C19-F6:
-        // when the fired plan belongs to a vessel that ISN'T the
-        // focus, name it — jettisoning another craft's parts must
-        // never read as if the focused vessel staged.
+        // The cue names what the firing did — a chute-only stage is
+        // not "0 PART(S) JETTISONED". A chute is FIRED here: its canopy
+        // opens only when the flow can hold it, and `CANOPY OPEN` says
+        // so the frame it starts. C19-F6: when the fired plan belongs
+        // to a vessel that ISN'T the focus, name it — jettisoning
+        // another craft's parts must never read as if the focused
+        // vessel staged.
         let notice = match (n_jettisons, n_deploys) {
             (j, 0) => format!("STAGED — {j} PART(S) JETTISONED"),
-            (0, d) => format!("STAGED — {d} PART(S) DEPLOYED"),
-            (j, d) => format!("STAGED — {j} JETTISONED + {d} DEPLOYED"),
+            (0, d) => format!("STAGED — {d} CHUTE(S) FIRED"),
+            (j, d) => format!("STAGED — {j} JETTISONED + {d} CHUTE(S) FIRED"),
         };
         let notice = if focus != Some(vessel) {
             format!("{notice} · VESSEL {}", vessel.0)
@@ -4539,7 +4795,11 @@ impl View {
             .environment()
             .map_or(0.0, |e| e.atmosphere.as_ref().map_or(0.0, |a| a.top_m));
         let situation = match &v.state {
-            VesselState::SurfaceLatched(p) => Some(if p.altitude_m <= 0.0 {
+            // Ground or water is the simulation's call (`splashed`):
+            // a floater rides with its origin a few centimetres above
+            // the datum and a hull on a seabed far below it, so
+            // altitude cannot tell `Splashed` from `Landed`.
+            VesselState::SurfaceLatched(_) => Some(if sim.splashed(v.id) {
                 csp_data::Situation::Splashed
             } else {
                 csp_data::Situation::Landed
@@ -4547,11 +4807,9 @@ impl View {
             VesselState::InBubble(_) => {
                 let contact = sim.ground_contact(v.id);
                 if contact && alt_m <= 50.0 {
-                    Some(if alt_m <= 0.0 {
-                        csp_data::Situation::Splashed
-                    } else {
-                        csp_data::Situation::Landed
-                    })
+                    Some(csp_data::Situation::Landed)
+                } else if sim.splashed(v.id) {
+                    Some(csp_data::Situation::Splashed)
                 } else if alt_m < env_atm_top {
                     Some(if alt_m < FLYING_SPLIT_M.min(env_atm_top) {
                         csp_data::Situation::FlyingLow
@@ -6201,7 +6459,7 @@ mod tests {
         assert!(cam.valid, "map camera must be solved in map mode");
         assert_eq!(cam.distance_m, map_dist);
         // …and the chase camera exists on its own resource.
-        let flight_dist = view.world.resource::<flight::FlightInput>().distance_m;
+        let flight_dist = view.world.resource::<flight::FlightInput>().distance_m();
         let fcam = view.world.resource::<flight::FlightCameraF64>();
         assert!(fcam.0.valid, "chase camera must solve with a staged vessel");
         assert_eq!(fcam.0.distance_m, flight_dist);
@@ -6231,6 +6489,9 @@ mod tests {
             events,
             ..Default::default()
         };
+        // The windows are laid out under the loading screen a fresh
+        // view opens on; run it out before their rects are probed.
+        settle_ui(&mut view, input(vec![]));
         // Probe the overlay windows at their anchors — the host-side
         // half of C14-F2: `build_ui` must actually feed every drawn
         // window's rect into the pointer pass (the per-window contract
@@ -6823,6 +7084,137 @@ mod tests {
         );
     }
 
+    /// One 1 m³ cube of `mass_kg` — a sealed box for the water: at
+    /// 500 kg it floats, at 2 000 kg it sinks.
+    fn water_cube(mass_kg: f64) -> csp_sim::CraftDef {
+        use csp_phys::{PartGraph, PartNode, PartNodeId, PartTransform};
+        let mut graph = PartGraph::new(PartNodeId(1));
+        graph.insert(
+            PartNodeId(1),
+            PartNode::new(None, PartTransform::IDENTITY, 0),
+        );
+        csp_sim::CraftDef {
+            part_build_resources: Vec::new(),
+            hash_memo: Default::default(),
+            part_ids: vec![],
+            graph,
+            part_costs: vec![0.0],
+            parts: vec![csp_phys::WeldPart {
+                experiments: Vec::new(),
+                lab: None,
+                engine: None,
+                parachute: None,
+                dock_ports: vec![],
+                tanks: vec![],
+                crew_seats: 0,
+                structural: csp_data::StructuralDef::unlimited(),
+                mass_kg,
+                com: csp_core::DVec3::ZERO,
+                inertia: csp_phys::SymMat3::solid_box(mass_kg, csp_core::DVec3::new(0.5, 0.5, 0.5)),
+                collider: csp_phys::ColliderShape::Box {
+                    half_extents: csp_core::DVec3::new(0.5, 0.5, 0.5),
+                },
+                force_sites: Vec::new(),
+                aero: csp_data::AeroDef::constant(0.8, 0.0, 1.0),
+                thermal: csp_data::ThermalDef {
+                    heat_capacity_j_per_k: 400_000.0,
+                    max_temp_k: 1_500.0,
+                    emissivity: 0.8,
+                    conduction_w_per_k: 50.0,
+                },
+            }],
+            reliability: vec![],
+        }
+    }
+
+    /// Water physics (sub-phase 4.1): the situation label is the
+    /// simulation's verdict, not altitude arithmetic. Over Terrin's
+    /// ocean on the equator at longitude 0 — 193 m of water there — a
+    /// sealed 500 kg cube floats and a 2 000 kg one sinks to the
+    /// seabed, and both come to rest. The floater's origin ends a
+    /// centimetre above the datum and the sinker's 192 m below it, so
+    /// an altitude rule calls them `Landed` and `Splashed`; the view
+    /// follows `SimWorld::splashed` and stages the reverse.
+    #[test]
+    fn situation_follows_the_simulation_not_altitude() {
+        let mut view = View::new_demo().expect("demo data loads");
+        let step = |view: &mut View| {
+            view.sim_step(view.sim.clock().ticks() + 1).expect("step");
+        };
+        // The pad craft wins the mirror's flight-focus pick — retire it.
+        view.enqueue_command(
+            SourceClass::Ui,
+            PLAYER_SOURCE_ID,
+            SimCommand::TerminateVessel {
+                vessel: csp_sim::VesselId(0),
+            },
+        );
+        step(&mut view);
+        for (mass_kg, situation, sign_of_altitude, what) in [
+            (500.0, csp_data::Situation::Splashed, 1.0, "afloat"),
+            (2_000.0, csp_data::Situation::Landed, -1.0, "on the seabed"),
+        ] {
+            let (center, radius, spin) = {
+                let env = view.sim.environment().expect("physics");
+                (env.body_center, env.radius_m, env.body_spin)
+            };
+            let pos = center + csp_core::DVec3::new(radius + 1.5, 0.0, 0.0);
+            view.enqueue_command(
+                SourceClass::Ui,
+                PLAYER_SOURCE_ID,
+                SimCommand::SpawnPhysicalVessel {
+                    craft: water_cube(mass_kg),
+                    pos,
+                    rot: csp_sim::bubble::surface_upright(0.0, 0.0),
+                    // At rest relative to the water, which turns with
+                    // the planet.
+                    vel: spin.cross(pos - center),
+                    ang_vel: csp_core::DVec3::ZERO,
+                },
+            );
+            step(&mut view);
+            let id = *view
+                .sim
+                .vessels()
+                .keys()
+                .next_back()
+                .expect("the cube spawned");
+            // A second at a time: the sinker has 192 m to cover.
+            let mut pose = None;
+            for _ in 0..130 {
+                view.sim_step(view.sim.clock().ticks() + 64).expect("step");
+                if let VesselState::SurfaceLatched(p) = &view.sim.vessels()[&id].state {
+                    pose = Some(p.clone());
+                    break;
+                }
+            }
+            let pose = pose.unwrap_or_else(|| panic!("the {what} cube never came to rest"));
+            assert!(
+                pose.altitude_m * sign_of_altitude > 0.0,
+                "the {what} cube rests {} m from the datum",
+                pose.altitude_m
+            );
+            view.world
+                .resource_mut::<flight::FlightFocusOverride>()
+                .target = None;
+            view.world.resource_mut::<map::MapInput>().focus_vessel = Some(id);
+            view.end_frame();
+            let mirror = view.world.resource::<ProgramMirror>();
+            assert_eq!(mirror.vessel, Some(id));
+            assert_eq!(
+                mirror.science_ctx.as_ref().map(|(_, s)| *s),
+                Some(situation),
+                "a cube {what} at {sign_of_altitude} altitude stages its situation from the sim"
+            );
+            view.enqueue_command(
+                SourceClass::Ui,
+                PLAYER_SOURCE_ID,
+                SimCommand::TerminateVessel { vessel: id },
+            );
+            step(&mut view);
+        }
+    }
+
     /// W2.6: the §3.4 test stand is player-reachable — the panel's
     /// `RunBenchTest` maps through `program_command` to the sim
     /// command (the FACILITIES rows the buttons gate on stage too),
@@ -7372,6 +7764,119 @@ mod tests {
         );
     }
 
+    /// The revert point keeps its plans BOUND. A launch's plan is pushed
+    /// unbound (its vessel's id is minted in the drain), and the copy
+    /// used to be stored unbound too: a revert put it back into the
+    /// world its craft still occupies, where it bound to the next
+    /// launch of the same craft and shadowed that craft's own plan
+    /// (`stage_plan.rs`: the restaged relaunch fired the pre-revert
+    /// plan). The capture binds every plan against the world the
+    /// snapshot holds, keeps out a plan with no vessel there, and
+    /// leaves the live table alone.
+    #[test]
+    fn revert_point_keeps_its_plans_bound_to_the_captured_world() {
+        let mut view = View::new().expect("data/ load");
+        view.seed_starter_craft().expect("starter seed");
+        view.begin_frame();
+        view.sim_step(view.sim.clock().ticks() + 1)
+            .expect("advance");
+        view.end_frame();
+        let (&id, vessel) = view.sim.vessels().iter().next().unwrap();
+        let craft = vessel.craft.clone().expect("the seeded craft");
+        // The live table holds the launch's plan, still unbound — no
+        // stage was pressed.
+        let mut table = view.world.resource::<flight::StagePlans>().clone();
+        assert_eq!(table.plans.len(), 1);
+        assert!(table.plans[0].vessel.is_none());
+        // A plan whose launch never landed: nothing in this world was
+        // minted at or after its bound.
+        table.push(flight::StagePlan::for_launch(
+            vec![flight::StageActions {
+                jettisons: vec![csp_phys::PartNodeId(0)],
+                deploys: Vec::new(),
+            }],
+            &view.sim,
+            &craft,
+        ));
+
+        let stored = table.captured_for_revert(&view.sim);
+        assert_eq!(stored.plans.len(), 1, "only the plan with a vessel is kept");
+        assert_eq!(
+            stored.plans[0].vessel,
+            Some(id),
+            "the launch's plan is stored bound to its own craft"
+        );
+        assert_eq!(stored.plans[0].stages, table.plans[0].stages);
+        // The capture binds the copy, never the live table.
+        assert!(
+            table.plans.iter().all(|p| p.vessel.is_none()),
+            "the capture bound the live table"
+        );
+    }
+
+    /// Two launches of one craft and no stage pressed: both plans are
+    /// unbound when the first press comes. Each binds inside its own
+    /// launch window — the older plan's closes where the newer
+    /// launch's opens — so a press on the first craft fires the first
+    /// craft's plan. On `(min_id, key)` alone the older plan saw both
+    /// vessels, latched `ambiguous`, and the press fell through to the
+    /// newer craft's plan.
+    #[test]
+    fn two_unstaged_launches_bind_plans_to_their_own_crafts() {
+        let mut view = View::new().expect("data/ load");
+        view.seed_starter_craft().expect("starter seed");
+        let step = |view: &mut View, ticks: u64| {
+            view.begin_frame();
+            view.sim_step(view.sim.clock().ticks() + ticks)
+                .expect("advance");
+            view.end_frame();
+        };
+        step(&mut view, 1);
+        let first = csp_sim::VesselId(0);
+        // Fly the first craft clear of the pad — a single berth.
+        view.sim.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetThrottle {
+                vessel: first,
+                throttle: 1.0,
+            },
+        );
+        step(&mut view, 8 * 64);
+        view.launch_craft().expect("second launch");
+        step(&mut view, 1);
+        let second = view.flight_focus().expect("the second launch takes focus");
+        assert_ne!(second, first);
+        {
+            let plans = view.world.resource::<flight::StagePlans>();
+            assert_eq!(plans.plans.len(), 2);
+            assert!(
+                plans.plans.iter().all(|p| p.vessel.is_none()),
+                "no stage was pressed"
+            );
+        }
+
+        // SPACE with the FIRST craft focused.
+        view.world.resource_mut::<flight::FlightUiData>().focus = Some(first.0);
+        assert_eq!(
+            view.fire_stage(),
+            1,
+            "the first craft's plan did not fire on the first craft"
+        );
+        let plans = view.world.resource::<flight::StagePlans>();
+        assert_eq!(
+            plans.plans[0].vessel,
+            Some(first),
+            "the older plan owns the older craft"
+        );
+        assert_eq!(
+            plans.plans[1].vessel,
+            Some(second),
+            "the newer plan owns the newer craft"
+        );
+        assert!(!plans.plans[0].ambiguous);
+    }
+
     /// C21-F5 + C22-F1: `load_game` clears the revert point — a revert
     /// on a loaded world can never resurrect the prior session's
     /// launch snapshot over it.
@@ -7614,7 +8119,10 @@ mod tests {
         // match key — so only the reject outcome is exercised.
         let arm_site = csp_data::SiteId::from("csp.test.no-such-site");
         let arm_craft = tiny_foreign_craft();
-        view.pre_launch = Some(Ok(view.sim.snapshot().expect("snapshot at rest")));
+        view.pre_launch = Some(RevertPoint {
+            snapshot: Ok(view.sim.snapshot().expect("snapshot at rest")),
+            plans: view.world.resource::<flight::StagePlans>().clone(),
+        });
         view.revert_capture = Some(RevertCapture::AwaitingDelivery {
             site: arm_site.clone(),
             craft: arm_craft.clone(),
@@ -7659,6 +8167,9 @@ mod tests {
 
     /// C19-F4 regression: the chase camera reframes on a focus-id
     /// change — a zoom held on one vessel must not carry to the next.
+    /// Changed with the eased camera: the reframe sets the TARGET
+    /// distance (the old test pinned a snap of the camera to 60 m; it
+    /// now eases there, and the frame of the change moves nothing).
     #[test]
     fn camera_reframes_on_focus_change() {
         let mut view = View::new().expect("data/ load");
@@ -7684,14 +8195,40 @@ mod tests {
         view.sim_step(1).expect("step");
         view.end_frame();
         let focus = view.flight_focus().expect("a vessel is focused");
+        fn radius_of(view: &View, vessel: csp_sim::VesselId) -> f64 {
+            view.world
+                .resource::<flight::CraftRadii>()
+                .0
+                .iter()
+                .find(|(v, _)| *v == vessel.0)
+                .expect("every staged vessel carries its radius")
+                .1
+        }
+        let first = radius_of(&view, focus);
+        // First focus: the target is the craft's frame distance.
+        assert_eq!(
+            view.world
+                .resource::<flight::FlightInput>()
+                .distance_target_m(),
+            (4.0 * first).max(3.0).max(1.5 * first),
+            "first focus frames the craft at four radii, clamped to the limits"
+        );
         // Zoom in, then remove the focused vessel — focus moves.
         view.flight_event(flight::FlightEvent::Zoom { factor: 0.05 });
         view.begin_frame();
         view.end_frame();
-        assert!(
-            view.world.resource::<flight::FlightInput>().distance_m < 30.0,
-            "the zoom applied"
+        let input = view.world.resource::<flight::FlightInput>();
+        assert_eq!(
+            input.distance_target_m(),
+            3.0_f64.max(1.5 * first),
+            "the zoom applies to the target and stops at the distance floor"
         );
+        // No frame time is supplied here, so the camera is still where
+        // it started and nothing eases.
+        let (was_at, was_eye, was_view) = {
+            let cam = &view.world.resource::<flight::FlightCameraF64>().0;
+            (input.distance_m(), cam.eye, cam.view_proj)
+        };
         view.enqueue_command(
             SourceClass::Ui,
             PLAYER_SOURCE_ID,
@@ -7701,10 +8238,24 @@ mod tests {
         view.sim_step(view.sim.clock().ticks() + 1).expect("step");
         view.end_frame();
         assert_ne!(view.flight_focus(), Some(focus));
+        let next = view.flight_focus().expect("the other vessel takes focus");
+        let next_radius = radius_of(&view, next);
+        let input = view.world.resource::<flight::FlightInput>();
         assert_eq!(
-            view.world.resource::<flight::FlightInput>().distance_m,
-            60.0,
-            "a focus-id change must reframe to the default distance"
+            input.distance_target_m(),
+            (4.0 * next_radius).max(3.0).max(1.5 * next_radius),
+            "a focus-id change must reframe to the new vessel's frame distance"
+        );
+        assert_eq!(
+            input.distance_m(),
+            was_at,
+            "the distance the camera is at does not snap — it eases"
+        );
+        let cam = &view.world.resource::<flight::FlightCameraF64>().0;
+        assert_eq!(
+            (cam.eye, cam.view_proj),
+            (was_eye, was_view),
+            "the frame of the focus change moves neither the eye nor the view"
         );
     }
 
@@ -7891,4 +8442,58 @@ mod tests {
             "a real removal still cues: {cues:?}"
         );
     }
+
+    /// The entrance clock starts at its first pass and counts only the
+    /// steps after it. A host's time is an offset from the host's own
+    /// epoch: 100 s on the first pass is where the entrance starts, not
+    /// how long it has run. Read as an age (the `unstable_dt` the clock
+    /// used to sum — a fresh context's is the whole offset), it ended the
+    /// entrance on the second pass.
+    #[test]
+    fn ui_arrival_is_timed_from_its_first_pass() {
+        let step = 1.0 / 60.0;
+        let mut time = 100.0;
+        let mut arrival = UiArrival::default();
+        assert!(
+            !arrival.settled(0.0),
+            "no pass built yet: the sizing pass is drawn over, whatever the animation time"
+        );
+        arrival.pass_built(time);
+        assert!(
+            !arrival.settled(0.2),
+            "the first pass starts the clock: 100 s is where the entrance begins, not 100 s of it"
+        );
+        for steps in 1..12 {
+            time += step;
+            arrival.pass_built(time);
+            assert!(
+                !arrival.settled(0.2),
+                "{steps} steps in, the clock reads {} — settled early",
+                arrival.age
+            );
+        }
+        time += step;
+        arrival.pass_built(time);
+        assert_eq!(arrival.age, 0.2, "twelve steps of 1/60 s span 0.2 s");
+        assert!(arrival.settled(0.2), "the entrance is over at 0.2 s");
+    }
+}
+
+/// Test rig: run frames staged with `input` until the loading screen
+/// lifts. A fresh view opens under it and it takes every click, so
+/// input driven on the view's first frames reaches nothing. The panels
+/// are laid out under the screen, so `input` carries the screen rect
+/// the test means to run on, and no `time`: the entrance counts egui's
+/// own, which advances by the predicted frame time while none is fed.
+#[cfg(test)]
+pub(crate) fn settle_ui(view: &mut View, input: egui::RawInput) {
+    for _ in 0..64 {
+        if view.world.resource::<EguiPass>().arrived() {
+            return;
+        }
+        view.set_egui_input(input.clone());
+        view.begin_frame();
+        view.end_frame();
+    }
+    panic!("the loading screen never lifted");
 }

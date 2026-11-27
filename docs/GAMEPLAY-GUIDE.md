@@ -40,8 +40,9 @@ VAB (build) → LAUNCH (a paid build order) → fly in the bubble → auto OnRai
 What you start with (`csp-view/src/lib.rs: View::new` + `View::seed_starter_craft`):
 - **₣ 1,000,000** funds (`data/balance.ron: starting_funds_micros`).
 - A seeded starter craft, the **"Stock Hopper"** — pod + science canister + battery + s160 tank +
-  Sparc engine, sitting latched on the Terrin pad (`csp-view/src/demo.rs: STARTER_CRAFT`,
-  liftoff TWR ≈ 5).
+  Sparc engine + the s125 chute on the pod's top node, sitting latched on the Terrin pad
+  (`csp-view/src/demo.rs: STARTER_CRAFT`, liftoff TWR ≈ 5). The chute is **stage 1**: the first
+  **SPACE** after liftoff deploys it, and the canopy brings the hopper home (§4.5).
 - A seeded 6-slot contract offer board (`contract_offer_slots`, `csp-sim/src/contracts.rs`).
 - One authored colony: the **Rask Mines** outpost (solar + battery + ore drill + smelter),
   founded at boot (`data/systems/home/colonies.ron`).
@@ -89,8 +90,8 @@ etc.; hint bars always print the key as your layout labels it.
 
 | Input | Where | Effect |
 |---|---|---|
-| Drag | flight | Orbit the chase camera (`csp-view/src/flight.rs: FlightEvent::Orbit`) |
-| Wheel | flight | Multiplicative zoom (`FlightEvent::Zoom`) |
+| Drag | flight | Orbit the chase camera 1:1 — it turns by exactly what the pointer travels (`csp-view/src/flight.rs: FlightEvent::Orbit`); pitch stops at ±89°. Dragged below the horizon the camera rides 0.3 m above the ground, sliding along it rather than going under, and the ground never pushes it inside the craft's minimum distance — dragged straight down, it slides along the ground toward the craft and then goes round it at exactly that distance, and zooming in never moves it back out. Over water the surface is no floor: the camera goes under it, down to 0.3 m above the seabed, and from below the water fills the view. Over a craft that is under the ground the camera orbits from above the ground; for a craft at least an eye distance down — the whole orbit above the ground — a drag moves it there as freely as in flight, while a shallower craft keeps only its depth of clearance and the ground still lifts the eye when it looks down |
+| Wheel | flight | Zoom: the wheel sets a distance and the camera eases to it (80 ms half-life), between 3 m (1.5 × the craft's size for a big one) and 1,000 km (`FlightEvent::Zoom`) |
 | Drag / RMB or MMB drag / wheel | map | Orbit / pan / zoom-to-cursor; **click** a marker to focus (`csp-ui/src/lib.rs: map_overlay` hint bar) |
 | Click / drag / RMB | VAB | Select part / lift-to-move / remove hovered subtree; drop a lifted part on the palette to delete (`csp-ui/src/vab.rs: vab_pointer_input`) |
 | **RMB on a part** | **flight** | **Part action menu** — run science, deploy parachute, transmit/recover data, recover/terminate vessel (`csp-ui/src/program.rs: part_menu`) |
@@ -100,8 +101,11 @@ etc.; hint bars always print the key as your layout labels it.
 `Settings` (Esc): audio volume/mute, **vertical sync** and **render scale** (Graphics — vsync off
 asks for an uncapped frame rate where the platform and driver allow it; the log's `render:` line
 names the mode actually in use. Render scale 0.5–1.0 renders the 3D scene
-smaller and upscales it for fps while the UI stays sharp), UI scale, **max time warp**
-(×1…×100,000 — a QoL ceiling under the ladder, `WARP_CAP_OPTIONS` at `csp-ui/src/settings.rs:163`),
+smaller and upscales it for fps while the UI stays sharp), UI scale, **orbit sensitivity**
+(0.25–4, default 1.0 — scales every camera drag in flight, map and VAB) and **invert vertical
+orbit** (reverses the vertical half of an orbit drag in all three cameras — flight, map and VAB),
+**max time warp**
+(×1…×100,000 — a QoL ceiling under the ladder, `WARP_CAP_OPTIONS` at `csp-ui/src/settings.rs:227`),
 new-game difficulty (life support, dormant stress — applied only when a save is created), and the
 full key-binding grid with per-action rebind/clear (`Keymap::bind` evicts a stolen key so nothing
 double-fires). Settings persist to `$XDG_CONFIG_HOME/csp/settings.ron`
@@ -146,9 +150,18 @@ Entered with `V` or the top-bar button. Four surfaces: **palette** (left, catalo
 8. **Tweak**: inspector offers per-part **scale** and **stack-axis stretch** (gated by the part's
    `ScaleRule` — tanks scale continuously, the adapter has discrete 0.5/1/2 steps, most parts
    none) and **variants** (e.g. engine "qualified" variant: +20–25% cost for better stats).
-9. **Staging**: the Staging panel — `+ stage` / `− stage` / `compact`, and per-part stage
-   assignment via the inspector (higher stage index fires earlier). Space fires one stage set
-   per press in flight; the plan is captured at launch (`csp-view/src/flight.rs: StagePlan`).
+9. **Staging**: the Staging panel lists every stage top-first — the highest stage number fires
+   first — with each part on the row of the stage it is in. Click a part's row to select it, and
+   its row gains **up** / **down** buttons that move it one stage at a time (the inspector's
+   numeric stage field does the same and stays). `+ stage` adds an empty stage at the top (marked
+   `(empty)`; it stays listed, empty or not, until `compact` renumbers the stages, or until `− stage`
+   removes it — that button only takes the top listed stage, so an opened stage survives while
+   anything is listed above it), `− stage` removes the top listed stage (its parts fold down one),
+   `compact` renumbers the stages and drops the empty ones. New parts start in stage 0. An empty
+   stage is editor state: a saved craft file keeps only the stage each part is in. Space fires one
+   stage set per press in flight; the plan is captured at launch
+   (`csp-view/src/flight.rs: StagePlan`), comes back with a revert to launch, and is rebuilt from
+   the craft after a load (§8).
 
 ### 3.2 Readouts (before you launch)
 
@@ -201,7 +214,11 @@ subassembly loading; no offset/rotate gizmo — positions are snap-attach only.
 The delivered craft sits **latched** on the pad; the HUD prints `ON PAD — [Z] to launch`
 (`csp-ui/src/lib.rs: flight_hud`). `Z` (throttle full) issues `SetThrottle`, which **unlatches**
 the craft and starts the climb. Fly with `Shift/Ctrl` (throttle), `WASD` (pitch/yaw), `Q/E`
-(roll), `Space` (stage). Chase camera: drag to orbit, wheel to zoom.
+(roll), `Space` (stage). Chase camera: drag to orbit, wheel to zoom (the distance eases to the
+wheel's target, 80 ms half-life). A craft is framed at four times its size whenever it takes the
+camera — a launch, a recovery — and the camera eases there rather than jumping; when the new
+craft is far away (a recovery on the far side of the planet) the camera makes the trip in half a
+second, over the ground, and keeps your orbit angles.
 
 ### 4.2 HUD and navball (what the numbers mean)
 
@@ -223,8 +240,8 @@ its text, and the navball first opens parked too high — see Known issues):
   high, a known issue; `csp-ui/src/navball.rs`): attitude ball with sky/ground, pitch
   ladder, compass letters, heading tape, plus **green prograde/retrograde markers** in the
   surface frame (hidden while parked).
-- Top-center **notice stack** (« cues »): engine/stage/impact SFX edges, warp/refusal reasons,
-  build-delivery toasts — in *every* view mode (`csp-ui/src/lib.rs: notice_overlay`).
+- Top-center **notice stack** (« cues »): engine/stage/canopy-open/impact SFX edges,
+  warp/refusal reasons, build-delivery toasts — in *every* view mode (`csp-ui/src/lib.rs: notice_overlay`).
 - Top-right **status strip** `₣ funds ⚛ science ✉ contracts` — click it to open the Program
   window (`program_status`).
 
@@ -267,11 +284,65 @@ click-to-focus, `Tab` cycles focus (`csp-view/src/map.rs`). Two planning windows
   notices name why). Then burn retrograde / set a retrograde node to lower Pe into the
   atmosphere and drag does the rest.
 - **Parachute**: the `csp.chute.s125` part (surface-mount). Deploy via **right-click on the
-  part → deploy parachute**, or the flight **Actions strip** — deployable **only while flying**
-  (in-bubble; `apply_deploy_part`, `csp-sim/src/lib.rs:7211`). The canopy catches below
-  **6 km** and **260 m/s** (`deploy_alt_m`/`deploy_speed_mps` in the part def) with a
-  120 m² drag area.
-- **Recovery**: land, come to rest — the vessel becomes **latched** — then **RECOVER VESSEL**
+  part → deploy parachute**, the flight **Actions strip**, or — the KSP rule — **SPACE**: a
+  chute assigned to a stage fires with it (the Stock Hopper's chute is stage 1) — deployable
+  **only while flying** (in-bubble; `apply_deploy_part`, `csp-sim/src/lib.rs`). The canopy
+  waits packed until the craft is below **16 km** AND **1200 m/s**
+  (`deploy_alt_m`/`deploy_speed_mps` in the part def), so deploy early and let it wait; it is
+  reefed to its mount's rating while the craft is fast and lands the dry Stock Hopper at 7 m/s
+  (700 m² of drag area). **A chute on any mount lands the craft**: the canopy's pull is taken
+  on the craft's axis, not at its mount, so a radial canister slows and rights the stack as
+  well as the top one does — one radial chute on the pod brings the Hopper down from 1.5 km
+  at 250 m/s at the top chute's own 7 m/s, and from a 70 km apogee too. (Before, the pull
+  acted at the mount: a side chute held the stack together but could not slow it, and the
+  Hopper arrived at 149 m/s.) What the mount still limits is the canopy itself — reefed to
+  0.9× its weaker force rating, 54 kN for the s125 — and a hot entry still tears the canister
+  off. A canister's own drag, and the turn a canopy gives a craft that leans into its catch,
+  are each held to what the joints below can carry: a side canister does not break a stack by
+  itself, and a leaning catch rights the craft instead of snapping it. Under its canopy the
+  Hopper hangs within about half a degree of the flow and comes in with no spin
+  (`canopy_steady_arm_m`, `canopy_steady_damp_m_s`, `data/balance.ron`). A catch needs
+  altitude under it — about 1.5 km at 250 m/s, 6 km at 600 m/s; lower and faster than
+  that it opens too late and the impact breaks the stack. Those are the dry Hopper's
+  numbers: with its tank full it is nearly twice as heavy and the same reefed canopy
+  takes about 5 km from 250 m/s.
+- **Seeing the parachute**: the press reads **`STAGED — 1 CHUTE(S) FIRED`** — fired, not
+  open. The canopy is drawn from the tick the simulation starts inflating it, and
+  **`CANOPY OPEN`** posts that same frame; it grows to full size over `deploy_time_s`
+  (1.5 s) and hangs there while the craft descends: a striped dome as wide as the part's
+  deployed drag area (30 m across for the s125's 700 m²) over the canister's place on the
+  craft's axis, its suspension lines down to the canister. The camera backs off once to
+  frame craft and canopy together as it opens — the wheel is yours again after that.
+  A chute waiting above the gates draws nothing; a craft that climbs back through them
+  loses its canopy from the view until it is under them again, and then the canopy is
+  whole at once, not re-inflated.
+- **Touchdown** (M4c landing): the ground stop of a landing is read by the breakup check as if
+  spread over 0.5 m of crush (`touchdown_crush_m`, `data/balance.ron`) — a 7 m/s touchdown loads
+  each inline joint to `m·v²/(2·0.5)` instead of the one-tick stop it is in the solver, and the
+  Stock Hopper lands intact on its engine bell. The spread stop acts through the centre of
+  mass, so a landing with drift or on a slope bends each joint only with what hangs off it.
+  The Hopper is a tall stack on a narrow bell, though: on sloping ground it can tip over after
+  touchdown, and the fall is what breaks it. An arrival faster than 64 m/s outruns the crush
+  distance and is read as the impact it is.
+- **Water is real** (sub-phase 4.1): where a body has an ocean (`terrin` does — everything
+  from the seabed up to sea level), water holds a craft up. A part floats if it is lighter
+  than the water its collider displaces (`water_density_kg_m3: 1025` kg/m³ — a full fuel tank
+  floats with four fifths of it under, a loaded ore carrier sinks). What floats **settles and
+  latches like a landed craft, as `Splashed`**; what sinks goes down to the seabed and latches
+  `Landed`. Weight high in the stack tips it over in the water, weight low brings it back
+  upright — a tall craft that splashes engine-first tips over and settles on its side.
+  **Splashdown loads are real**: at a parachute-class 17 m/s a stack on the shipped
+  mount limits survives the hit (≈9 g; the stock chute now arrives at 7 m/s); unbraked at
+  200 m/s it breaks apart (≈900 g). The
+  shipped science
+  canister's situation mask (49) does **not** include `Splashed` — recover a floater or
+  transmit from it instead of running the canister (`csp-phys/src/water.rs`,
+  `SimWorld::splashed`).
+  **You can see it** (sub-phase 4.2): a craft in the water shows through the surface, fading
+  with the water before it, red first — 15 m of water leaves a hundredth of the red, 92 m a
+  hundredth of the green, 230 m a hundredth of the blue — and the camera follows it under the
+  surface, down to 0.3 m above the seabed.
+- **Recovery**: land — or come to rest on the water — the vessel becomes **latched** — then **RECOVER VESSEL**
   (Actions strip, Program → SCIENCE, or right-click menu). Payout: **part value** at site
   efficiency (1.0 at the launch pad, 0.9 at other sites, 0.25 remote salvage), **resource
   contents** credited to that site's stockpile, **all pooled science banks at the recover
@@ -436,13 +507,25 @@ Top-right **Game** strip (drag it anywhere) → **Game** menu (`csp-ui/src/game.
   Files are `CSPSAVE` under `$XDG_CONFIG_HOME/csp/saves/<slot>.cspsave`
   (`csp-app/src/lib.rs:1159`). Saving is refused (with the §7.4 reason named) while commands
   are pending, contacts are live, joints are live, or the session is tainted/halted — e.g.
-  *save while latched on the pad, not mid-bounce*.
+  *save while latched on the pad, not mid-bounce*. A save does not store stage plans: after a
+  load each craft's plan is rebuilt from its parts — a chute that is not already deployed is a
+  deploy stage, and each depth of decoupler drops the subtree under it, deepest first
+  (`csp-view/src/flight.rs: StagePlans::from_restored_world`). The order you staged in the VAB is
+  not kept.
 - **Revert to launch [F10]**: enabled once a launch order has been placed (the pre-launch
-  snapshot is captured at `launch_craft`). The confirm dialog carries the mandated honesty
+  snapshot is captured at `launch_craft`). The craft's stage plan comes back with the world, so
+  it stages as it did at launch. The confirm dialog carries the mandated honesty
   disclosure: **"Reliability thresholds are pre-drawn: the same parts will still fail at the
   same accumulated hazard. Revert is not a reroll — it is a retry of the flying."**
   (`game.rs`, PLAN §3.4's revert policy).
 - **New game**: confirm-gated; abandons the current session (save first).
+
+Load, Revert and New game rebuild the world inside the frame they run in, so each
+shows a **loading screen** (`LOADING …`) for the frames it takes and comes down on the
+finished scene — pad, craft and HUD together, nothing arriving after it. The game opens
+the same way: a loading screen, then the whole scene at once. (The one other time it
+appears is a surface still being generated — `GENERATING SURFACE …` — which a normal
+session never waits on: the terrain is ready before the first frame.)
 
 A fatal sim error shows a read-only crash dialog with the bug-report bundle path
 (`csp_ui::crash_dialog`) — the session cannot be saved or continued from that point.
@@ -601,7 +684,12 @@ It completes on the **recovery event**, not on landing — press RECOVER VESSEL 
 **How do I deorbit / come home?**
 Focus the vessel in map, press **T** (`RecoverControl`) to pull it off rails into the bubble,
 then fly the entry or set a retrograde maneuver node — the executor flies it automatically.
-Deploy the chute below ~6 km / 260 m/s.
+Deploy the chute before 16 km / 1200 m/s — on the Stock Hopper, SPACE fires its chute stage
+whenever you like after liftoff: the canopy waits packed for those gates. The press reads
+`STAGED — 1 CHUTE(S) FIRED`; `CANOPY OPEN` and the canopy itself come when the gates pass.
+A catch needs about 6 km of air beneath it at 600 m/s (1.5 km at 250 m/s; about 5 km for a
+Hopper with its tank full); a craft that is still supersonic in the last kilometres is
+coming in without it.
 
 **The game says the session is read-only.**
 A fatal sim error halted the clock (crash dialog with a bug-report bundle path). Nothing can

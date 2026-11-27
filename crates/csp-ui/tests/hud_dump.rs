@@ -293,7 +293,6 @@ fn flight_input<'a>(
         t_pe_s: None,
         period_s: None,
         builds: &[],
-        terrain_pending: false,
         fps: 0.0,
         frame_ms: 0.0,
         propellant: prop,

@@ -1475,7 +1475,9 @@ mod tests {
                         friction_mu: 0.5,
                         drag_cd: 1.0,
                         convective_heat_fraction: csp_phys::DEFAULT_CONVECTIVE_HEAT_FRACTION,
+                        touchdown_crush_m: csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M,
                         terrain: None,
+                        ocean: None,
                     },
                     dominant: BodyId::from("p"),
                     bubble_radius_m: csp_sim::DEFAULT_BUBBLE_RADIUS_M,
@@ -1849,6 +1851,30 @@ mod tests {
         assert_eq!(
             b.dock_latch_rel_speed_mps,
             csp_sim::DEFAULT_LATCH_REL_SPEED_MPS
+        );
+        // M4c landing: the touchdown crush distance — `Environment::
+        // for_body`'s no-data stamp is what data-less worlds land
+        // under, so it must agree with the authored file.
+        assert_eq!(b.touchdown_crush_m, csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M);
+        // §3.1 rule A: the canopy steering — `SimpleBackend`'s no-data
+        // stamp is what data-less worlds and every world restored from a
+        // §7.6 artifact hang under, so it must agree with the authored
+        // file; and the loader's own fallback, what a v17 file without
+        // the two fields loads, with both.
+        assert_eq!(
+            csp_phys::CanopySteering::DEFAULT,
+            csp_phys::CanopySteering {
+                steady_arm_m: b.canopy_steady_arm_m,
+                steady_damp_m_s: b.canopy_steady_damp_m_s,
+            }
+        );
+        assert_eq!(
+            csp_data::balance::DEFAULT_CANOPY_STEADY_ARM_M,
+            csp_phys::DEFAULT_CANOPY_STEADY_ARM_M
+        );
+        assert_eq!(
+            csp_data::balance::DEFAULT_CANOPY_STEADY_DAMP_M_S,
+            csp_phys::DEFAULT_CANOPY_STEADY_DAMP_M_S
         );
         // And the literal `DEFAULT_*` mirrors the file names.
         assert_eq!(b.dock_capture_range_m, csp_sim::DEFAULT_CAPTURE_RANGE_M);

@@ -5,8 +5,10 @@
 //! convective-heating flux sample, **ground-contact dust**, and the
 //! HUD mirrors. Same §2.5 schedule shape as the map and VAB:
 //! `end_frame` stages sim reads into [`FlightSyncInput`],
-//! `sync_flight` mirrors them, `flight_present` solves the chase
-//! camera + the SFX cue edges, `extract_flight` emits clip-space
+//! `sync_flight` mirrors them, `flight_interp` draws each staged pose
+//! at the frame's fractional tick ([`DrawnScene`]), `flight_camera`
+//! steps the chase camera from that pose, `flight_present` derives the
+//! HUD mirrors + the SFX cue edges, `extract_flight` emits clip-space
 //! vertices for `csp_render::flight::FlightRenderer`.
 //!
 //! **SFX (§3.7 "basic SFX").** M4c ships the cue channel, not an
@@ -24,7 +26,8 @@
 //! the map projection. Cue TTLs count presentation frames — session
 //! state, never sim state.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use bevy_ecs::prelude::*;
@@ -44,10 +47,37 @@ pub(crate) const FLIGHT_FOV_Y: f64 = 0.9;
 /// bake `n` into a matrix or an NDC z must agree bit-for-bit, hence
 /// one constant.
 pub(crate) const FLIGHT_NEAR_M: f64 = 0.1;
-/// Default camera distance (m) — restored by `flight_present` on
-/// every focus-id change (C19-F4: a kept zoom framed the new focus at
-/// the old vessel's range).
+/// Where the chase camera sits before anything frames it (m). A focus
+/// frames itself the frame it stages ([`frame_distance`], C19-F4: a kept
+/// zoom framed the new focus at the old vessel's range); this is only
+/// the distance the first frame eases from.
 const FLIGHT_DEFAULT_DIST: f64 = 60.0;
+/// Half-life (s) of the chase camera's eased zoom. A frame closes
+/// `1 − exp2(−dt/half)` of what is left, so the same wall time closes
+/// the same share at any frame rate and nothing overshoots. A travel to
+/// a new focus starts from here and is shortened by
+/// [`travel_half_life`].
+const EASE_HALF_LIFE_S: f64 = 0.080;
+/// The orbit pitch limits (rad): 89° — nearly straight down or up,
+/// never the flip a hard ±π/2 would give the up vector.
+const PITCH_LIMIT: f64 = 89.0 * core::f64::consts::PI / 180.0;
+/// Nearest the eye may sit to the focus (m).
+const MIN_DISTANCE_M: f64 = 3.0;
+/// Farthest the eye may sit from the focus (m).
+const MAX_DISTANCE_M: f64 = 1.0e6;
+/// The distance floor as a multiple of the focus's bounding radius.
+const MIN_RADIUS_MULTIPLE: f64 = 1.5;
+/// A focus is framed at this multiple of its bounding radius.
+const FRAME_RADIUS_MULTIPLE: f64 = 4.0;
+/// The eye's clearance over the terrain under it (m) — the ground on
+/// land, the seabed under an ocean, whose surface is no floor.
+const EYE_GROUND_CLEARANCE_M: f64 = 0.3;
+/// A focus travel shorter than this (m) is done: the anchor is the
+/// focus's resting anchor exactly from that frame on.
+const TRAVEL_DONE_M: f64 = 1.0e-3;
+/// How long (s) a focus travel of ANY length may take to be under
+/// [`TRAVEL_DONE_M`].
+const TRAVEL_SETTLE_S: f64 = 0.5;
 /// Plasma sheath display window (W/m² of convective input,
 /// `FlightBody::plasma_w_m2`) — the flux half of
 /// [`plasma_intensity`]. C19-F1 recalibration: a plasma sheath is
@@ -110,24 +140,38 @@ pub enum FlightEvent {
         /// Pitch increment.
         dpitch: f64,
     },
-    /// Multiplicative zoom.
+    /// Multiplies the TARGET distance (`> 1` zooms out, `< 1` in); the
+    /// camera eases to the target ([`FlightInput`]).
     Zoom {
-        /// `> 1` zooms out, `< 1` in.
+        /// The factor.
         factor: f64,
     },
 }
 
-/// Session-state chase camera (§2.2-C).
+/// Session-state chase camera (§2.2-C). The angles follow the pointer
+/// with nothing in between; the distance EASES — the wheel moves
+/// [`Self::distance_target_m`] and every frame steps
+/// [`Self::distance_m`] toward it ([`ease_fraction`]).
 #[derive(Resource)]
 pub struct FlightInput {
     /// Orbit yaw (radians).
     pub yaw: f64,
-    /// Orbit pitch (radians).
+    /// Orbit pitch (radians), within ±[`PITCH_LIMIT`]. The player's
+    /// intent, like the yaw: the camera step never rewrites it — the
+    /// floor moves the eye, not the angles — and neither does a focus
+    /// change.
     pub pitch: f64,
-    /// Eye–focus distance (m).
-    pub distance_m: f64,
+    /// Where the eye is this frame (m).
+    distance_m: f64,
+    /// Where the wheel asked the eye to go (m), within the limits.
+    distance_target_m: f64,
     /// Viewport in physical pixels.
     pub viewport_px: (f64, f64),
+    /// The focus had an open canopy last frame — the edge a canopy
+    /// opening over the craft it already holds is read against.
+    canopy_open: bool,
+    /// What makes a focus change continuous.
+    travel: FocusTravel,
 }
 
 impl Default for FlightInput {
@@ -136,8 +180,173 @@ impl Default for FlightInput {
             yaw: 0.7,
             pitch: 0.25,
             distance_m: FLIGHT_DEFAULT_DIST,
+            distance_target_m: FLIGHT_DEFAULT_DIST,
             viewport_px: (1.0, 1.0),
+            canopy_open: false,
+            travel: FocusTravel::default(),
         }
+    }
+}
+
+impl FlightInput {
+    /// The eye–anchor distance this frame (m) — the orbit the camera
+    /// solves with, before any lift off the floor.
+    pub fn distance_m(&self) -> f64 {
+        self.distance_m
+    }
+
+    /// The distance the camera is easing to (m).
+    pub fn distance_target_m(&self) -> f64 {
+        self.distance_target_m
+    }
+
+    /// Place the eye at `m` outright — current and target together, so
+    /// nothing eases afterward. A non-finite or non-positive `m` changes
+    /// nothing.
+    pub fn set_distance(&mut self, m: f64) {
+        if m.is_finite() && m > 0.0 {
+            self.distance_m = m;
+            self.distance_target_m = m;
+        }
+    }
+
+    /// Forget where the camera orbited: the next focus is a first one,
+    /// with no travel to it. For a world replaced wholesale — the
+    /// anchor belonged to the discarded session, and a travel from it
+    /// would swoop in from wherever that session's craft flew.
+    pub(crate) fn forget_anchor(&mut self) {
+        self.travel.last = None;
+    }
+}
+
+/// Last frame's camera, as the next frame's focus edge reads it.
+#[derive(Clone, Copy)]
+struct Last {
+    /// The focused vessel.
+    id: u64,
+    /// The anchor the eye orbited.
+    anchor: DVec3,
+    /// The point the camera looked at.
+    look_at: DVec3,
+    /// How far the keep-out had moved the eye off its lifted orbit point —
+    /// at rest the least-distance rule ([`skirt_eye`]), and on a travel
+    /// whatever was still carried of the focus before's skirt as well.
+    skirt: DVec3,
+    /// The eye itself — what the next focus's least distance is read
+    /// against when the focus changes ([`FocusTravel::began_inside`]),
+    /// and where the keep-out on a travel finds it.
+    eye: DVec3,
+    /// The orbit point the keep-out read: lifted, and with whatever was
+    /// still carried of the focus before's skirt. Where it was on the
+    /// frame before, for the keep-out on a travel ([`KeptOut::ride`]).
+    carried: DVec3,
+    /// How far the eye moved over that frame (m): `None` where no frame
+    /// time was put in, so nothing moved.
+    moved_m: Option<f64>,
+    /// The travel's share of what is left that that frame closed
+    /// ([`ease_fraction`] of its half-life): what reads a move made in
+    /// one frame time in another ([`Pace::cap_m`]).
+    travelled: f64,
+}
+
+/// The eye's ride round a focus's ball while a travel carries its orbit
+/// point across it ([`KeptOut::ride`]) — what has come of it so far.
+#[derive(Clone, Copy)]
+struct Ride {
+    /// The way the eye set off round the ball: a unit vector, tangent to
+    /// it. Decides a diameter alone — a way whose two ways round are as
+    /// long as each other ([`KeptOut::round_way`]).
+    sets_off: DVec3,
+    /// Which way round the floor's circle the eye took where the way is
+    /// under the floor: `1` with the bearings, `-1` against, `0` until it
+    /// rode the circle.
+    floor_side: f64,
+    /// How much of its way the eye had left on the frame before (m).
+    left_m: f64,
+    /// How much of its own way inside the ball the orbit point had left
+    /// on the frame before, to where its way leaves the ball (m): `None`
+    /// where the orbit point comes to rest inside it, is outside it, or
+    /// that frame put no time in.
+    ahead_m: Option<f64>,
+}
+
+/// The camera's memory of where it orbited. At rest the anchor is the
+/// focus's resting anchor ([`resting_anchor`]); when the focus moves to
+/// another vessel the anchor starts where the last frame's eye orbited
+/// and eases to the new craft's own (at [`travel_half_life`]), so the eye
+/// carries no jump. The memory is also the focus edge: a frame whose
+/// focus is not last frame's is a first focus or a change.
+#[derive(Clone, Copy, Default)]
+struct FocusTravel {
+    /// The anchor's offset from the focus's resting anchor this frame
+    /// (m) — zero at rest.
+    offset: DVec3,
+    /// The half-life (s) the travel in hand eases at — taken once when
+    /// it starts and fixed for its whole run. `None` at rest.
+    half_life_s: Option<f64>,
+    /// The travel's length when it started (m) — `0` at rest.
+    start_m: f64,
+    /// What the previous focus left the camera looking at, as an offset
+    /// from the anchor the eye orbited when the travel started (m): the
+    /// look-at is handed over from it ([`travel_blend`]).
+    look_carry: DVec3,
+    /// The previous focus's skirt, handed over the same way.
+    skirt_carry: DVec3,
+    /// The eye's ride round the new focus's ball while the travel
+    /// carries its orbit point across it ([`KeptOut::ride`]) — in hand
+    /// or `None`. Nothing at rest.
+    ride: Option<Ride>,
+    /// The eye began this travel inside the new focus's least distance.
+    /// The orbit point's own way may pass through the craft, so the eye
+    /// does not follow it: it leaves the ball by the nearest way out and
+    /// makes for the orbit point round the craft instead
+    /// ([`KeptOut::outward`], [`KeptOut::chase`]) — its distance to the
+    /// craft's centre never falls, on any frame. `false` at rest and on
+    /// every other travel.
+    began_inside: bool,
+    /// Last frame — `None` while nothing is focused, so the next focus
+    /// is a first one.
+    last: Option<Last>,
+}
+
+impl FocusTravel {
+    /// Start a focus's memory over on a frame whose focus is not last
+    /// frame's: nothing in hand and — for a change, `last` being the frame
+    /// before — a travel from where that frame's eye orbited to the new
+    /// craft's resting anchor `rest`, carrying what the previous focus
+    /// left in hand; unless that already is the anchor, when there is no
+    /// travel at all. A first focus (`None`) has no earlier eye to be
+    /// continuous with. `com` and `rmin` are the new focus's.
+    fn begin(&mut self, last: Option<Last>, rest: DVec3, com: DVec3, rmin: f64) {
+        *self = Self {
+            last,
+            ..Self::default()
+        };
+        let Some(last) = last else {
+            return;
+        };
+        let change = last.anchor - rest;
+        let d0_m = change.norm();
+        if d0_m.is_finite() && d0_m > TRAVEL_DONE_M {
+            self.offset = change;
+            self.half_life_s = Some(travel_half_life(d0_m));
+            self.start_m = d0_m;
+            self.look_carry = last.look_at - last.anchor;
+            self.skirt_carry = last.skirt;
+            // The eye itself, skirt and all: that is what the travel
+            // starts from — on the frame of the change the orbit point,
+            // carry and all, is exactly this.
+            self.began_inside = (last.eye - com).norm() < rmin;
+        }
+    }
+
+    /// The travel is done: nothing is in hand any more, and nothing is
+    /// left of the orbit point's way round the focus's zone.
+    fn settle(&mut self) {
+        *self = Self {
+            last: self.last,
+            ..Self::default()
+        };
     }
 }
 
@@ -394,6 +603,15 @@ pub struct FlightSyncInput {
     /// one, and `flight_present` needs the distinction for the pin's
     /// `seen` edge and the SFX conversion cue.
     pub rails: Vec<u64>,
+    /// `(VesselId.0, bounding radius about the CoM)` for every entry of
+    /// `vessels` — the chase camera's framing and distance-limit input
+    /// ([`bounding_radius`]), folded once per craft revision where the
+    /// parts are staged. Mirrored into [`CraftRadii`].
+    pub radii: Vec<(u64, f64)>,
+    /// The open canopies the frame draws — every staged vessel's, each
+    /// craft's own in its body's site order. Mirrored into
+    /// [`CanopiesStaged`].
+    pub canopies: Vec<FlightCanopy>,
 }
 
 /// [`FlightSyncInput::rails`] mirrored — a standalone resource for the
@@ -401,6 +619,96 @@ pub struct FlightSyncInput {
 /// constructs `FlightSnapshot`, so that struct cannot grow).
 #[derive(Resource, Default)]
 pub struct RailsStaged(pub Vec<u64>);
+
+/// [`FlightSyncInput::radii`] mirrored (same standalone-resource
+/// reason as [`RailsStaged`]); `sync_flight` writes it, the chase
+/// camera reads the focus's row.
+#[derive(Resource, Default)]
+pub struct CraftRadii(pub Vec<(u64, f64)>);
+
+/// One deployed parachute's canopy as a frame stages it from the
+/// simulation ([`csp_sim::World::canopies`]) — presentation-owned, body
+/// frame like the craft it hangs under. A row exists exactly while the
+/// simulation holds the canopy open: a chute waiting out its gates, one
+/// back past them, and a craft out of the bubble stage none.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FlightCanopy {
+    /// The vessel it hangs under (`VesselId.0`).
+    pub vessel: u64,
+    /// The chute's graph node (`PartNodeId.0`).
+    pub node: u64,
+    /// How far the canopy is inflated, `0..=1` — the simulation's own
+    /// share of its open drag area, and the share of its size it is
+    /// drawn at.
+    pub inflation: f64,
+    /// The canister, body frame — where the suspension lines come down.
+    pub canister: DVec3,
+    /// The canister's place on the craft's axis, body frame — the
+    /// canopy hangs over this point.
+    pub on_axis: DVec3,
+    /// The craft's axis, unit, body frame — the way up to the canopy.
+    pub axis: DVec3,
+    /// The open canopy's drag area Cd·A (m²).
+    pub drag_area_m2: f64,
+}
+
+impl FlightCanopy {
+    /// The row for a canopy the simulation holds open — `None` where it
+    /// holds nothing.
+    fn staged(vessel: u64, canopy: csp_sim::Canopy) -> Option<Self> {
+        Some(Self {
+            vessel,
+            node: canopy.node.0,
+            inflation: canopy.inflation?,
+            canister: canopy.canister,
+            on_axis: canopy.on_axis,
+            axis: canopy.axis,
+            drag_area_m2: canopy.drag_area_m2,
+        })
+    }
+
+    /// The inflated canopy's radius (m): its drag area read as the disc
+    /// that catches it, `A = πr²`, at this inflation.
+    pub fn radius_m(&self) -> f64 {
+        (self.drag_area_m2 / core::f64::consts::PI).sqrt() * self.inflation
+    }
+
+    /// How far the canopy reaches from the craft's centre of mass `com`
+    /// once whole, body frame — the farthest of its dome's rings, rim and
+    /// apex counted in — at every inflation it may be staged at: the
+    /// chase camera frames a canopy by the size it is opening to, from
+    /// the first tick it shows, so the eye is already backing off while
+    /// it inflates.
+    fn reach_m(&self, com: DVec3) -> f64 {
+        let r = (self.drag_area_m2 / core::f64::consts::PI).sqrt();
+        let to_com = com - self.on_axis;
+        let along = to_com.dot(self.axis);
+        let aside = (to_com - self.axis * along).norm();
+        (0..=CANOPY_RINGS)
+            .map(|ring| {
+                let theta = ring as f64 * core::f64::consts::FRAC_PI_2 / CANOPY_RINGS as f64;
+                let height = (CANOPY_LINES + CANOPY_HEIGHT * theta.cos()) * r - along;
+                let out = aside + theta.sin() * r;
+                (height * height + out * out).sqrt()
+            })
+            .fold(0.0, f64::max)
+    }
+}
+
+/// How far the drawn canopy's rim stands over the point it hangs above,
+/// in canopy radii ([`FlightCanopy::radius_m`]) — its suspension lines
+/// run from there down to the canister.
+const CANOPY_LINES: f64 = 1.0;
+
+/// How far the drawn dome rises over its rim, in the same radii.
+const CANOPY_HEIGHT: f64 = 0.5;
+
+/// [`FlightSyncInput::canopies`] mirrored (same standalone-resource
+/// reason as [`RailsStaged`]): the open canopies the frame draws.
+/// `flight_present` and the chase camera read the focus's rows — the
+/// canopy-open cue and the framing it asks for.
+#[derive(Resource, Default)]
+pub struct CanopiesStaged(pub Vec<FlightCanopy>);
 
 /// The §3.4 flight display's g-load input (C10-F2/C22-F5): sustained
 /// acceleration per vessel, measured the way the sim's per-tick
@@ -533,10 +841,11 @@ impl FlightFocusOverride {
     /// The shared pin-aware focus resolver — the real focus is the
     /// pinned vessel when it is staged, else the newest staged vessel
     /// ([`focus_vessel`]'s rule). Every focus-sensitive consumer
-    /// resolves through HERE — the chase camera/HUD, the SFX edges,
-    /// the tutorial measures, and (via [`FlightSfx::focus_vessel`])
-    /// the app's audio voices — so a `recover_control` pin cannot
-    /// split them across two vessels (P04-F4/P07-F1/P11-F1/P12-F1).
+    /// resolves through HERE — the chase camera/HUD, the SFX edges, the
+    /// extract's blob shadow, the tutorial measures, and (via
+    /// [`FlightSfx::focus_vessel`]) the app's audio voices — so a
+    /// `recover_control` pin cannot split them across two vessels
+    /// (P04-F4/P07-F1/P11-F1/P12-F1).
     pub(crate) fn resolve<'a>(&self, vessels: &'a [FlightBody]) -> Option<&'a FlightBody> {
         self.target
             .and_then(|id| vessels.iter().find(|b| b.id == id.0))
@@ -563,8 +872,193 @@ pub struct FlightSnapshot {
 #[derive(Resource, Default)]
 pub struct LiveVesselCount(pub usize);
 
+/// A vessel's pose as a frame draws it — the same origin / orientation /
+/// CoM triple [`FlightBody`] stages, at the instant the frame is drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DrawnPose {
+    /// The vessel's id (`VesselId.0`).
+    pub id: u64,
+    /// Body-origin position (bubble frame).
+    pub pos: DVec3,
+    /// Body→world rotation.
+    pub rot: DQuat,
+    /// CoM (bubble frame) — the chase camera's focus.
+    pub com: DVec3,
+}
+
+impl DrawnPose {
+    /// Exactly as staged — no interpolation.
+    fn staged(b: &FlightBody) -> Self {
+        Self {
+            id: b.id,
+            pos: b.pos,
+            rot: b.rot,
+            com: b.com,
+        }
+    }
+}
+
+/// One staged pose at one whole tick — a sample on the path a vessel is
+/// drawn along.
+#[derive(Clone, Copy, Debug)]
+struct PoseSample {
+    /// The sim tick the pose was staged at.
+    tick: u64,
+    pose: DrawnPose,
+}
+
+/// The last two distinct-tick samples of one vessel.
+#[derive(Clone, Copy, Debug)]
+struct SamplePair {
+    /// The sample before `cur`'s tick — `None` until the vessel has
+    /// been staged across a tick boundary. A vessel with no previous
+    /// pose (freshly spawned, just delivered, a breakup fragment) is
+    /// drawn at its current pose.
+    prev: Option<PoseSample>,
+    /// The latest staged sample.
+    cur: PoseSample,
+}
+
+/// §2.5's interpolation memory — per vessel, the poses its last two
+/// distinct ticks staged. Session state only: nothing here is sim state
+/// or reaches a hash. A `BTreeMap`, so every walk is ascending
+/// `VesselId` — the staged list's own order.
+#[derive(Resource, Default)]
+pub struct PoseHistory {
+    samples: BTreeMap<u64, SamplePair>,
+}
+
+impl PoseHistory {
+    /// Age the history by one frame's staging and return the pose every
+    /// staged vessel is drawn at, in `vessels`' order. `tick` is the
+    /// clock the poses were staged at; `frac` the frame's fractional
+    /// tick remainder past it, in `[0, 1)` — at `0` every pose is the
+    /// staged one, unchanged.
+    fn advance(&mut self, vessels: &[FlightBody], tick: u64, frac: f64) -> Vec<DrawnPose> {
+        // A vessel absent from this frame's staging has left the path —
+        // a rails vessel outside the focus hint, a removal. Its next
+        // sighting starts over.
+        self.samples
+            .retain(|id, _| vessels.iter().any(|b| b.id == *id));
+        let mut poses = Vec::with_capacity(vessels.len());
+        for b in vessels {
+            let staged = PoseSample {
+                tick,
+                pose: DrawnPose::staged(b),
+            };
+            let pair = self.samples.entry(b.id).or_insert(SamplePair {
+                prev: None,
+                cur: staged,
+            });
+            match tick.cmp(&pair.cur.tick) {
+                Ordering::Greater => pair.prev = Some(pair.cur),
+                // The clock went backwards — a world restored at an
+                // earlier tick: the samples describe a discarded
+                // timeline.
+                Ordering::Less => pair.prev = None,
+                // A zero-tick frame restages the same instant.
+                Ordering::Equal => {}
+            }
+            pair.cur = staged;
+            poses.push(match pair.prev {
+                Some(prev) if frac > 0.0 => pose_between(&prev, &pair.cur, frac),
+                _ => pair.cur.pose,
+            });
+        }
+        poses
+    }
+}
+
+/// The point on `prev → cur` at the frame's drawn instant, `(cur.tick −
+/// 1) + frac` ticks — one tick of latency, so nothing is ever
+/// extrapolated: exactly `frac` of the way along a one-tick step, and a
+/// frame that spanned several ticks interpolates across that whole
+/// span. `frac < 1` keeps the result short of `cur`.
+fn pose_between(prev: &PoseSample, cur: &PoseSample, frac: f64) -> DrawnPose {
+    let span = (cur.tick - prev.tick) as f64;
+    let t = ((cur.tick - 1 - prev.tick) as f64 + frac) / span;
+    DrawnPose {
+        id: cur.pose.id,
+        pos: prev.pose.pos + (cur.pose.pos - prev.pose.pos) * t,
+        rot: rot_between(prev.pose.rot, cur.pose.rot, t),
+        com: prev.pose.com + (cur.pose.com - prev.pose.com) * t,
+    }
+}
+
+/// Shortest-arc interpolation of two unit rotations at `t`: the
+/// renormalized lerp, whose only transcendental is `DQuat::normalize`'s
+/// libm sqrt (`csp-view` has no `libm` edge for a constant-rate slerp's
+/// `acos`). It travels the arc a slerp would, at a rate that departs
+/// from constant by under 0.001 rad across a step turning up to 18° —
+/// a 64 Hz tick of any real tumble turns far less.
+fn rot_between(a: DQuat, b: DQuat, t: f64) -> DQuat {
+    // `q` and `−q` are the same rotation — flip to the shorter arc.
+    let flip = if a.dot(b) < 0.0 { -1.0 } else { 1.0 };
+    DQuat::new(
+        a.x + (b.x * flip - a.x) * t,
+        a.y + (b.y * flip - a.y) * t,
+        a.z + (b.z * flip - a.z) * t,
+        a.w + (b.w * flip - a.w) * t,
+    )
+    .normalize()
+}
+
+/// What a frame draws, all at one instant — §2.5's "never extrapolates"
+/// presentation time, `(clock − 1) + remainder` ticks: every staged
+/// vessel's pose, and the scene values that otherwise ride the integer
+/// clock (the dominant body's spin phase; the seconds the plume flicker
+/// and the ocean wave scroll read). [`flight_interp`] writes it every
+/// frame ahead of `flight_camera`; the chase solve, the part pick and
+/// `extract_flight` read it. The default — nothing drawn — reads as the
+/// staged snapshot, so a rig that runs the extract alone draws exactly
+/// what it stages.
+#[derive(Resource, Default)]
+pub struct DrawnScene {
+    /// The environment at the drawn instant: the staged one with its
+    /// spin phase rolled back to it. `None` mirrors a snapshot without
+    /// physics.
+    pub(crate) env: Option<FlightEnv>,
+    /// The drawn instant in seconds — `None` until a frame has been
+    /// drawn.
+    pub(crate) time_s: Option<f64>,
+    /// One pose per staged vessel, ascending id.
+    poses: Vec<DrawnPose>,
+}
+
+impl DrawnScene {
+    /// The pose `body` is drawn at this frame — its staged pose when
+    /// this frame drew none.
+    pub(crate) fn pose_of(&self, body: &FlightBody) -> DrawnPose {
+        self.poses
+            .iter()
+            .find(|p| p.id == body.id)
+            .map_or_else(|| DrawnPose::staged(body), |p| *p)
+    }
+
+    /// The pose drawn for vessel `id` this frame — `None` when the frame
+    /// drew none (the vessel is not staged, or interpolation has not
+    /// run).
+    pub fn drawn(&self, id: u64) -> Option<DrawnPose> {
+        self.poses.iter().find(|p| p.id == id).copied()
+    }
+
+    /// The environment at the drawn instant — its spin phase is the
+    /// ground's, the drawn poses ride. `None` without physics or until
+    /// a frame has been drawn.
+    pub fn env(&self) -> Option<&FlightEnv> {
+        self.env.as_ref()
+    }
+
+    /// The drawn instant in seconds — `None` until a frame has been
+    /// drawn.
+    pub fn time_s(&self) -> Option<f64> {
+        self.time_s
+    }
+}
+
 /// HUD mirrors — written by `flight_present`, drawn by
-/// `csp_ui::flight_hud`.
+/// `csp_ui::flight_hud`; the loading screen's two halves ride beside
+/// them.
 #[derive(Resource, Default)]
 pub struct FlightUiData {
     /// P1's FPS readout — the app's smoothed wall-clock frame timing
@@ -649,12 +1143,19 @@ pub struct FlightUiData {
     /// written from [`FlightSfx`], drawn as event flashes by
     /// `csp_ui::flight_hud`.
     pub sfx: Vec<String>,
-    /// The dominant body's heightfield bake is still in flight — the
-    /// frame's terrain packet is sky-only (no displaced surface drawn,
-    /// M5 §5.2-R2 arrival polish). Written by `extract_flight` (the
-    /// extract is where the cache is polled); the HUD reads it one
-    /// frame later because UiBuild runs before RenderExtract (§2.5).
+    /// The dominant body's heightfield is not in the cache this frame —
+    /// the frame's terrain packet is sky-only (no displaced surface
+    /// drawn, M5 §5.2-R2 arrival polish) and the loading screen covers
+    /// the frame. A body the simulation holds is adopted before the
+    /// first frame (`terrain::TerrainCache::adopt`), so `true` means a
+    /// bake of the view's own is in flight.
     pub terrain_pending: bool,
+    /// The loading screen's session half (§2.2-C session data): set
+    /// while the host holds a world-replacing session op
+    /// (`View::set_loading`). With this or [`Self::terrain_pending`]
+    /// set, `build_ui` covers the frame with the screen — the panels
+    /// are still built under it.
+    pub session_loading: bool,
     /// Osculating apoapsis altitude (m) — `None` open/latched/no vessel.
     pub apo_alt_m: Option<f64>,
     /// Osculating periapsis altitude (m).
@@ -756,6 +1257,8 @@ struct SfxPrev {
     contact: bool,
     /// Focused vessel is surface-latched — the landing edge.
     latched: bool,
+    /// The focused vessel has an open canopy — the canopy-open edge.
+    canopy: bool,
 }
 
 /// §3.7's "basic SFX" as a visual cue channel (module docs carry the
@@ -829,10 +1332,16 @@ pub struct StageActions {
 /// this plan. The `VesselId` cannot be predicted at capture (the
 /// enqueued `SpawnPhysicalVessel` allocates it inside `step_frame`,
 /// and queued producers/event firings may burn ids first), so the
-/// plan binds *lazily* — the first `fire_stage`/`vessel_for` call
-/// that sees a post-launch vessel carrying the captured craft
-/// fingerprint keeps it.
-#[derive(Resource, Default)]
+/// plan binds *lazily* — the first binding pass that sees a vessel
+/// inside its LAUNCH WINDOW carrying the captured craft's launch key
+/// keeps it ([`StagePlans::bind_all`]).
+///
+/// `Clone` because the plan is §2.2-C session state the save does not
+/// carry: a revert point keeps its own copy of the plans its snapshot
+/// was taken with, bound ([`StagePlans::captured_for_revert`];
+/// [`crate::View::revert_to_launch`]), and a load rebuilds them from
+/// the restored crafts ([`StagePlans::from_restored_world`]).
+#[derive(Resource, Default, Clone)]
 pub struct StagePlan {
     /// Remaining stage firings' action sets, firing order.
     pub stages: Vec<StageActions>,
@@ -843,25 +1352,28 @@ pub struct StagePlan {
     /// The vessel this plan fires at — `None` until [`Self::vessel_for`]
     /// binds it; a bound id is never re-pointed at another vessel.
     pub vessel: Option<VesselId>,
-    /// Binding bound: the lowest `VesselId` a post-launch spawn can
-    /// mint — `vessels().next_back() + 1` at capture (ids are
-    /// monotonic and never reused, so nothing already live can meet
+    /// Where the plan's launch window opens: the lowest `VesselId` its
+    /// launch could mint — `vessels().next_back() + 1` at capture (ids
+    /// are monotonic and never reused, so nothing already live can meet
     /// it, and any id at/above it was necessarily allocated after the
-    /// launch was enqueued).
+    /// launch was enqueued). The window closes where the next newer
+    /// plan's opens ([`StagePlans::bind_all`]).
     min_id: u64,
-    /// `craft_fingerprint` of the launched craft — the binding match.
-    /// Two launches of the same session craft produce identical
-    /// fingerprints; `min_id` keeps the newest launch's plan from
-    /// binding a still-live older copy.
+    /// [`craft_launch_key`] of the launched craft — the binding match.
+    /// Two launches of the same session craft produce identical keys
+    /// and restaging changes nothing a launch keys on, so the key
+    /// alone cannot tell a plan's own vessel from a later copy of the
+    /// craft: the window does.
     craft_key: u64,
-    /// `true` once binding proved AMBIGUOUS — two or more live
-    /// vessels minted at/above `min_id` share the launch fingerprint
-    /// (P05-F1: a second same-craft mint interposed while unbound,
-    /// e.g. the plan's own spawn rejected and a scripted mint of the
-    /// same craft landed instead). `(min_id, fingerprint)` cannot
-    /// name the vessel honestly, so the plan stays unbound rather
-    /// than latching a permanent wrong-vessel bind — `fire_stage`
-    /// surfaces the notice and retires the plan.
+    /// `true` once binding proved AMBIGUOUS — two or more live vessels
+    /// inside the launch window share the launch fingerprint (P05-F1:
+    /// a second same-craft mint interposed while unbound, e.g. the
+    /// plan's own spawn rejected and a scripted mint of the same craft
+    /// landed instead). The window cannot name the vessel honestly, so
+    /// the plan stays unbound rather than latching a permanent
+    /// wrong-vessel bind — `fire_stage` surfaces the notice and retires
+    /// the plan. A later launch of the same craft is not ambiguity: its
+    /// vessel falls outside the window.
     pub ambiguous: bool,
 }
 
@@ -880,37 +1392,49 @@ impl StagePlan {
             stages,
             vessel: None,
             min_id: sim.vessels().keys().next_back().map_or(0, |id| id.0 + 1),
-            craft_key: craft_fingerprint(craft),
+            craft_key: craft_launch_key(craft),
             ambiguous: false,
         }
     }
 
     /// A plan pre-bound to a known vessel — for tests and scripted
-    /// producers that mint the `VesselId` themselves. `min_id`/
-    /// `craft_key` stay inert because [`Self::vessel`] is already set.
+    /// producers that mint the `VesselId` themselves. Nothing is left
+    /// to bind; `craft_key` stays inert. `min_id` is the vessel's own
+    /// id — the launch minted exactly that — so the plan still closes
+    /// the window of any plan older than it.
     pub fn bound_to(stages: Vec<StageActions>, vessel: VesselId) -> Self {
         Self {
             total: stages.len(),
             stages,
             vessel: Some(vessel),
-            min_id: 0,
+            min_id: vessel.0,
             craft_key: 0,
             ambiguous: false,
         }
     }
 
     /// The vessel this plan fires at, binding on first call: the
-    /// UNIQUE vessel minted at-or-after [`Self::min_id`] whose stored
-    /// craft matches the launch's fingerprint (P05-F1 — the old
-    /// "newest match" rule permanently bound a wrong vessel whenever
-    /// a second same-craft mint interposed while the plan was
-    /// unbound). An unbound plan stays unbound (never caches `None`)
-    /// so a not-yet-landed spawn binds on a later press; a bound id
-    /// is returned verbatim — the caller re-checks it against the
-    /// live arena (the vessel may be gone). Two or more matching
-    /// candidates mean `(min_id, fingerprint)` cannot disambiguate:
-    /// [`Self::ambiguous`] latches and the plan never binds.
-    pub(crate) fn vessel_for(&mut self, sim: &World) -> Option<VesselId> {
+    /// UNIQUE vessel inside the plan's launch window — minted at or
+    /// after [`Self::min_id`] and before `closed_at`, the next newer
+    /// plan's own bound ([`StagePlans::bind_all`] walks the table to
+    /// supply it; the newest plan's window stays open, `u64::MAX`) —
+    /// whose stored craft matches the launch's key. Ids are monotonic
+    /// and the table is in launch order, so a vessel minted at or
+    /// after a newer launch's bound belongs to that launch or a later
+    /// one, never to this one: the window is what keeps a plan off the
+    /// next launch of the same craft, whether the plan is still
+    /// waiting for a spawn that never lands, came back from a revert
+    /// into the world its own craft occupies, or was retired and lost
+    /// its bound id. An unbound plan stays unbound (never caches
+    /// `None`) so a not-yet-landed spawn binds on a later press; a
+    /// bound id is returned verbatim — the caller re-checks it against
+    /// the live arena (the vessel may be gone). Two or more matching
+    /// candidates INSIDE the window mean it cannot name the vessel
+    /// honestly (P05-F1 — the old "newest match" rule permanently bound
+    /// a wrong vessel whenever a second same-craft mint interposed
+    /// while the plan was unbound): [`Self::ambiguous`] latches and the
+    /// plan never binds.
+    pub(crate) fn vessel_for(&mut self, sim: &World, closed_at: u64) -> Option<VesselId> {
         if let Some(v) = self.vessel {
             return Some(v);
         }
@@ -918,14 +1442,14 @@ impl StagePlan {
             return None;
         }
         let mut candidates = sim.vessels().iter().filter(|(id, v)| {
-            id.0 >= self.min_id
+            (self.min_id..closed_at).contains(&id.0)
                 && v.craft
                     .as_ref()
-                    .is_some_and(|c| craft_fingerprint(c) == self.craft_key)
+                    .is_some_and(|c| craft_launch_key(c) == self.craft_key)
         });
         let found = candidates.next().map(|(id, _)| *id);
         if candidates.next().is_some() {
-            // A second same-fingerprint mint at/above the bound —
+            // A second same-fingerprint mint inside the window —
             // which one is OURS is unanswerable. Latch the flag:
             // honest "cannot stage" beats a silent wrong-vessel fire.
             self.ambiguous = true;
@@ -942,14 +1466,16 @@ impl StagePlan {
 /// slot: a second launch used to `insert_resource` over the first
 /// craft's unfired stages, making them permanently unfireable and
 /// pointing the HUD at the wrong craft. Each launch pushes its own
-/// plan; they bind their own vessels independently through
-/// [`StagePlan::vessel_for`]. Most-recent launch LAST, so
-/// [`Self::active`] prefers the focused vessel's plan and falls back
-/// to the newest plan — the single-plan behaviour is unchanged.
-#[derive(Resource, Default)]
+/// plan; they bind their own vessels independently, each inside its
+/// launch window ([`StagePlan::vessel_for`], [`Self::bind_all`]).
+/// Most-recent launch LAST, so [`Self::active_index`] prefers the
+/// focused vessel's plan and falls back to the newest plan — the
+/// single-plan behaviour is unchanged.
+#[derive(Resource, Default, Clone)]
 pub struct StagePlans {
-    /// Live plans in launch order (oldest first). Expended or
-    /// orphaned plans are retired out of the vec by `fire_stage`.
+    /// Live plans in launch order (oldest first) — the order the
+    /// launch windows are read from. Expended or orphaned plans are
+    /// retired by `fire_stage`.
     pub plans: Vec<StagePlan>,
 }
 
@@ -965,6 +1491,77 @@ impl StagePlans {
         self.plans.push(plan);
     }
 
+    /// Bind every unbound plan inside its LAUNCH WINDOW. The table is
+    /// in launch order and ids are never reused, so every vessel minted
+    /// at or after a newer plan's [`StagePlan::min_id`] belongs to that
+    /// launch or a later one: plan `i` may own the ids in
+    /// `[plans[i].min_id, plans[i + 1].min_id)`, and the newest plan's
+    /// window stays open. Keyed on `(min_id, craft key)` alone a plan
+    /// could not tell its own vessel from a later launch of the same
+    /// craft — restaging changes nothing the key reads — so any plan
+    /// still unbound when that launch berthed claimed it first and
+    /// shadowed its staging: one waiting for a spawn that never landed
+    /// (a rejected launch), one a revert put back beside its own
+    /// craft, one the gone-vessel branch of `fire_stage` had retired.
+    /// Inside its window each of them finds nothing and stays unbound.
+    fn bind_all(&mut self, sim: &World) {
+        // Newest first: each plan's bound closes the window of the
+        // plan launched before it.
+        let mut closed_at = u64::MAX;
+        for p in self.plans.iter_mut().rev() {
+            let _ = p.vessel_for(sim, closed_at);
+            closed_at = p.min_id;
+        }
+    }
+
+    /// The plans a loaded save comes back without: the file stores the
+    /// sim, and the stage table each craft launched under is session
+    /// state it does not carry. One plan per restored craft, bound to
+    /// its vessel and derived from the craft alone
+    /// ([`restored_stage_actions`]); a craft with nothing left to stage
+    /// gets none, so the press reports "nothing to stage".
+    pub(crate) fn from_restored_world(sim: &World) -> Self {
+        Self {
+            plans: sim
+                .vessels()
+                .iter()
+                .filter_map(|(id, vessel)| {
+                    let Some(craft) = &vessel.craft else {
+                        return None;
+                    };
+                    let stages = restored_stage_actions(craft, &vessel.deployed, sim.parts());
+                    (!stages.is_empty()).then(|| StagePlan::bound_to(stages, *id))
+                })
+                .collect(),
+        }
+    }
+
+    /// The plans a revert point keeps ([`crate::View::launch_craft`] and
+    /// the delivery-boundary recapture in `sim_step`): this table as it
+    /// stands, every plan bound inside its launch window against the
+    /// world the point's snapshot holds, and the plans that cannot bind
+    /// left out. Only the copy is bound — the live table keeps binding
+    /// on its first press.
+    ///
+    /// A launch's plan is pushed unbound, and the copy used to be
+    /// stored that way too. A revert then put it back into the world
+    /// its own craft still occupies, where the next launch of the same
+    /// craft recovers that craft and berths the restaged one under a
+    /// later id with the same launch key — and the older plan, still
+    /// unbound, claimed the new vessel first: SPACE fired the pre-revert
+    /// staging. Bound here the plan names the pad craft's own id, and a
+    /// bound id is never re-pointed.
+    ///
+    /// A plan with no vessel in the captured world is not kept: the
+    /// restore cannot bring its craft back, so it is an orphan of that
+    /// world — a launch that never landed, a craft since recovered.
+    pub(crate) fn captured_for_revert(&self, sim: &World) -> Self {
+        let mut plans = self.clone();
+        plans.bind_all(sim);
+        plans.plans.retain(|p| p.vessel.is_some());
+        plans
+    }
+
     /// The plan a stage press should fire: the plan bound to `focus`
     /// when one exists, else the most recent plan still holding
     /// stages (or simply the newest — an expended newest plan is
@@ -972,9 +1569,7 @@ impl StagePlans {
     fn active_index(&mut self, sim: &World, focus: Option<VesselId>) -> Option<usize> {
         // Bind every unbound plan first so focus matching reads
         // resolved vessels, not pending fingerprints.
-        for p in self.plans.iter_mut() {
-            let _ = p.vessel_for(sim);
-        }
+        self.bind_all(sim);
         if let Some(f) = focus
             && let Some(i) = self.plans.iter().position(|p| p.vessel == Some(f))
         {
@@ -1007,20 +1602,114 @@ impl StagePlans {
     }
 
     /// Fire the active plan's next stage at `sim`: resolves binding,
-    /// returns `(vessel, ambiguous, refuse_msg)`; `refuse_msg`
-    /// `Some("")` means "plan exists but nothing to fire" — the
-    /// caller composes the cue from `total`.
+    /// returns `(index, vessel, ambiguous)` — the state
+    /// [`Self::active_index`]'s binding pass left the selected plan in
+    /// (never a second, window-less scan); the caller composes the cue
+    /// from `total`.
     pub(crate) fn select_for_fire(
         &mut self,
         sim: &World,
         focus: Option<VesselId>,
     ) -> Option<(usize, Option<VesselId>, bool)> {
         let i = self.active_index(sim, focus)?;
-        let p = &mut self.plans[i];
-        let v = p.vessel_for(sim);
-        let ambiguous = p.ambiguous;
-        Some((i, v, ambiguous))
+        let p = &self.plans[i];
+        Some((i, p.vessel, p.ambiguous))
     }
+}
+
+/// One restored craft's firing list, rebuilt from the craft itself —
+/// a save carries each part, not the stage table it launched under:
+///
+/// - a drop stage per depth of decoupler, deepest first, every
+///   decoupler at that depth firing together (a symmetric booster pair
+///   separates as one stage), each holding the subtree below its
+///   decouplers minus what a deeper firing already took;
+/// - then one deploy stage for the chutes no drop stage takes.
+///
+/// A chute already deployed before the save is not offered again, and
+/// the VAB's own stage order is gone — this is the order the craft's
+/// shape implies, not the one the player staged.
+fn restored_stage_actions(
+    craft: &csp_sim::CraftDef,
+    deployed: &BTreeMap<csp_phys::PartNodeId, csp_sim::DeployRecord>,
+    catalog: &BTreeMap<csp_data::PartId, csp_data::PartDef>,
+) -> Vec<StageActions> {
+    let nodes = &craft.graph.nodes;
+    let mut children: BTreeMap<csp_phys::PartNodeId, Vec<csp_phys::PartNodeId>> = BTreeMap::new();
+    for (id, node) in nodes {
+        if let Some(parent) = node.parent {
+            children.entry(parent).or_default().push(*id);
+        }
+    }
+    // Only the catalog says which parts are decouplers: staging is
+    // editor metadata the weld input does not carry.
+    let is_decoupler = |node: &csp_phys::PartNode| {
+        craft
+            .part_ids
+            .get(node.effective_index as usize)
+            .and_then(|part| catalog.get(part))
+            .is_some_and(|def| {
+                def.modules
+                    .iter()
+                    .any(|m| matches!(m, csp_data::ModuleDef::Decoupler))
+            })
+    };
+    let depth_of = |mut id: csp_phys::PartNodeId| {
+        let mut depth = 0;
+        while let Some(parent) = nodes[&id].parent {
+            depth += 1;
+            id = parent;
+        }
+        depth
+    };
+
+    // Every decoupler's drop set, by the decoupler's depth below the root.
+    let mut drops: BTreeMap<u32, BTreeSet<csp_phys::PartNodeId>> = BTreeMap::new();
+    for (id, node) in nodes {
+        if !is_decoupler(node) {
+            continue;
+        }
+        let set = drops.entry(depth_of(*id)).or_default();
+        let mut stack = children.get(id).cloned().unwrap_or_default();
+        while let Some(n) = stack.pop() {
+            if set.insert(n) {
+                stack.extend(children.get(&n).into_iter().flatten().copied());
+            }
+        }
+    }
+
+    let mut stages = Vec::new();
+    let mut dropped = BTreeSet::new();
+    for (_, set) in drops.into_iter().rev() {
+        let jettisons: Vec<csp_phys::PartNodeId> = set.difference(&dropped).copied().collect();
+        if !jettisons.is_empty() {
+            dropped.extend(jettisons.iter().copied());
+            stages.push(StageActions {
+                jettisons,
+                deploys: Vec::new(),
+            });
+        }
+    }
+    // The weld input's own parachute flag — the gate `DeployPart` checks.
+    let deploys: Vec<csp_phys::PartNodeId> = nodes
+        .iter()
+        .filter(|(id, node)| {
+            craft
+                .parts
+                .get(node.effective_index as usize)
+                .is_some_and(|p| p.parachute.is_some())
+                && !deployed.contains_key(id)
+                && !dropped.contains(id)
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    if !deploys.is_empty() {
+        stages.push(StageActions {
+            jettisons: Vec::new(),
+            deploys,
+        });
+    }
+    stages
 }
 
 /// Session-state cache for the §2.6.4 latched-vessel weld. The
@@ -1036,32 +1725,130 @@ impl StagePlans {
 pub struct LatchedWeldCache {
     /// `VesselId.0` → the cached weld-derived render data.
     entries: BTreeMap<u64, LatchedWeld>,
-    /// `VesselId.0` → `(craft_fingerprint, vessel_parts output)` for
-    /// the InBubble vessels — the same craft-identity key, reusing
-    /// the per-part derivation (the `body_transforms` fold, the
-    /// per-collider-vertex AABB fold, `classify_weld_part`) across
-    /// frames instead of redoing it for a craft that only moves
-    /// (C12-F3). Entries drop the frame the vessel leaves the
-    /// bubble; a staging/jettison/breakup re-graph changes the
-    /// fingerprint and re-derives. The parts vec is `Arc`-shared
-    /// into each staged [`FlightBody`] — the cache entry is
-    /// immutable per fingerprint, so the share is honest (C19-F5).
-    bubble_parts: BTreeMap<u64, (u64, Arc<Vec<FlightPart>>)>,
+    /// `VesselId.0` → the staged craft for the InBubble vessels — the
+    /// same craft-identity key, reusing the per-part derivation (the
+    /// `body_transforms` fold, the per-collider-vertex AABB fold,
+    /// `classify_weld_part`) across frames instead of redoing it for a
+    /// craft that only moves (C12-F3). Entries drop the frame the vessel
+    /// leaves the bubble; a staging/jettison/breakup re-graph changes the
+    /// fingerprint and re-derives. The parts vec is `Arc`-shared into
+    /// each staged [`FlightBody`] — the cache entry is immutable per
+    /// fingerprint, so the share is honest (C19-F5).
+    bubble_parts: BTreeMap<u64, StagedCraft>,
+    /// Last frame's staged canopy rows, emptied — the buffer
+    /// [`capture_sync_input`] refills, so a steady canopy allocates
+    /// nothing frame to frame. `end_frame` hands it back from
+    /// [`CanopiesStaged`] before each capture.
+    pub(crate) canopy_rows: Vec<FlightCanopy>,
+}
+
+/// [`vessel_parts`]' output with what it bounds — derived once per
+/// craft revision, never per frame.
+struct StagedCraft {
+    /// `craft_fingerprint` of the craft these entries describe.
+    key: u64,
+    /// The per-part render entries — `Arc`-shared into the staged
+    /// bodies (immutable per fingerprint, C19-F5).
+    parts: Arc<Vec<FlightPart>>,
+    /// [`bounding_radius`] of `parts` about the craft's CoM (m).
+    radius_m: f64,
+}
+
+impl StagedCraft {
+    /// Derive the entries and the radius they bound for one craft
+    /// revision, under its weld's body-frame CoM.
+    fn stage(
+        key: u64,
+        craft: Option<&csp_sim::CraftDef>,
+        hulls: &[csp_phys::ConvexHull],
+        com_local: DVec3,
+        art: &crate::art::ArtAssets,
+    ) -> Self {
+        let parts = vessel_parts(craft, hulls, art);
+        Self {
+            key,
+            radius_m: bounding_radius(&parts, com_local),
+            parts,
+        }
+    }
 }
 
 /// One latched vessel's cached weld output — the render data
 /// `capture_sync_input` would otherwise recompute every frame.
 struct LatchedWeld {
-    /// `craft_fingerprint` of the `(graph, parts)` this entry welded.
-    key: u64,
+    /// The staged craft — its fingerprint, parts and bounding radius.
+    craft: StagedCraft,
     /// `WeldedBody::com_local` — `surface_pose_restore`'s CoM input.
     com_local: DVec3,
     /// Live plume emitters `(local_pos, local_dir, delivered)` — see
     /// [`FlightBody::plumes`]. A fresh baseline weld stages `1.0`.
     plumes: Vec<(DVec3, DVec3, f64)>,
-    /// `vessel_parts`' output over the welded hulls — `Arc`-shared
-    /// into the staged bodies (immutable per fingerprint, C19-F5).
-    parts: Arc<Vec<FlightPart>>,
+}
+
+/// The smallest sphere about a craft's body-frame CoM holding every
+/// part's collider AABB — the farthest AABB corner from `com_local`. The
+/// baked models are fitted to those AABBs at emit, so it bounds what is
+/// drawn. A corner at no finite distance (an empty hull's inverted
+/// extents) bounds nothing.
+fn bounding_radius(parts: &[FlightPart], com_local: DVec3) -> f64 {
+    let mut far_sq: f64 = 0.0;
+    for p in parts {
+        for x in [p.lo.x, p.hi.x] {
+            for y in [p.lo.y, p.hi.y] {
+                for z in [p.lo.z, p.hi.z] {
+                    let d_sq = (DVec3::new(x, y, z) - com_local).norm_squared();
+                    if d_sq.is_finite() {
+                        far_sq = far_sq.max(d_sq);
+                    }
+                }
+            }
+        }
+    }
+    far_sq.sqrt()
+}
+
+/// FNV-1a over a craft — the mixer [`craft_fingerprint`] and
+/// [`craft_launch_key`] share.
+struct CraftHash(u64);
+
+impl CraftHash {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn mix(&mut self, bits: u64) {
+        self.0 ^= bits;
+        self.0 = self.0.wrapping_mul(Self::FNV_PRIME);
+    }
+
+    /// The mixer opened over `craft`'s shape: its root, then every
+    /// node ascending — id, parent, transform, effective index — then
+    /// the part count.
+    fn over(craft: &csp_sim::CraftDef) -> Self {
+        let mut h = Self(Self::FNV_OFFSET);
+        h.mix(craft.graph.root.0);
+        for (id, node) in &craft.graph.nodes {
+            h.mix(id.0);
+            h.mix(node.parent.map_or(u64::MAX, |p| p.0));
+            for v in [
+                node.transform.offset.x,
+                node.transform.offset.y,
+                node.transform.offset.z,
+                node.transform.rotation.x,
+                node.transform.rotation.y,
+                node.transform.rotation.z,
+                node.transform.rotation.w,
+            ] {
+                h.mix(v.to_bits());
+            }
+            h.mix(u64::from(node.effective_index));
+        }
+        h.mix(craft.parts.len() as u64);
+        h
+    }
+
+    fn finish(self) -> u64 {
+        self.0
+    }
 }
 
 /// The [`LatchedWeldCache`] staleness key: FNV-1a over the
@@ -1070,38 +1857,32 @@ struct LatchedWeld {
 /// so a same-id/different-craft hit re-welds rather than rendering a
 /// stale parked shape. Presentation-only; not the §7.1 state hash.
 fn craft_fingerprint(craft: &csp_sim::CraftDef) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h = FNV_OFFSET;
-    let mut mix = |bits: u64| {
-        h ^= bits;
-        h = h.wrapping_mul(FNV_PRIME);
-    };
-    mix(craft.graph.root.0);
-    for (id, node) in &craft.graph.nodes {
-        mix(id.0);
-        mix(node.parent.map_or(u64::MAX, |p| p.0));
-        for v in [
-            node.transform.offset.x,
-            node.transform.offset.y,
-            node.transform.offset.z,
-            node.transform.rotation.x,
-            node.transform.rotation.y,
-            node.transform.rotation.z,
-            node.transform.rotation.w,
-        ] {
-            mix(v.to_bits());
-        }
-        mix(u64::from(node.effective_index));
-    }
-    mix(craft.parts.len() as u64);
+    let mut h = CraftHash::over(craft);
     for p in &craft.parts {
-        mix(p.mass_kg.to_bits());
-        mix(p.com.x.to_bits());
-        mix(p.com.y.to_bits());
-        mix(p.com.z.to_bits());
+        h.mix(p.mass_kg.to_bits());
+        h.mix(p.com.x.to_bits());
+        h.mix(p.com.y.to_bits());
+        h.mix(p.com.z.to_bits());
     }
-    h
+    h.finish()
+}
+
+/// The key a [`StagePlan`] binds its vessel by: the craft's shape and
+/// its catalog part ids — deliberately not the masses
+/// [`craft_fingerprint`] also folds in. A tanked craft's part masses
+/// move with the fuel bucket the first tick its engine burns, and the
+/// plan binds on its first stage press: keyed on mass, a craft the
+/// player flew before staging never matched its plan, and the press
+/// reported a spawn that had long since landed.
+fn craft_launch_key(craft: &csp_sim::CraftDef) -> u64 {
+    let mut h = CraftHash::over(craft);
+    for id in &craft.part_ids {
+        for byte in id.as_str().bytes() {
+            h.mix(u64::from(byte));
+        }
+        h.mix(u64::MAX);
+    }
+    h.finish()
 }
 
 /// Sun direction in the bubble frame: the bubble is a translated copy
@@ -1203,25 +1984,44 @@ pub fn capture_sync_input(
     let mut vessels = Vec::new();
     let mut propulsion = Vec::new();
     let mut rails = Vec::new();
+    let mut radii = Vec::new();
+    // The canopy rows ride last frame's buffer, emptied: the capture
+    // refills it and `end_frame` hands it back, so a canopy that stays
+    // open stages without an allocation.
+    let mut canopies = std::mem::take(&mut cache.canopy_rows);
+    canopies.clear();
     for (id, vessel) in sim.vessels() {
         match &vessel.state {
             VesselState::InBubble(body) => {
                 // The per-part render data is a pure function of the
                 // craft topology — cache it on the same fingerprint
-                // the latched path uses (C12-F3). Craft-less bodies
-                // stage the cheap hull-AABB fallback uncached.
-                let parts = match vessel.craft.as_ref() {
+                // the latched path uses (C12-F3); the bounding radius
+                // is a function of the same revision, so it rides
+                // along. Craft-less bodies stage the cheap hull-AABB
+                // fallback uncached.
+                let (parts, radius_m) = match vessel.craft.as_ref() {
                     Some(craft) => {
                         let key = craft_fingerprint(craft);
-                        let entry = cache.bubble_parts.entry(id.0).or_insert_with(|| {
-                            (key, vessel_parts(Some(craft), &body.collider.hulls, art))
-                        });
-                        if entry.0 != key {
-                            *entry = (key, vessel_parts(Some(craft), &body.collider.hulls, art));
+                        let derive = || {
+                            StagedCraft::stage(
+                                key,
+                                Some(craft),
+                                &body.collider.hulls,
+                                body.com_local,
+                                art,
+                            )
+                        };
+                        let entry = cache.bubble_parts.entry(id.0).or_insert_with(derive);
+                        if entry.key != key {
+                            *entry = derive();
                         }
-                        Arc::clone(&entry.1)
+                        (Arc::clone(&entry.parts), entry.radius_m)
                     }
-                    None => vessel_parts(None, &body.collider.hulls, art),
+                    None => {
+                        let staged =
+                            StagedCraft::stage(0, None, &body.collider.hulls, body.com_local, art);
+                        (staged.parts, staged.radius_m)
+                    }
                 };
                 let plumes = live_plumes(vessel.craft.as_ref(), body);
                 // §3.7's plasma driver: the per-area convective input the
@@ -1248,7 +2048,13 @@ pub fn capture_sync_input(
                     latched: false,
                     tanks: vessel_tanks(vessel),
                 });
+                radii.push((id.0, radius_m));
                 propulsion.push(vessel_propulsion(*id, vessel, Some(body)));
+                for canopy in sim.canopies(*id) {
+                    if let Some(row) = FlightCanopy::staged(id.0, canopy) {
+                        canopies.push(row);
+                    }
+                }
             }
             // §2.6.4 surface rails: a latched vessel is still *on the
             // pad* — stage its restored inertial pose so the parked
@@ -1257,8 +2063,11 @@ pub fn capture_sync_input(
             // environment; without one the record is uninterpretable —
             // skip honestly rather than guess a pose.
             VesselState::SurfaceLatched(pose) => {
-                if let Some(body) = stage_latched(sim, env_ref, *id, vessel, pose, cache, art) {
+                if let Some((body, radius_m)) =
+                    stage_latched(sim, env_ref, *id, vessel, pose, cache, art)
+                {
                     vessels.push(body);
+                    radii.push((id.0, radius_m));
                     propulsion.push(vessel_propulsion(*id, vessel, None));
                 }
             }
@@ -1271,11 +2080,12 @@ pub fn capture_sync_input(
             // nothing, exactly as before.
             VesselState::OnRails(orbit) => {
                 if rails_focus.contains(id)
-                    && let Some((body, prop)) =
+                    && let Some((body, prop, radius_m)) =
                         stage_rails(sim, env_ref, *id, vessel, orbit, cache, art)
                 {
                     rails.push(id.0);
                     vessels.push(body);
+                    radii.push((id.0, radius_m));
                     propulsion.push(prop);
                 }
             }
@@ -1297,6 +2107,8 @@ pub fn capture_sync_input(
         live_vessels,
         propulsion,
         rails,
+        radii,
+        canopies,
     }
 }
 
@@ -1319,7 +2131,7 @@ fn stage_rails(
     orbit: &csp_sim::orbit::OrbitState,
     cache: &mut LatchedWeldCache,
     art: &crate::art::ArtAssets,
-) -> Option<(FlightBody, VesselPropulsion)> {
+) -> Option<(FlightBody, VesselPropulsion, f64)> {
     let env = env?;
     let dominant = sim.dominant_body()?.clone();
     let t = sim.clock();
@@ -1338,34 +2150,40 @@ fn stage_rails(
     let vel = vel_off + v;
     // Weld-derived render data — the latched path's cache (the craft
     // is immutable while railed, so the fingerprint key holds).
-    let (parts, com_local, plumes, nodes) = match vessel.craft.as_ref() {
+    let (parts, com_local, plumes, nodes, radius_m) = match vessel.craft.as_ref() {
         Some(craft) => {
             let key = craft_fingerprint(craft);
-            if cache.entries.get(&id.0).is_none_or(|e| e.key != key) {
+            if cache.entries.get(&id.0).is_none_or(|e| e.craft.key != key) {
                 let welded = csp_phys::weld(&craft.graph, &craft.parts).ok()?;
                 let plumes = live_plumes(vessel.craft.as_ref(), &welded);
                 cache.entries.insert(
                     id.0,
                     LatchedWeld {
-                        key,
                         com_local: welded.com_local,
                         plumes,
-                        parts: vessel_parts(vessel.craft.as_ref(), &welded.collider.hulls, art),
+                        craft: StagedCraft::stage(
+                            key,
+                            vessel.craft.as_ref(),
+                            &welded.collider.hulls,
+                            welded.com_local,
+                            art,
+                        ),
                     },
                 );
             }
             let entry = cache.entries.get(&id.0)?;
             (
-                Arc::clone(&entry.parts),
+                Arc::clone(&entry.craft.parts),
                 entry.com_local,
                 entry.plumes.clone(),
                 craft.graph.nodes.len(),
+                entry.craft.radius_m,
             )
         }
         // Craft-less (elements-only) vessel: the hull-AABB fallback has
         // no hulls to box — an empty part list still leaves the staged
         // pose/HUD honest (the camera and telemetry keep working).
-        None => (Arc::new(Vec::new()), DVec3::ZERO, Vec::new(), 0),
+        None => (Arc::new(Vec::new()), DVec3::ZERO, Vec::new(), 0, 0.0),
     };
     let rot = DQuat::IDENTITY;
     Some((
@@ -1388,6 +2206,7 @@ fn stage_rails(
             tanks: vessel_tanks(vessel),
         },
         vessel_propulsion(id, vessel, None),
+        radius_m,
     ))
 }
 
@@ -1401,7 +2220,7 @@ fn stage_rails(
 /// `None` for an unstageable record — no environment (the pose record
 /// is uninterpretable without one), no stored craft, or a craft that
 /// cannot weld. Skipping honestly matches the pre-cache behaviour:
-/// degraded, never guessed.
+/// degraded, never guessed. Returns the body and its bounding radius (m).
 fn stage_latched(
     sim: &World,
     env: Option<&csp_phys::Environment>,
@@ -1410,12 +2229,12 @@ fn stage_latched(
     pose: &csp_sim::SurfacePose,
     cache: &mut LatchedWeldCache,
     art: &crate::art::ArtAssets,
-) -> Option<FlightBody> {
+) -> Option<(FlightBody, f64)> {
     let (Some(env), Some(craft)) = (env, vessel.craft.as_ref()) else {
         return None;
     };
     let key = craft_fingerprint(craft);
-    if cache.entries.get(&id.0).is_none_or(|e| e.key != key) {
+    if cache.entries.get(&id.0).is_none_or(|e| e.craft.key != key) {
         let welded = csp_phys::weld(&craft.graph, &craft.parts).ok()?;
         // A fresh weld reads baseline `rated_n` on every site —
         // `live_plumes` stages each at `delivered = 1` (and drops a
@@ -1426,10 +2245,15 @@ fn stage_latched(
         cache.entries.insert(
             id.0,
             LatchedWeld {
-                key,
                 com_local: welded.com_local,
                 plumes,
-                parts: vessel_parts(vessel.craft.as_ref(), &welded.collider.hulls, art),
+                craft: StagedCraft::stage(
+                    key,
+                    vessel.craft.as_ref(),
+                    &welded.collider.hulls,
+                    welded.com_local,
+                    art,
+                ),
             },
         );
     }
@@ -1438,24 +2262,27 @@ fn stage_latched(
     // `pos + rot·com_local`, not of the origin `pos`.
     let (pos, rot, vel, _ang_vel) =
         csp_sim::bubble::surface_pose_restore(env, pose, entry.com_local, sim.clock());
-    Some(FlightBody {
-        id: id.0,
-        pos,
-        rot,
-        vel,
-        throttle: 0.0,
-        debris: vessel.debris_since.is_some(),
-        // Parked, not impacting — the dust puff reads as a touchdown
-        // event, not a resting state.
-        contact: false,
-        plasma_w_m2: 0.0,
-        nodes: craft.graph.nodes.len(),
-        parts: Arc::clone(&entry.parts),
-        plumes: entry.plumes.clone(),
-        com: pos + rot.rotate(entry.com_local),
-        latched: true,
-        tanks: vessel_tanks(vessel),
-    })
+    Some((
+        FlightBody {
+            id: id.0,
+            pos,
+            rot,
+            vel,
+            throttle: 0.0,
+            debris: vessel.debris_since.is_some(),
+            // Parked, not impacting — the dust puff reads as a touchdown
+            // event, not a resting state.
+            contact: false,
+            plasma_w_m2: 0.0,
+            nodes: craft.graph.nodes.len(),
+            parts: Arc::clone(&entry.craft.parts),
+            plumes: entry.plumes.clone(),
+            com: pos + rot.rotate(entry.com_local),
+            latched: true,
+            tanks: vessel_tanks(vessel),
+        },
+        entry.craft.radius_m,
+    ))
 }
 
 /// One vessel's per-resource propellant totals — capacities summed
@@ -1822,13 +2649,15 @@ pub(crate) fn apply_flight_input(
         match e {
             FlightEvent::Orbit { dyaw, dpitch } => {
                 input.yaw += dyaw;
-                // ~89° — the camera may go nearly under or directly
-                // overhead; a hard ±π/2 flips the up vector instead.
-                input.pitch = (input.pitch + dpitch).clamp(-1.55, 1.55);
+                input.pitch = (input.pitch + dpitch).clamp(-PITCH_LIMIT, PITCH_LIMIT);
             }
-            FlightEvent::Zoom { factor } => {
-                input.distance_m = (input.distance_m * factor).clamp(3.0, 1.0e6);
+            // The craft-radius half of the limit lands in
+            // `step_chase_camera`, where the focus is known.
+            FlightEvent::Zoom { factor } if factor.is_finite() => {
+                input.distance_target_m =
+                    (input.distance_target_m * factor).clamp(MIN_DISTANCE_M, MAX_DISTANCE_M);
             }
+            FlightEvent::Zoom { .. } => {}
         }
     }
 }
@@ -1845,42 +2674,97 @@ pub(crate) fn sync_flight(
     mut live: ResMut<LiveVesselCount>,
     mut prop: ResMut<VesselPropulsionStaged>,
     mut rails: ResMut<RailsStaged>,
+    mut radii: ResMut<CraftRadii>,
+    mut canopies: ResMut<CanopiesStaged>,
 ) {
     snap.env.clone_from(&staged.env);
     snap.vessels = std::mem::take(&mut staged.vessels);
     live.0 = staged.live_vessels;
     prop.0 = std::mem::take(&mut staged.propulsion);
     rails.0 = std::mem::take(&mut staged.rails);
+    radii.0 = std::mem::take(&mut staged.radii);
+    canopies.0 = std::mem::take(&mut staged.canopies);
 }
 
-/// The flight chase-camera solve: an orbit camera in the *local-level
-/// frame* at the focus (up = radial at the CoM, north = spin axis
-/// projected level, east completes it), so the horizon stays level
-/// while the camera is dragged — the shared world-frame
-/// `solve_orbit_camera` puts the orbit basis on the ecliptic normal,
-/// which renders a pad away from the pole tilted (the "can't place
-/// the camera" complaint). `input.yaw` is the azimuth about local up,
-/// `input.pitch` the elevation above the horizon; the eye is clamped
-/// just above the *terrain* surface (the baked heightfield rises up
-/// to `amplitude_m` above `radius_m`, so a datum-only floor lets a
-/// downward drag bury the camera inside a hill). Falls back to the
-/// world-frame basis when there is no environment.
-fn solve_chase_camera(
-    input: &FlightInput,
-    env: Option<&FlightEnv>,
-    focus: &FlightBody,
-    terrain_cfg: &TerrainConfig,
-    terrain_cache: &mut TerrainCache,
-) -> MapCameraF64 {
-    let mut up = DVec3::Z;
-    let mut axis = DVec3::Z;
-    if let Some(env) = env {
-        axis = env.spin_axis;
-        let rel = focus.com - env.body_center;
-        if rel.norm_squared() > 1.0e-12 {
-            up = rel / rel.norm();
-        }
+/// The share of what is left that one frame of `dt_s` closes at a
+/// half-life of `half_life_s` — `1 − exp2(−dt / half)`. Frame-rate
+/// independent (two half-length frames close exactly what one does) and
+/// never more than 1, which is what keeps an eased value short of its
+/// target: no overshoot.
+fn ease_fraction(dt_s: f64, half_life_s: f64) -> f64 {
+    1.0 - (-dt_s / half_life_s).exp2()
+}
+
+/// The half-life (s) a focus travel of `d0_m` eases at: the zoom's
+/// ([`EASE_HALF_LIFE_S`]), shortened for a long travel so that
+/// `half_life · log2(d0_m / TRAVEL_DONE_M)` — the time to be done —
+/// never exceeds [`TRAVEL_SETTLE_S`]. At the zoom's own rate a travel
+/// from 850 km away crawled for over a second; at this one every travel
+/// from a metre to a thousand kilometres is done in half a second.
+fn travel_half_life(d0_m: f64) -> f64 {
+    EASE_HALF_LIFE_S.min(TRAVEL_SETTLE_S / (d0_m / TRAVEL_DONE_M).log2())
+}
+
+/// The nearest the eye may sit to a focus of bounding radius `radius_m`
+/// (m): the larger of [`MIN_DISTANCE_M`] and [`MIN_RADIUS_MULTIPLE`]
+/// radii, itself within the far limit.
+fn min_distance(radius_m: f64) -> f64 {
+    MIN_DISTANCE_M
+        .max(MIN_RADIUS_MULTIPLE * radius_m)
+        .min(MAX_DISTANCE_M)
+}
+
+/// The distance a focus of bounding radius `radius_m` is framed at (m):
+/// [`FRAME_RADIUS_MULTIPLE`] radii, clamped to the limits.
+fn frame_distance(radius_m: f64) -> f64 {
+    (FRAME_RADIUS_MULTIPLE * radius_m).clamp(min_distance(radius_m), MAX_DISTANCE_M)
+}
+
+/// The least radius the eye may have where the heightfield's surface is
+/// `ground_m` from the body centre: [`EYE_GROUND_CLEARANCE_M`] over that
+/// surface, on land and under an ocean alike. Over water the eye goes
+/// under the surface freely, down to the clearance over the seabed.
+fn eye_floor(ground_m: f64) -> f64 {
+    ground_m + EYE_GROUND_CLEARANCE_M
+}
+
+/// The local-level frame at the camera's anchor — the basis the orbit
+/// angles are read in, so the horizon stays level while the camera is
+/// dragged (the shared world-frame `solve_orbit_camera` puts the orbit
+/// basis on the ecliptic normal, which renders a pad away from the pole
+/// tilted).
+struct LevelFrame {
+    /// Local up — the radial at the anchor.
+    up: DVec3,
+    /// Local north — the spin axis projected level.
+    north: DVec3,
+    /// Local east — completes the right-handed frame.
+    east: DVec3,
+}
+
+impl LevelFrame {
+    /// The unit direction from the anchor toward the eye: `yaw` about
+    /// `up` from north, `pitch` above the horizon.
+    fn dir(&self, yaw: f64, pitch: f64) -> DVec3 {
+        let (sy, cy) = yaw.sin_cos();
+        let (sp, cp) = pitch.sin_cos();
+        self.north * (cy * cp) + self.east * (sy * cp) + self.up * sp
     }
+}
+
+/// `anchor`'s level frame on the body centred at `centre` spinning
+/// about `axis`. Without a body, or over a degenerate anchor, up is
+/// world +Z. Over a pole the axis projection collapses — world +Z, then
+/// +X, is projected instead.
+fn level_frame(anchor: DVec3, centre: Option<DVec3>, axis: DVec3) -> LevelFrame {
+    let up = centre.map_or(DVec3::Z, |c| {
+        let rel = anchor - c;
+        if rel.norm_squared() > 1.0e-12 {
+            rel / rel.norm()
+        } else {
+            DVec3::Z
+        }
+    });
     let mut north = axis - up * axis.dot(up);
     if north.norm_squared() < 1.0e-12 {
         north = DVec3::Z - up * up.z;
@@ -1889,43 +2773,1258 @@ fn solve_chase_camera(
         }
     }
     let north = north / north.norm();
-    let east = north.cross(up);
-    let (sy, cy) = input.yaw.sin_cos();
-    let (sp, cp) = input.pitch.sin_cos();
-    let dir = north * (cy * cp) + east * (sy * cp) + up * sp;
-    let mut eye = focus.com + dir * input.distance_m;
-    // Keep the eye out of the ground: a drag pitching under the
-    // horizon stops above the local terrain surface (the baked
-    // heightfield's neighbourhood ceiling), not the bare datum —
-    // procedural relief rises up to `amplitude_m` over `radius_m`.
-    if let Some(env) = env {
-        let rel = eye - env.body_center;
-        let r = rel.norm();
-        if r > 0.0 {
-            let floor =
-                crate::terrain::surface_floor_radius(terrain_cfg, terrain_cache, env, rel / r);
-            let min_r = (env.radius_m + 1.5).max(floor + 1.5);
-            if r < min_r {
-                eye = env.body_center + rel * (min_r / r);
-            }
+    LevelFrame {
+        up,
+        north,
+        east: north.cross(up),
+    }
+}
+
+/// An orbit about the camera's anchor.
+struct Orbit {
+    /// Azimuth about local up (rad).
+    yaw: f64,
+    /// Elevation above the horizon (rad).
+    pitch: f64,
+    /// Eye–anchor distance (m).
+    distance_m: f64,
+}
+
+/// The chase-camera solve, pure: the eye for one `orbit` about
+/// `anchor`, and whether the floor lifted it. The intent's orbit point —
+/// `anchor + dir(yaw, pitch)·d` — is the eye whenever it clears the floor
+/// (`floor` gives the least radius the eye may have from `centre` along a
+/// unit direction: [`eye_floor`] over the heightfield). Under the floor
+/// the eye is that same point lifted along the local up, radially out from
+/// `centre`, onto the floor — sampled along the point's own direction, so
+/// the lifted eye sits on the floor exactly, whatever the ground does.
+///
+/// Nothing else happens here: no pitch is searched for and no angle is
+/// handed back, because where the floor had to put the eye must never
+/// rewrite the player's orbit. The eye is a continuous function of the
+/// intent alone — the lift shrinks to nothing as the point reaches the
+/// floor. What the lift keeps of a drag is the orbit point's share along
+/// the floor, `d·cos(pitch)`, whose slope in pitch, `d·sin(pitch)`, is
+/// zero at the anchor's own level. Two rules stand outside the solve for
+/// what that leaves: a craft under the floor has its anchor lifted over
+/// the ground ([`resting_anchor`]), and an eye that would come nearer
+/// than the focus's least distance is kept out of its ball ([`skirt_eye`]
+/// at rest, [`KeptOut::ride`] on a focus travel).
+fn solve_orbit(
+    orbit: &Orbit,
+    anchor: DVec3,
+    level: &LevelFrame,
+    centre: DVec3,
+    floor: &mut dyn FnMut(DVec3) -> f64,
+) -> (DVec3, bool) {
+    let asked = anchor
+        + level.dir(orbit.yaw, orbit.pitch.clamp(-PITCH_LIMIT, PITCH_LIMIT)) * orbit.distance_m;
+    let rel = asked - centre;
+    let r = rel.norm();
+    if r > 0.0 {
+        let dir = rel / r;
+        let min_r = floor(dir);
+        if r < min_r {
+            return (centre + dir * min_r, true);
         }
     }
-    // Camera basis (columns = view axes in world, c0×c1 = c2): z_out
-    // points focus → eye, "up" is the local surface up.
+    (asked, false)
+}
+
+/// The least-distance rule's edges along the floor are placed to this (m).
+const SKIRT_PRECISION_M: f64 = 1.0e-9;
+
+/// A way into a craft's ball whose tangent share where it enters is within
+/// this of nothing passes within `rmin` times this of the CoM: a diameter
+/// for the keep-out on a travel, whose two ways round are as long as each
+/// other.
+const DIAMETER_SHARE: f64 = 1.0e-3;
+
+/// Two points of a craft's ball this close together, as a share of its
+/// radius, are the same point: nothing for a way to go.
+const SAME_POINT_SHARE: f64 = 1.0e-12;
+
+/// How many samples along the way round a craft's ball the keep-out on a
+/// travel looks for the way being under the floor at, and how finely each
+/// edge of that is then bisected.
+const ROUND_SAMPLES: usize = 256;
+const ROUND_BISECTIONS: usize = 40;
+
+/// The share of the way across the zone — from the turn point to the far
+/// edge, `2` whole in [`skirt_azimuth`]'s measure — over which the eye
+/// settles from the drag's own pace along the floor onto the circle's
+/// ([`skirt_plateau`]).
+const SKIRT_ONRAMP: f64 = 0.5;
+
+/// How many times the orbit point's slide along the floor the eye covers
+/// along the circle once it has settled ([`skirt_azimuth`]). The circle's
+/// half circumference is `π·h*` and the slide straight across the zone
+/// `2·h*`, `h*` the turn: the eye must average `π/2` times the slide to be
+/// round by the time the orbit point leaves, and it spends its first
+/// [`SKIRT_ONRAMP`] of the way at the slide itself — so it settles at
+/// this.
+fn skirt_plateau() -> f64 {
+    (core::f64::consts::PI - 0.5 * SKIRT_ONRAMP) / (2.0 - 0.5 * SKIRT_ONRAMP)
+}
+
+/// Where the eye is round the circle: the angle (rad) from the turn point
+/// toward the yaw's own side, `π` at the far edge, for an orbit point `u`
+/// of the way across the zone — `0` at the turn point, `2` at the far
+/// edge. Its slope is how many metres of circle the eye covers for a
+/// metre of the orbit point's slide: the slide itself where the eye
+/// enters (at the turn point), so the frame that enters the zone moves no
+/// further than the drag's own step, settling smoothly over
+/// [`SKIRT_ONRAMP`] onto [`skirt_plateau`] times it. It rises all the way,
+/// and depends on `u` alone: dragging down or zooming in carries the eye
+/// on round the craft, dragging up or zooming out brings it back along
+/// the same circle, and a reversed drag retraces the path.
+fn skirt_azimuth(u: f64) -> f64 {
+    let plateau = skirt_plateau();
+    let v = u / SKIRT_ONRAMP;
+    if v < 1.0 {
+        // `u`, plus the on-ramp's gain integrated under a smooth step.
+        u + 0.5 * (plateau - 1.0) * SKIRT_ONRAMP * v.powi(3) * (2.0 - v)
+    } else {
+        0.5 * SKIRT_ONRAMP * (1.0 + plateau) + plateau * (u - SKIRT_ONRAMP)
+    }
+}
+
+/// A line along the floor from the point under a craft — where
+/// [`skirt_eye`] moves the eye.
+struct FloorRay<'a> {
+    /// The body's centre.
+    centre: DVec3,
+    /// The craft's local up.
+    up: DVec3,
+    /// Across the floor, away from the point under the craft.
+    along: DVec3,
+    /// The floor's radius under the craft (m).
+    floor_r: f64,
+    floor: &'a mut dyn FnMut(DVec3) -> f64,
+}
+
+impl FloorRay<'_> {
+    /// The floor point `x` metres from the point under the craft.
+    fn at(&mut self, x: f64) -> DVec3 {
+        let (sin, cos) = (x / self.floor_r).sin_cos();
+        let dir = self.up * cos + self.along * sin;
+        self.centre + dir * (self.floor)(dir)
+    }
+}
+
+/// The first point from `from_m` out along the ray that is `rmin` or
+/// more from `com` — `from_m` itself being nearer. No floor point further
+/// than `rmin` along the ray can be nearer, so the edge is bracketed by
+/// doubling steps inside that and bisected to [`SKIRT_PRECISION_M`].
+fn clear_from(ray: &mut FloorRay, com: DVec3, rmin: f64, from_m: f64) -> f64 {
+    let clear = |ray: &mut FloorRay, x: f64| (ray.at(x) - com).norm() >= rmin;
+    let (mut inside, mut step, mut edge) = (from_m, 0.01 * rmin, from_m + 0.01 * rmin);
+    while !clear(ray, edge) && edge < from_m + 4.0 * rmin {
+        inside = edge;
+        step *= 2.0;
+        edge += step;
+    }
+    for _ in 0..64 {
+        if edge - inside <= SKIRT_PRECISION_M {
+            break;
+        }
+        let mid = 0.5 * (inside + edge);
+        if clear(ray, mid) {
+            edge = mid;
+        } else {
+            inside = mid;
+        }
+    }
+    edge
+}
+
+/// How close to the floor a point of the craft's ball counts as on it.
+/// A way that sets off from the floor's least-distance circle, or comes
+/// in to land on it, is on the circle there: one built on the sphere a
+/// hair over it would leave the ground.
+const FLOOR_HAIR_M: f64 = 1.0e-7;
+
+/// A point this close to the craft's ball's surface counts as on it (m).
+const ON_BALL_M: f64 = 1.0e-7;
+
+/// How many bisections find the first point along a way on the craft's
+/// ball from which the straight line to a point outside it clears it.
+const CLEAR_BISECTIONS: usize = 24;
+
+/// How many bisections find how far along its way the eye's pace carries
+/// it, where the way asked more of it ([`paced`]).
+const PACE_BISECTIONS: usize = 24;
+
+/// The most one frame's move of the eye may exceed the one before's on a
+/// focus travel, over the frames moving more than a millimetre: a tenth,
+/// less a hair, so that rounding cannot carry a frame over it.
+const PACE_GAIN: f64 = 1.099;
+
+/// A ride is done within this of where it is going (m): a tenth of the
+/// millimetre the travel itself snaps at its end, so nothing shows.
+const RIDE_DONE_M: f64 = 1.0e-4;
+
+/// A great circle of a craft's ball — a leg of the eye's way along it
+/// on a focus travel ([`Leg::Sphere`]).
+#[derive(Clone, Copy)]
+struct GreatCircle {
+    /// The CoM's direction to where the leg starts.
+    out: DVec3,
+    /// The second axis, at right angles to the first: the way sets off
+    /// along it.
+    aside: DVec3,
+    /// How far the leg sweeps along the circle (rad).
+    swept: f64,
+}
+
+impl GreatCircle {
+    /// The offset from the CoM to the point of the ball `angle` (rad)
+    /// along the circle, the ball's radius being `rmin`.
+    fn offset(&self, rmin: f64, angle: f64) -> DVec3 {
+        (self.out * angle.cos() + self.aside * angle.sin()) * rmin
+    }
+}
+
+/// One leg of the eye's way ([`Way`]).
+#[derive(Clone, Copy)]
+enum Leg {
+    /// Straight from `from` to `to`.
+    Line { from: DVec3, to: DVec3 },
+    /// Along a great circle of the sphere, from `from` (rad) for `span`
+    /// (rad) — the ball's radius being the craft's least distance.
+    Sphere {
+        circle: GreatCircle,
+        from: f64,
+        span: f64,
+    },
+    /// Along the floor's least-distance circle, from bearing `from` (rad,
+    /// [`KeptOut::bearing`]) for `round` (rad, signed).
+    Floor { from: f64, round: f64 },
+}
+
+impl Leg {
+    /// The point `share` of the way along the leg: `0` where it starts,
+    /// `1` where it ends.
+    fn at(&self, kept_out: &mut KeptOut, share: f64) -> DVec3 {
+        match *self {
+            Self::Line { from, to } => from + (to - from) * share,
+            Self::Sphere { circle, from, span } => kept_out.on_ball(&circle, from + span * share),
+            Self::Floor { from, round } => kept_out.on_circle(from + round * share),
+        }
+    }
+}
+
+/// The eye's way from where it is to where it is going on a focus
+/// travel: legs end to end, each by its own length, walked from `0` to
+/// [`Way::total_m`]. Built afresh every frame from where the eye is.
+#[derive(Default)]
+struct Way {
+    /// The legs, in order, each with its length (m).
+    legs: Vec<(Leg, f64)>,
+}
+
+impl Way {
+    /// Add `leg` of `length_m` on the end; nothing that has no length.
+    fn push(&mut self, leg: Leg, length_m: f64) {
+        if length_m > 0.0 {
+            self.legs.push((leg, length_m));
+        }
+    }
+
+    /// The way's whole length (m).
+    fn total_m(&self) -> f64 {
+        self.legs.iter().map(|(_, length_m)| *length_m).sum()
+    }
+
+    /// The point `arc_m` (m) along the way, its end at or past the whole
+    /// of it; `None` for no way at all.
+    fn at(&self, kept_out: &mut KeptOut, arc_m: f64) -> Option<DVec3> {
+        let mut left_m = arc_m;
+        for &(leg, length_m) in &self.legs {
+            if left_m <= length_m {
+                return Some(leg.at(kept_out, left_m / length_m));
+            }
+            left_m -= length_m;
+        }
+        self.legs.last().map(|&(leg, _)| leg.at(kept_out, 1.0))
+    }
+
+    /// Keep the first `arc_m` (m) of the way and no more.
+    fn cut(&mut self, arc_m: f64) {
+        let mut left_m = arc_m;
+        for (i, &(leg, length_m)) in self.legs.iter().enumerate() {
+            if left_m < length_m {
+                let share = left_m / length_m;
+                let leg = match leg {
+                    Leg::Line { from, to } => Leg::Line {
+                        from,
+                        to: from + (to - from) * share,
+                    },
+                    Leg::Sphere { circle, from, span } => Leg::Sphere {
+                        circle,
+                        from,
+                        span: span * share,
+                    },
+                    Leg::Floor { from, round } => Leg::Floor {
+                        from,
+                        round: round * share,
+                    },
+                };
+                self.legs.truncate(i);
+                self.legs.push((leg, left_m));
+                return;
+            }
+            left_m -= length_m;
+        }
+    }
+
+    /// How far along the way — all of it on the craft's ball — the first
+    /// point is from which the straight line to `target`, a point
+    /// outside the ball, does not enter it ([`KeptOut::clears`]), and
+    /// that point. The way runs along the ball up to there and straight
+    /// on from it.
+    fn clear_at(&self, kept_out: &mut KeptOut, target: DVec3) -> (f64, DVec3) {
+        let mut gone_m = 0.0;
+        for &(leg, length_m) in &self.legs {
+            let end = leg.at(kept_out, 1.0);
+            if !kept_out.clears(end, target) {
+                gone_m += length_m;
+                continue;
+            }
+            let start = leg.at(kept_out, 0.0);
+            if kept_out.clears(start, target) {
+                return (gone_m, start);
+            }
+            // Between one that is blocked and one that clears: where it
+            // turns.
+            let (mut blocked, mut clear) = (0.0, 1.0);
+            for _ in 0..CLEAR_BISECTIONS {
+                let mid = 0.5 * (blocked + clear);
+                let at = leg.at(kept_out, mid);
+                if kept_out.clears(at, target) {
+                    clear = mid;
+                } else {
+                    blocked = mid;
+                }
+            }
+            let at = leg.at(kept_out, clear);
+            return (gone_m + length_m * clear, at);
+        }
+        let end_m = self.total_m();
+        (end_m, self.at(kept_out, end_m).unwrap_or(target))
+    }
+}
+
+/// How much of what it has left the eye keeps of a frame riding toward a
+/// place it must be at by the time the travel settles: the travel's own
+/// share squared — its remainder falls off twice as fast as the
+/// travel's — where that is there in time, and faster where it would not
+/// be. `left_m` is what the eye has left, `remaining_m` what the travel
+/// has, and a frame of the travel closes `share` of what is left.
+fn ride_taper(left_m: f64, remaining_m: f64, share: f64) -> f64 {
+    let keeps = 1.0 - share;
+    let mut taper = keeps * keeps;
+    if left_m > RIDE_DONE_M && remaining_m > TRAVEL_DONE_M && keeps > 0.0 {
+        // Frames until the travel is under a millimetre:
+        // `remaining_m · keeps^n` drops under `TRAVEL_DONE_M` at `n`.
+        let frames = (TRAVEL_DONE_M / remaining_m).ln() / keeps.ln();
+        // The most a frame may keep and be within `RIDE_DONE_M` of the
+        // end by then: `left_m · taper^frames` under it.
+        if frames.is_finite() && frames > 0.0 {
+            taper = taper.min(((RIDE_DONE_M / left_m).ln() / frames).exp());
+        }
+    }
+    taper.clamp(0.0, 1.0)
+}
+
+/// What paces the eye on a frame of a focus travel ([`KeepFrame::eye`]).
+#[derive(Clone, Copy)]
+struct Pace {
+    /// The eye's move on the frame before (m): `None` where that frame
+    /// put no time in or was the focus before's — the frame of a change
+    /// is a travel's first, and what the eye moved on it was the last
+    /// focus's.
+    moved_m: Option<f64>,
+    /// The travel's share of what is left that the frame before closed
+    /// and that this frame closes.
+    share: (f64, f64),
+    /// How far the anchor still has to travel (m).
+    remaining_m: f64,
+    /// How far the anchor moved this frame (m).
+    anchor_step_m: f64,
+}
+
+impl Pace {
+    /// How far the eye may move this frame (m), as the eye itself moves:
+    /// a tenth beyond its move on the frame before — the same move read at
+    /// this frame's time, by the two frames' travel shares — or, where
+    /// that frame was no frame of this travel's and so bounds nothing,
+    /// beyond the travel's own step this frame.
+    /// A frame that moved less than a millimetre bounds nothing
+    /// ([`TRAVEL_DONE_M`]).
+    fn cap_m(&self, step_m: f64) -> f64 {
+        let base_m = self
+            .moved_m
+            .unwrap_or(step_m.max(self.anchor_step_m))
+            .max(TRAVEL_DONE_M);
+        let (was, now) = self.share;
+        let read_m = if was > 0.0 && now > 0.0 {
+            base_m * (now / was).clamp(1.0e-3, 1.0e3)
+        } else {
+            base_m
+        };
+        PACE_GAIN * read_m
+    }
+
+    /// How much of what it has left the eye keeps of this frame, to be
+    /// within [`RIDE_DONE_M`] of where it is going by the time the travel
+    /// settles ([`ride_taper`]).
+    fn taper(&self, left_m: f64) -> f64 {
+        ride_taper(left_m, self.remaining_m, self.share.1)
+    }
+}
+
+/// The craft an eye is kept out of: the least-distance rule's measure of
+/// the ball about it — its sphere, and the floor under that sphere: a
+/// line along the floor from the point under the craft, out along the
+/// yaw's side of it, and the yaw's own side across that line.
+struct KeptOut<'a> {
+    /// The craft's CoM.
+    com: DVec3,
+    /// The craft's least distance ([`min_distance`]) (m).
+    rmin: f64,
+    /// Out along the yaw's side of the craft — at rest the side of it the
+    /// eye orbits on.
+    along: DVec3,
+    /// The yaw's own side, `along × up`: an increasing yaw moves the eye
+    /// this way.
+    side: DVec3,
+    ray: FloorRay<'a>,
+}
+
+impl KeptOut<'_> {
+    /// The measure for a craft whose CoM is `com`, on the floor under it.
+    /// `None` without a usable floor there.
+    fn under(
+        com: DVec3,
+        rmin: f64,
+        yaw_dir: DVec3,
+        centre: DVec3,
+        floor: &mut dyn FnMut(DVec3) -> f64,
+    ) -> Option<KeptOut<'_>> {
+        let rel = com - centre;
+        if rel.norm_squared() <= 0.0 {
+            return None;
+        }
+        let up = rel / rel.norm();
+        let floor_r = floor(up);
+        if !floor_r.is_finite() || floor_r <= 0.0 {
+            return None;
+        }
+        let along = [yaw_dir, DVec3::Z, DVec3::X]
+            .into_iter()
+            .map(|v| v - up * v.dot(up))
+            .find(|v| v.norm_squared() > 1.0e-24)
+            .unwrap_or(DVec3::X);
+        let along = along / along.norm();
+        Some(KeptOut {
+            com,
+            rmin,
+            side: along.cross(up),
+            along,
+            ray: FloorRay {
+                centre,
+                up,
+                along,
+                floor_r,
+                floor,
+            },
+        })
+    }
+
+    /// How far `point` is out along the yaw's side of the craft and how
+    /// far to the yaw's own side of that line (m): its angles from the
+    /// vertical through the craft, times the floor's radius under it.
+    fn place(&self, point: DVec3) -> (f64, f64) {
+        let out = point - self.ray.centre;
+        let over = out.dot(self.ray.up);
+        (
+            out.dot(self.along).atan2(over) * self.ray.floor_r,
+            out.dot(self.side).atan2(over) * self.ray.floor_r,
+        )
+    }
+
+    /// `point`'s bearing round the craft (rad): from the yaw's side of it
+    /// toward the yaw's own — the angle [`Self::on_circle`] takes.
+    fn bearing(&self, point: DVec3) -> f64 {
+        let (out, aside) = self.place(point);
+        aside.atan2(out)
+    }
+
+    /// Whether `point` is inside the craft's ball: nearer than the least
+    /// distance from the CoM.
+    fn inside_ball(&self, point: DVec3) -> bool {
+        (point - self.com).norm() < self.rmin
+    }
+
+    /// Whether `point` is on the craft's ball — its surface — to within
+    /// [`ON_BALL_M`]: a way along the ball starts from such a point.
+    fn is_on_ball(&self, point: DVec3) -> bool {
+        ((point - self.com).norm() - self.rmin).abs() <= ON_BALL_M
+    }
+
+    /// Whether `point` is under the floor, or on it to within
+    /// [`FLOOR_HAIR_M`].
+    fn under_floor(&mut self, point: DVec3) -> bool {
+        let out = point - self.ray.centre;
+        let r = out.norm();
+        r > 0.0 && r < (self.ray.floor)(out / r) + FLOOR_HAIR_M
+    }
+
+    /// Whether the straight line from `from` to `to` stays out of the
+    /// craft's ball: neither end inside it, and the closest the line
+    /// comes to the CoM no nearer than the least distance — as positions
+    /// measure it, a point of the ball itself being on it. For a line off
+    /// the ball toward a point outside it, that is setting off along the
+    /// ball's surface or away from its centre, never in toward it.
+    fn clears(&self, from: DVec3, to: DVec3) -> bool {
+        let (line, at) = (to - from, from - self.com);
+        let closest = if line.norm_squared() > 0.0 {
+            (-at.dot(line) / line.norm_squared()).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        (at + line * closest).norm() >= self.rmin - ON_BALL_M
+    }
+
+    /// The point `offset` from the CoM gives — the offset lengthened by
+    /// [`SKIRT_PRECISION_M`] at a time until that point is the least
+    /// distance or more from the CoM as positions measure it: a point
+    /// built on the ball can round a hair inside it.
+    fn clear_of(&self, mut offset: DVec3) -> DVec3 {
+        let step_m = SKIRT_PRECISION_M.max(f64::EPSILON * 8.0 * self.ray.floor_r);
+        let mut point = self.com + offset;
+        for _ in 0..16 {
+            if (point - self.com).norm() >= self.rmin {
+                break;
+            }
+            offset = offset + offset * (step_m / offset.norm());
+            point = self.com + offset;
+        }
+        point
+    }
+
+    /// The point of the ball `angle` (rad) along `circle` from the entry.
+    fn on_ball(&self, circle: &GreatCircle, angle: f64) -> DVec3 {
+        self.clear_of(circle.offset(self.rmin, angle))
+    }
+
+    /// The point of the craft's ball on the way out from the CoM
+    /// through `point`: on the sphere where that is over the floor, on
+    /// the floor's least-distance circle at `point`'s bearing where it is
+    /// under it ([`Self::on_circle`]). For a point inside the ball it is
+    /// its nearest way out — the eye's distance to the CoM grows all
+    /// along it, and nothing of the craft is in the way; for one outside
+    /// it, the nearest point of the ball. A point on the vertical through
+    /// the CoM leaves toward the yaw's side.
+    fn outward(&mut self, point: DVec3) -> DVec3 {
+        let to_ball = point - self.com;
+        let to_ball = if to_ball.norm_squared() > (1.0e-9 * self.rmin).powi(2) {
+            to_ball
+        } else {
+            self.along * self.rmin
+        };
+        let out = to_ball / to_ball.norm();
+        if self.under_floor(self.com + out * self.rmin) {
+            let (along, aside) = self.place(point);
+            let bearing = if along.hypot(aside) > 1.0e-9 * self.ray.floor_r {
+                aside.atan2(along)
+            } else {
+                0.0
+            };
+            self.on_circle(bearing)
+        } else {
+            self.clear_of(out * self.rmin)
+        }
+    }
+
+    /// Where the straight step `from`…`to` crosses into the craft's
+    /// ball — `from` outside it and `to` inside: the share of the step
+    /// that is outside, and the crossing, a point of the ball.
+    fn entry(&self, from: DVec3, to: DVec3) -> (f64, DVec3) {
+        let step = to - from;
+        let (mut outside, mut inside) = (0.0, 1.0);
+        for _ in 0..64 {
+            let mid = 0.5 * (outside + inside);
+            if self.inside_ball(from + step * mid) {
+                inside = mid;
+            } else {
+                outside = mid;
+            }
+        }
+        (inside, from + step * inside)
+    }
+
+    /// The zone's edges along the yaw's line (m): how far out on the yaw's
+    /// side the floor first is `rmin` from the CoM — the turn — and as far
+    /// on the far side. The point under the craft is inside the zone.
+    fn edges(&mut self) -> (f64, f64) {
+        let turn_m = clear_from(&mut self.ray, self.com, self.rmin, 0.0);
+        self.ray.along = -self.along;
+        let far_m = clear_from(&mut self.ray, self.com, self.rmin, 0.0);
+        (turn_m, far_m)
+    }
+
+    /// The first point along the floor on bearing `bearing` from the turn
+    /// point toward the yaw's own side that is `rmin` or more from the
+    /// CoM — the circle's own point there.
+    fn on_circle(&mut self, bearing: f64) -> DVec3 {
+        self.ray.along = self.along * bearing.cos() + self.side * bearing.sin();
+        let reach_m = clear_from(&mut self.ray, self.com, self.rmin, 0.0);
+        self.ray.at(reach_m)
+    }
+
+    /// [`skirt_eye`]'s rule for `lifted`: the lifted orbit point itself
+    /// while it is `rmin` or more from the CoM, and the eye that goes
+    /// round the craft for one that is nearer.
+    fn rule(&mut self, lifted: DVec3) -> DVec3 {
+        if (lifted - self.com).norm() >= self.rmin {
+            return lifted;
+        }
+        self.ray.along = self.along;
+        let h = self.place(lifted).0;
+        if (self.ray.at(0.0) - self.com).norm() >= self.rmin {
+            // The band's far edge, from where the eye is.
+            let turn_m = clear_from(&mut self.ray, self.com, self.rmin, h);
+            let mut x = 2.0 * turn_m - h;
+            if (self.ray.at(x) - self.com).norm() < self.rmin {
+                x = clear_from(&mut self.ray, self.com, self.rmin, x);
+            }
+            return self.ray.at(x);
+        }
+        // The zone's two edges and the circle between them are the craft's
+        // and the floor's alone — the same for every eye: each the first
+        // point along its own bearing from the craft's ground point that
+        // is `rmin` from the CoM.
+        let (turn_m, far_m) = self.edges();
+        let u = (2.0 * (turn_m - h) / (turn_m + far_m)).clamp(0.0, 2.0);
+        self.on_circle(skirt_azimuth(u))
+    }
+
+    /// The way the eye sets off round the ball from `entered`, a point of
+    /// its surface, for a way that travelled `step` into it: the share of
+    /// the step tangent to the ball there. It decides a diameter alone
+    /// ([`Self::round_way`]) — a way whose two ways round are as long as
+    /// each other; every other way goes round by the nearer. A way aimed
+    /// within [`DIAMETER_SHARE`] of the CoM is a diameter and takes the
+    /// yaw's own side; so does one that runs along that side itself, over
+    /// the top.
+    fn way_round(&self, entered: DVec3, step: DVec3) -> DVec3 {
+        let to_ball = entered - self.com;
+        let out = to_ball / to_ball.norm();
+        let mut way = step - out * step.dot(out);
+        if way.norm() > DIAMETER_SHARE * step.norm() {
+            return way / way.norm();
+        }
+        way = self.side - out * self.side.dot(out);
+        if way.norm_squared() <= 1.0e-24 {
+            way = self.ray.up - out * self.ray.up.dot(out);
+        }
+        if way.norm_squared() <= 1.0e-24 {
+            way = self.along - out * self.along.dot(out);
+        }
+        way / way.norm()
+    }
+
+    /// The way along the craft's ball from `from` to `to` — both points
+    /// of the ball — going round it by the NEARER way, always: the great
+    /// circle through both, from the one toward the other, for an arc of
+    /// half a turn at most. Only a true diameter — its two ways round as
+    /// long as each other — is decided by the way the eye set off
+    /// (`sets_off`, [`Self::way_round`]), and a way that ends where it
+    /// starts has nothing to go round. Where the great circle is under
+    /// the floor the eye rides the floor's least-distance circle instead:
+    /// down the sphere to the floor, along the circle, and up the sphere
+    /// on to `to` ([`Self::under_the_floor`]) — so a way from the floor's
+    /// circle to it, as the eye's is wherever the orbit point's own way
+    /// is on the ground, is the circle's the whole way. `floor_side` is
+    /// the ride's memory of which way round the circle the eye took, to
+    /// go on round it. The eye covers the same length of the way for the
+    /// same progress, whichever leg it is on.
+    fn round_way(&mut self, from: DVec3, sets_off: DVec3, to: DVec3, floor_side: &mut f64) -> Way {
+        let to_ball = from - self.com;
+        let to_target = to - self.com;
+        let (out, reach) = (to_ball / to_ball.norm(), to_target / to_target.norm());
+        let facing = reach.dot(out);
+        let mut aside = reach - out * facing;
+        if facing > 0.0 {
+            // The same point twice has nothing to go round; next to it,
+            // the short arc — which way it lies is plain.
+            if aside.norm_squared() <= SAME_POINT_SHARE.powi(2) {
+                return Way::default();
+            }
+        } else if aside.norm() <= DIAMETER_SHARE {
+            aside = sets_off;
+        }
+        let aside = aside / aside.norm();
+        let swept = reach.dot(aside).atan2(facing);
+        let circle = GreatCircle {
+            out,
+            aside,
+            swept: if swept < 0.0 {
+                swept + 2.0 * core::f64::consts::PI
+            } else {
+                swept
+            },
+        };
+        let Some((into_floor, off_floor)) = self.under_the_floor(&circle) else {
+            let mut way = Way::default();
+            way.push(
+                Leg::Sphere {
+                    circle,
+                    from: 0.0,
+                    span: circle.swept,
+                },
+                self.rmin * circle.swept,
+            );
+            return way;
+        };
+        let (full, turn) = (core::f64::consts::PI, 2.0 * core::f64::consts::PI);
+        let (enters_floor, leaves_floor) = (
+            self.bearing(self.com + circle.offset(self.rmin, into_floor)),
+            self.bearing(self.com + circle.offset(self.rmin, off_floor)),
+        );
+        let mut round = wrap_angle(leaves_floor - enters_floor);
+        if *floor_side == 0.0 {
+            // Two ways round as long as each other — a diameter: the
+            // yaw's own side is the one taken.
+            if round.abs() >= full - 1.0e-9 && (enters_floor + 0.5 * round).sin() < 0.0 {
+                round -= turn * round.signum();
+            }
+            *floor_side = round.signum();
+        } else if round * *floor_side < 0.0 {
+            // The way round was taken where the eye came to the circle:
+            // it goes on round that way to wherever it leaves.
+            round -= turn * round.signum();
+        }
+        let from_floor = self.on_circle(enters_floor);
+        let to_floor = self.on_circle(enters_floor + round);
+        let half = 0.5 * round;
+        let along_m = (to_floor - from_floor).norm()
+            * if half.sin().abs() > 1.0e-9 {
+                half / half.sin()
+            } else {
+                1.0
+            };
+        let mut way = Way::default();
+        way.push(
+            Leg::Sphere {
+                circle,
+                from: 0.0,
+                span: into_floor,
+            },
+            self.rmin * into_floor,
+        );
+        way.push(
+            Leg::Floor {
+                from: enters_floor,
+                round,
+            },
+            along_m,
+        );
+        way.push(
+            Leg::Sphere {
+                circle,
+                from: off_floor,
+                span: circle.swept - off_floor,
+            },
+            self.rmin * (circle.swept - off_floor),
+        );
+        way
+    }
+
+    /// Whether the point of the great circle `circle` — of the craft's
+    /// ball — `angle` (rad) along it from its start is under the floor.
+    fn under_at(&mut self, circle: &GreatCircle, angle: f64) -> bool {
+        self.under_floor(self.com + circle.offset(self.rmin, angle))
+    }
+
+    /// Where the great circle `circle` is under the floor, sampled along
+    /// the way and each edge of that then bisected: the angle from the
+    /// start at which it goes under and the angle at which it comes up
+    /// again. `None` where the whole way is over the sphere. A way that
+    /// starts on the floor is on the circle from there, and one that ends
+    /// on it to the end.
+    fn under_the_floor(&mut self, circle: &GreatCircle) -> Option<(f64, f64)> {
+        // The first and the last sample along the way that is under it.
+        let (mut first, mut last) = (None, 0);
+        for i in 0..=ROUND_SAMPLES {
+            if self.under_at(circle, circle.swept * (i as f64 / ROUND_SAMPLES as f64)) {
+                if first.is_none() {
+                    first = Some(i);
+                }
+                last = i;
+            }
+        }
+        let first = first?;
+        let sample = |i: f64| circle.swept * (i / ROUND_SAMPLES as f64);
+        // The angle between one that is under the floor and one that is
+        // over it where it crosses: the last that is under.
+        let edge = |kept_out: &mut Self, under_at: f64, over: f64| {
+            let (mut under_at, mut over) = (under_at, over);
+            for _ in 0..ROUND_BISECTIONS {
+                let mid = 0.5 * (under_at + over);
+                if kept_out.under_at(circle, mid) {
+                    under_at = mid;
+                } else {
+                    over = mid;
+                }
+            }
+            under_at
+        };
+        Some((
+            // Where the way goes under: between the first sample that is
+            // and the one before it — nothing, where it starts there.
+            if first == 0 {
+                0.0
+            } else {
+                edge(self, sample(first as f64), sample(first as f64 - 1.0))
+            },
+            // Where it comes up again: between the last sample that is
+            // under and the one after it — the end, where it ends there.
+            if last == ROUND_SAMPLES {
+                circle.swept
+            } else {
+                edge(self, sample(last as f64), sample(last as f64 + 1.0))
+            },
+        ))
+    }
+
+    /// The eye's way to `target` — a carried point outside the craft's
+    /// ball — from an eye at `eye` that is not at it. Straight there
+    /// where that line stays out of the ball; else out to the ball first
+    /// while the eye is not on it ([`Self::outward`]), along it by the
+    /// nearer way to the first point from which the straight line to
+    /// the target clears it ([`Way::clear_at`]), and straight on from
+    /// there. `floor_side` is the ride's memory of the way round the
+    /// floor's circle.
+    fn way_to(&mut self, eye: DVec3, target: DVec3, floor_side: &mut f64) -> Way {
+        let mut way = Way::default();
+        if self.clears(eye, target) {
+            way.push(
+                Leg::Line {
+                    from: eye,
+                    to: target,
+                },
+                (target - eye).norm(),
+            );
+            return way;
+        }
+        let from = if self.is_on_ball(eye) {
+            eye
+        } else {
+            self.outward(eye)
+        };
+        way.push(
+            Leg::Line {
+                from: eye,
+                to: from,
+            },
+            (from - eye).norm(),
+        );
+        let mut straight_from = from;
+        if !self.clears(from, target) {
+            let shadow = self.outward(target);
+            let mut round =
+                self.round_way(from, self.way_round(from, self.side), shadow, floor_side);
+            let (clear_m, at) = round.clear_at(self, target);
+            round.cut(clear_m);
+            way.legs.append(&mut round.legs);
+            straight_from = at;
+        }
+        way.push(
+            Leg::Line {
+                from: straight_from,
+                to: target,
+            },
+            (target - straight_from).norm(),
+        );
+        way
+    }
+
+    /// The orbit point at rest — about `rest`, a focus's resting anchor,
+    /// on the body spinning about `axis` — lifted onto the floor, and the
+    /// eye the rule at rest puts for it.
+    fn at_rest(
+        &mut self,
+        orbit: &Orbit,
+        rest: DVec3,
+        centre: DVec3,
+        axis: DVec3,
+    ) -> (DVec3, DVec3) {
+        let rest_level = level_frame(rest, Some(centre), axis);
+        let (at_rest, _) = solve_orbit(orbit, rest, &rest_level, centre, &mut *self.ray.floor);
+        (at_rest, self.rule(at_rest))
+    }
+}
+
+/// An angle in radians wound into `(-π, π]`.
+fn wrap_angle(radians: f64) -> f64 {
+    let turn = 2.0 * core::f64::consts::PI;
+    radians - turn * ((radians - core::f64::consts::PI) / turn).ceil()
+}
+
+/// The lifted eye kept out of the craft. The floor lift can bring the
+/// eye nearer than `rmin` — the craft's least distance ([`min_distance`])
+/// — to the craft's CoM `com`: dragged straight down, the lifted eye ends
+/// over the craft's own ground point, a stone's throw from the CoM or
+/// inside the craft. So the eye goes round the craft instead, along the
+/// floor.
+///
+/// From the floor point `n` under the craft, along `yaw_dir`'s horizontal
+/// — at rest the direction from `n` to the eye, the side of the craft it
+/// orbits on — the orbit point is `h` metres along the floor, signed. The
+/// zone is the stretch of that line nearer than `rmin` from the CoM: from
+/// the turn point on the yaw's side to the far edge on the other. Outside
+/// it the eye is the orbit point. Inside it the eye rides the floor at
+/// exactly the least distance — the circle around `n` where the floor is
+/// `rmin` from the CoM — entering at the turn point, going round the
+/// yaw's own side (the way an increasing yaw moves the eye) and leaving
+/// at the far edge. Its place on the circle is [`skirt_azimuth`]'s of its
+/// place in the zone, a monotonic function of the intent: the eye never
+/// turns back on a drag that goes on the same way, and zooming in never
+/// carries it away from the craft. On flat ground the turn is
+/// `sqrt(rmin² − H²)` out, `H` the CoM's signed height over `n`; here both
+/// edges and the circle itself are measured on the real floor, so the
+/// rule holds on a slope too. An eye already `rmin` or more from the
+/// craft is handed back.
+///
+/// A floor whose point under the craft already clears it — a craft high
+/// over rising ground — has no zone about the craft. The eye is on a band
+/// of that ground instead, and is put past the band's far edge.
+fn skirt_eye(
+    lifted: DVec3,
+    com: DVec3,
+    rmin: f64,
+    yaw_dir: DVec3,
+    centre: DVec3,
+    floor: &mut dyn FnMut(DVec3) -> f64,
+) -> DVec3 {
+    if (lifted - com).norm() >= rmin {
+        return lifted;
+    }
+    KeptOut::under(com, rmin, yaw_dir, centre, floor)
+        .map_or(lifted, |mut kept_out| kept_out.rule(lifted))
+}
+
+/// The focus as its keep-out reads it, for an orbit point on the floor or
+/// in the air, and the frame the keep-out is read on.
+struct KeepFrame<'a> {
+    /// The focus's CoM, its least distance and the body's centre.
+    com: DVec3,
+    rmin: f64,
+    centre: DVec3,
+    axis: DVec3,
+    /// The orbit — the angles and the distance — and the focus's resting
+    /// anchor.
+    orbit: &'a Orbit,
+    rest: DVec3,
+    /// The yaw's horizontal.
+    yaw_dir: DVec3,
+    /// The eye on the frame before, and the carried point on it: `None`
+    /// on a first focus, and on the frame of a change the eye itself —
+    /// where the travel starts from.
+    before: DVec3,
+    previous: Option<DVec3>,
+    /// What paces the eye this frame.
+    pace: Pace,
+}
+
+/// How far the eye goes along `way` this frame, setting out from `from`:
+/// of the `asked_m` of the way — never more than the `left_m` of it there
+/// is — as much as its pace allows, read as the eye itself moves, in a
+/// straight line from where it was ([`Pace::cap_m`]); nothing at all
+/// where the frame put no time in. Where the way bends more is gone
+/// along it for the same move.
+fn paced(
+    way: &Way,
+    kept_out: &mut KeptOut,
+    from: DVec3,
+    asked_m: f64,
+    left_m: f64,
+    step_m: f64,
+    pace: &Pace,
+) -> f64 {
+    if pace.share.1 <= 0.0 {
+        return 0.0;
+    }
+    let asked_m = asked_m.max(0.0).min(left_m);
+    let cap_m = pace.cap_m(step_m);
+    let move_m = |kept_out: &mut KeptOut, arc_m: f64| {
+        way.at(kept_out, arc_m).map_or(0.0, |at| (at - from).norm())
+    };
+    if move_m(kept_out, asked_m) <= cap_m {
+        return asked_m;
+    }
+    // Between how far it is and how far it may: the furthest that stays
+    // within its pace. Nothing is always within it.
+    let (mut within, mut beyond) = (0.0, asked_m);
+    for _ in 0..PACE_BISECTIONS {
+        let mid = 0.5 * (within + beyond);
+        if move_m(kept_out, mid) > cap_m {
+            beyond = mid;
+        } else {
+            within = mid;
+        }
+    }
+    within
+}
+
+impl KeepFrame<'_> {
+    /// The eye for `carried` — the orbit point about the anchor, lifted
+    /// onto the floor while it is under it, with whatever is still carried
+    /// of the previous focus's skirt — under the focus's keep-out.
+    ///
+    /// - At rest: the rule itself ([`KeptOut::rule`]) wherever the orbit
+    ///   point was lifted into the craft's zone. A free eye at rest is
+    ///   never nearer than the least distance, and is handed back.
+    /// - On a travel while the carried point is inside the craft's ball:
+    ///   the eye rides the ball to where the carried point's way leads
+    ///   ([`KeptOut::ride`]) — from the air as from the floor.
+    /// - On a travel while the carried point is outside the ball and the
+    ///   eye is not at it — it began the travel inside the ball, or was
+    ///   still riding it when the carried point left — the eye makes for
+    ///   the carried point round the craft ([`KeptOut::chase`]).
+    /// - Everywhere else on a travel, and wherever there is no usable
+    ///   floor to measure the ball on: the carried point itself.
+    fn eye(
+        &self,
+        carried: DVec3,
+        travel: &mut FocusTravel,
+        floor: &mut dyn FnMut(DVec3) -> f64,
+    ) -> DVec3 {
+        let on_travel = travel.began_inside || travel.half_life_s.is_some();
+        let (eye, ride) = if !on_travel {
+            travel.ride = None;
+            return skirt_eye(
+                carried,
+                self.com,
+                self.rmin,
+                self.yaw_dir,
+                self.centre,
+                floor,
+            );
+        } else if let Some(mut kept_out) =
+            KeptOut::under(self.com, self.rmin, self.yaw_dir, self.centre, floor)
+        {
+            let step_m = self.previous.map_or(0.0, |p| (carried - p).norm());
+            if kept_out.inside_ball(carried) {
+                kept_out.ride(carried, step_m, self, travel.ride)
+            } else if travel.ride.is_some() || travel.began_inside {
+                kept_out.chase(carried, step_m, self, travel.ride)
+            } else {
+                (carried, None)
+            }
+        } else {
+            (carried, None)
+        };
+        if ride.is_none() {
+            travel.began_inside = false;
+        }
+        travel.ride = ride;
+        eye
+    }
+}
+
+impl KeptOut<'_> {
+    /// The eye for a carried point that is INSIDE the craft's ball —
+    /// `carried`, having moved `step_m` this frame — on a focus travel,
+    /// and the ride's memory (`ride`: what has come of it so far, `None`
+    /// setting out).
+    ///
+    /// The eye's way is from where it is: out to the ball while it is not
+    /// on it — where the carried point's step crossed in, for an eye that
+    /// was at the carried point; the eye's nearest way out
+    /// ([`Self::outward`]), for one that began the travel inside — and
+    /// then along the ball by the nearer way ([`Self::round_way`]) to
+    /// where the carried point's way leads: out of the ball, or its rest
+    /// and the rule's own eye there. Before it is on the ball the eye
+    /// only moves away from the CoM; on it, it is exactly the least
+    /// distance out.
+    ///
+    /// What it covers of the way this frame is the lesser of what its
+    /// pace allows ([`Pace`]) and what the carried point's own way asks:
+    ///
+    /// - The way leaves the ball: the eye keeps its share of the carried
+    ///   point's remaining run to where the way leaves — for the carried
+    ///   point's step, as much further of its own way as it has left to
+    ///   the carried point's — so it is at the way out about when the
+    ///   carried point is, moving no faster than it. Behind, from a frame
+    ///   its pace capped, it goes that much faster until it is not.
+    /// - The way comes to rest inside the ball: the eye's remainder keeps
+    ///   [`Pace::taper`] of a frame, so it is at the at-rest eye before
+    ///   the travel settles.
+    fn ride(
+        &mut self,
+        carried: DVec3,
+        step_m: f64,
+        frame: &KeepFrame,
+        ride: Option<Ride>,
+    ) -> (DVec3, Option<Ride>) {
+        let (at_rest, rest_eye) = self.at_rest(frame.orbit, frame.rest, frame.centre, frame.axis);
+        // What lies ahead for the carried point: where its way leaves the
+        // ball — the first point along it that is the least distance or
+        // more from the CoM — or, coming to rest inside it, the rest
+        // itself and the rule's own eye there.
+        let to_rest = at_rest - carried;
+        let (ahead_m, target, leaves) = if self.inside_ball(at_rest) {
+            (to_rest.norm(), rest_eye, false)
+        } else {
+            let step = carried - frame.previous.unwrap_or(carried);
+            let way = if step_m > 0.0 {
+                step / step_m
+            } else if to_rest.norm() > 0.0 {
+                to_rest / to_rest.norm()
+            } else {
+                self.along
+            };
+            let (mut inside, mut outside) = (0.0, 4.0 * self.rmin);
+            for _ in 0..64 {
+                let mid = 0.5 * (inside + outside);
+                if self.inside_ball(carried + way * mid) {
+                    inside = mid;
+                } else {
+                    outside = mid;
+                }
+            }
+            (outside, carried + way * outside, true)
+        };
+        // Where the way takes off from: the eye itself while it is on the
+        // ball; where the line on to the carried point crosses into it,
+        // for an eye outside it; the eye's nearest way out, for one inside.
+        let eye = frame.before;
+        let take_off = if self.is_on_ball(eye) {
+            eye
+        } else if self.inside_ball(eye) {
+            self.outward(eye)
+        } else {
+            self.clear_of(self.entry(eye, carried).1 - self.com)
+        };
+        // A ride setting out takes the way the line on to the carried
+        // point sets off; one in hand goes on as it began.
+        let mut ride = ride.unwrap_or(Ride {
+            sets_off: self.way_round(take_off, carried - eye),
+            floor_side: 0.0,
+            left_m: 0.0,
+            ahead_m: None,
+        });
+        let mut way = Way::default();
+        way.push(
+            Leg::Line {
+                from: eye,
+                to: take_off,
+            },
+            (take_off - eye).norm(),
+        );
+        let round = self.round_way(take_off, ride.sets_off, target, &mut ride.floor_side);
+        way.legs.extend(round.legs);
+        let left_m = way.total_m();
+        // What the eye had left of its way and the carried point of its
+        // run on the frame before: what the ride remembers of a frame that
+        // put time in, or — setting out — the eye's way as it stands now
+        // and the carried point's step this frame and what it has left.
+        let was_run = ride.ahead_m.filter(|_| frame.pace.share.0 > 0.0);
+        let (was_left_m, was_ahead_m) =
+            was_run.map_or((left_m, step_m + ahead_m), |ahead| (ride.left_m, ahead));
+        let asked_m = if leaves {
+            if was_ahead_m > 0.0 {
+                was_left_m * step_m / was_ahead_m
+            } else {
+                0.0
+            }
+        } else {
+            left_m * (1.0 - frame.pace.taper(left_m))
+        };
+        let moved_m = paced(&way, self, eye, asked_m, left_m, step_m, &frame.pace);
+        // Where nothing is gone, nothing moves: the eye stays exactly.
+        let eye = if moved_m > 0.0 {
+            way.at(self, moved_m).unwrap_or(eye)
+        } else {
+            eye
+        };
+        ride.left_m = left_m - moved_m;
+        ride.ahead_m = (leaves && frame.pace.share.1 > 0.0).then_some(ahead_m);
+        (eye, Some(ride))
+    }
+
+    /// The eye for a carried point that is OUTSIDE the craft's ball while
+    /// the eye is not at it — it began the travel inside the ball, or was
+    /// still riding the ball when the carried point left it — and the
+    /// ride's memory, `None` once the eye is at the carried point. The
+    /// eye makes for the carried point along [`Self::way_to`]: out of the
+    /// ball by the nearest way, along it to where a straight line to the
+    /// carried point clears it, and straight on — never through the
+    /// craft, and never nearer to its centre than it was. It goes the
+    /// carried point's own step and closes [`Pace::taper`] of what it had
+    /// left, so it is at the carried point before the travel settles —
+    /// and no faster than its pace allows.
+    fn chase(
+        &mut self,
+        carried: DVec3,
+        step_m: f64,
+        frame: &KeepFrame,
+        ride: Option<Ride>,
+    ) -> (DVec3, Option<Ride>) {
+        let eye = frame.before;
+        let gap_m = ride.map_or((carried - eye).norm(), |ride| ride.left_m);
+        let (sets_off, mut floor_side) =
+            ride.map_or((self.side, 0.0), |ride| (ride.sets_off, ride.floor_side));
+        let way = self.way_to(eye, carried, &mut floor_side);
+        let left_m = way.total_m();
+        let asked_m = step_m + (1.0 - frame.pace.taper(gap_m)) * gap_m;
+        let moved_m = paced(&way, self, eye, asked_m, left_m, step_m, &frame.pace);
+        let ride = Ride {
+            sets_off,
+            floor_side,
+            left_m: left_m - moved_m,
+            ahead_m: None,
+        };
+        if ride.left_m <= RIDE_DONE_M {
+            return (carried, None);
+        }
+        let eye = if moved_m > 0.0 {
+            way.at(self, moved_m).unwrap_or(carried)
+        } else {
+            eye
+        };
+        (eye, Some(ride))
+    }
+}
+
+/// The solved chase camera for an eye at `eye` looking at `look_at` — the
+/// view basis (columns = view axes in world, c0×c1 = c2): z_out points
+/// look_at → eye, "up" is the local surface up, so the horizon stays
+/// level wherever the camera sits.
+fn chase_camera(
+    eye: DVec3,
+    look_at: DVec3,
+    level: &LevelFrame,
+    viewport_px: (f64, f64),
+) -> MapCameraF64 {
     let z_out = {
-        let d = eye - focus.com;
+        let d = eye - look_at;
         if d.norm_squared() > 1.0e-12 {
             d / d.norm()
         } else {
-            up
+            level.up
         }
     };
     let right = {
-        let r = up.cross(z_out);
+        let r = level.up.cross(z_out);
         if r.norm_squared() > 1.0e-12 {
             r / r.norm()
         } else {
-            east
+            level.east
         }
     };
     let upv = z_out.cross(right);
@@ -1935,20 +4034,329 @@ fn solve_chase_camera(
         [z_out.x, z_out.y, z_out.z, 0.0],
         [0.0, 0.0, 0.0, 1.0],
     ];
-    let aspect = (input.viewport_px.0 / input.viewport_px.1.max(1.0)).max(1e-6);
+    let aspect = (viewport_px.0 / viewport_px.1.max(1.0)).max(1e-6);
     let proj = perspective_revz(FLIGHT_FOV_Y, aspect, FLIGHT_NEAR_M);
     MapCameraF64 {
         view_proj: mat4_mul(&proj, &view),
         eye,
-        // The POST-clamp eye–focus distance, not the requested one:
-        // `vessel_shadow` recovers the craft as `eye − z_out·d`, so a
-        // stale pre-clamp `input.distance_m` slid the blob shadow and
-        // its altitude term off the hull whenever the terrain clamp
-        // engaged (C12-F4). This matches the map convention
-        // (`distance_m` = actual |eye − focus|) — the no-clamp path
-        // reduces to `input.distance_m` exactly.
-        distance_m: (eye - focus.com).norm(),
+        // The POST-floor eye–look-at distance, not the eased one — the
+        // map convention (`distance_m` = actual |eye − focus|); with the
+        // camera looking at what it orbits it is the eased distance
+        // exactly. `cascade_uniforms`' no-focus fallback recovers the
+        // look-at as `eye − z_out·distance_m` from it.
+        distance_m: (eye - look_at).norm(),
         valid: true,
+    }
+}
+
+/// What one frame's chase-camera step ([`step_chase_camera`]) is told.
+struct ChaseFrame {
+    /// The focused vessel's id.
+    id: u64,
+    /// The focus's CoM as this frame draws it — what the camera looks
+    /// at, and the anchor it rests on at or above the floor.
+    com: DVec3,
+    /// The focus's bounding radius about its CoM (m).
+    radius_m: f64,
+    /// How far an open canopy over the focus reaches from its CoM once
+    /// whole (m) — `0` with none.
+    canopy_m: f64,
+    /// The body's centre — `None` without physics (and then no floor).
+    centre: Option<DVec3>,
+    /// The body's spin axis — world +Z without physics.
+    axis: DVec3,
+    /// The frame's wall time (ms) — what the easing advances by.
+    dt_wall_ms: f64,
+}
+
+/// The eye's target distance for a frame ([`step_chase_camera`]'s
+/// framing): the frame a vessel takes the focus — or already carries an
+/// open canopy — is [`frame_distance`] over craft and canopy alike. A
+/// canopy opening over the craft the camera already holds is framed the
+/// same way once, on the frame it appears, and only outward: a player
+/// already further out keeps their view, and after it the wheel is
+/// theirs. `canopy_m` is how far the open canopy reaches from the
+/// craft's CoM once whole — read from the first tick it shows, so the
+/// eye backs off to frame it while it inflates — `0` with none.
+fn frame_target(input: &mut FlightInput, changed: bool, radius_m: f64, canopy_m: f64) {
+    let framed = frame_distance(radius_m.max(canopy_m));
+    if changed {
+        input.distance_target_m = framed;
+    } else if canopy_m > 0.0 && !input.canopy_open {
+        input.distance_target_m = input.distance_target_m.max(framed);
+    }
+    input.canopy_open = canopy_m > 0.0;
+}
+
+/// One frame's chase-camera step, everything that moves the camera
+/// besides the pointer. `floor` gives the least radius the eye may have
+/// from the body's centre along a unit direction ([`eye_floor`] over the
+/// heightfield); it is the only terrain the step sees, so the step is
+/// pure in it. The focus edge is the camera's own memory of last frame
+/// ([`FocusTravel`]), so the step never depends on the order the
+/// Presentation systems run in.
+///
+/// - **Framing.** The frame a vessel takes the focus, its target
+///   distance is [`frame_distance`] — the old snap to a fixed range put
+///   a new focus at the old vessel's distance (C19-F4) — over its open
+///   canopy as over the craft, when it carries one. A canopy opening
+///   over the craft the camera already holds is framed the same way
+///   once, on the frame it appears, and only outward: a player already
+///   further out keeps their view, and after it the wheel is theirs.
+/// - **Zoom.** The target is held inside the limits and the distance
+///   eases toward it by this frame's share.
+/// - **Anchor.** The focus's resting anchor ([`resting_anchor`]): its
+///   CoM, lifted over the ground while the craft is under the floor.
+/// - **Travel.** On a focus CHANGE (not a first focus) the anchor starts
+///   where the last frame's eye orbited and eases to the new craft's
+///   resting anchor by the share of its own half-life
+///   ([`travel_half_life`]), held above the ground while it crosses the
+///   planet ([`travel_anchor`]). What the previous focus left the camera
+///   looking at, and its eye's offset from its own orbit point, is
+///   carried along and handed over by [`travel_blend`] — so the frame of
+///   the change moves neither the eye nor the view.
+/// - **Look-at.** The craft, never the lifted anchor: the camera looks
+///   at what the player is flying.
+/// - **Solve.** The eye from the angles and the distance about the
+///   anchor — the intent's orbit point, lifted onto the floor while that
+///   point is under it ([`solve_orbit`]). The angles are left exactly as
+///   the player set them.
+/// - **Keep-out.** A focus's keep-out is a ball of its least distance
+///   ([`min_distance`]) about its CoM. At rest only the floor lift can
+///   take the orbit point into it, and a lifted eye goes round the craft
+///   along the floor ([`skirt_eye`]); a free eye at rest is never inside
+///   the ball.
+/// - **Keep-out on a travel.** On a travel the new craft's keep-out acts
+///   at once on the travelling orbit point — with whatever is still
+///   carried of the previous craft's skirt, which is kept out of the new
+///   craft as well — whether it rides the floor or is in the air. Carried
+///   into the ball, the eye rides the ball from where it enters to where
+///   the point's own way leaves it ([`KeptOut::ride`],
+///   [`KeptOut::round_way`]): the sphere wherever that is above the
+///   floor, the floor's least-distance circle wherever it is under it, by
+///   the nearer way round and along a diameter by the yaw's own side — so
+///   the eye passes over or round the craft, never through it — and is
+///   the orbit point itself again on the frame that leaves. Wherever the
+///   orbit point comes to rest is where the rule at rest puts the eye,
+///   and the eye is there before the travel settles: it ends on the
+///   at-rest keep-out exactly.
+/// - **Pace.** No frame moves the eye more than a tenth beyond the one
+///   before ([`Pace::cap_m`]), over the frames above a millimetre. The
+///   ride keeps the orbit point's own pace where it may and, held back,
+///   catches up as its pace allows — it is at the way out about when the
+///   orbit point is — and what it has left of a ride to a place the eye
+///   is to be at falls off by [`ride_taper`] of a frame.
+/// - **The eye began inside the ball.** Where the eye itself begins the
+///   travel inside the new craft's ball ([`FocusTravel::began_inside`]),
+///   the orbit point's own way may run through the craft, so the eye does
+///   not follow it: it leaves the ball by the nearest way out
+///   ([`KeptOut::outward`]) — its distance to the craft's centre never
+///   falls — and, once the orbit point's way has left the ball, makes for
+///   the orbit point round the craft ([`KeptOut::chase`]). The frame of
+///   the change still moves nothing.
+///
+/// A harness that supplies no frame time (the render gates) steps
+/// nothing: the camera stays exactly where it was put.
+fn step_chase_camera(
+    input: &mut FlightInput,
+    frame: &ChaseFrame,
+    floor: &mut dyn FnMut(DVec3) -> f64,
+) -> MapCameraF64 {
+    // The frame loop's 100 ms clamp (`MAX_FRAME_DT`); a non-finite
+    // frame time carries no step, as it carries no interpolation.
+    let dt_s = (frame.dt_wall_ms / 1000.0).clamp(0.0, 0.1);
+    let dt_s = if dt_s.is_finite() { dt_s } else { 0.0 };
+    let k = ease_fraction(dt_s, EASE_HALF_LIFE_S);
+    let radius_m = if frame.radius_m.is_finite() {
+        frame.radius_m.max(0.0)
+    } else {
+        0.0
+    };
+    let rmin = min_distance(radius_m);
+
+    let last = input.travel.last;
+    let changed = last.map(|l| l.id) != Some(frame.id);
+    frame_target(input, changed, radius_m, frame.canopy_m.max(0.0));
+    input.distance_target_m = input
+        .distance_target_m
+        .clamp(min_distance(radius_m), MAX_DISTANCE_M);
+    input.distance_m += (input.distance_target_m - input.distance_m) * k;
+    let eye_m = input.distance_m;
+
+    let rest = resting_anchor(frame.com, eye_m, frame.centre, floor);
+    let travel = &mut input.travel;
+    if changed {
+        travel.begin(last, rest, frame.com, rmin);
+    }
+    let travelled = travel
+        .half_life_s
+        .map_or(0.0, |half_life_s| ease_fraction(dt_s, half_life_s));
+    travel.offset = travel.offset * (1.0 - travelled);
+    let mut remaining_m = travel.offset.norm();
+    if remaining_m < TRAVEL_DONE_M {
+        travel.settle();
+        remaining_m = 0.0;
+    }
+    let blend = travel_blend(remaining_m, travel.start_m, eye_m);
+    let anchor = travel_anchor(
+        rest + travel.offset,
+        remaining_m,
+        eye_m,
+        frame.centre,
+        floor,
+    );
+    let level = level_frame(anchor, frame.centre, frame.axis);
+    let look_at = frame.com + (anchor - frame.com + travel.look_carry) * blend;
+    // Without a body there is no ground to stay above.
+    let mut floored = |dir: DVec3| frame.centre.map_or(f64::NEG_INFINITY, |_| floor(dir));
+    let orbit = Orbit {
+        yaw: input.yaw,
+        pitch: input.pitch,
+        distance_m: eye_m,
+    };
+    let (lifted, on_floor) = solve_orbit(
+        &orbit,
+        anchor,
+        &level,
+        frame.centre.unwrap_or(anchor),
+        &mut floored,
+    );
+    // The orbit point with whatever is still carried of the previous
+    // focus's skirt — the eye, wherever the craft's keep-out leaves it
+    // alone. The focus's keep-out reads that, not the bare orbit point: a
+    // carried skirt must not carry the eye into the new craft either. At
+    // rest it is the lifted orbit point itself, and a free eye is left
+    // alone; on a travel it is kept out of the craft's ball from the air
+    // as from the floor. The kept-out eye itself is carried on, so a point
+    // the rule puts on the circle is on it to the last digit and not a
+    // round trip through the orbit point.
+    let carried = lifted + travel.skirt_carry * blend;
+    let on_travel = travel.began_inside || travel.half_life_s.is_some();
+    // The carried point on the frame before — on the frame of a change
+    // the eye itself, where the travel starts from — and the eye on it.
+    let previous = last.map(|l| if changed { l.eye } else { l.carried });
+    let before = last.map_or(carried, |l| l.eye);
+    let eye = if let Some(centre) = frame.centre
+        && (on_floor || on_travel)
+    {
+        KeepFrame {
+            com: frame.com,
+            rmin,
+            centre,
+            axis: frame.axis,
+            orbit: &orbit,
+            rest,
+            yaw_dir: level.dir(input.yaw, 0.0),
+            before,
+            previous,
+            pace: Pace {
+                // The frame of a change is a travel's first: what the eye
+                // moved on it belongs to the focus before.
+                moved_m: last.and_then(|l| l.moved_m).filter(|_| !changed),
+                share: (last.map_or(0.0, |l| l.travelled), travelled),
+                remaining_m,
+                anchor_step_m: last.map_or(0.0, |l| (anchor - l.anchor).norm()),
+            },
+        }
+        .eye(carried, travel, floor)
+    } else {
+        travel.ride = None;
+        carried
+    };
+    travel.last = Some(Last {
+        id: frame.id,
+        anchor,
+        look_at,
+        skirt: eye - lifted,
+        eye,
+        carried,
+        moved_m: (dt_s > 0.0 && last.is_some()).then_some((eye - before).norm()),
+        travelled,
+    });
+    chase_camera(eye, look_at, &level, input.viewport_px)
+}
+
+/// The anchor a focus rests on: its drawn CoM, unless that is under the
+/// floor. A craft `depth` under the floor has every orbit point lifted
+/// onto it, and the lift keeps of a drag only its share along the floor
+/// — nothing at the craft's own level. So the anchor rises along the
+/// local up to `depth + min(depth, eye_m)` above the CoM: a craft at
+/// least an eye distance down has its whole orbit sphere over the floor
+/// and a drag moves the eye as freely as in flight. That is the travel
+/// lift ([`travel_anchor`]) at its full margin, and it never fades: a
+/// shallower craft keeps `depth` of clearance. A craft at or above the
+/// floor rests on its CoM. `floor` is sampled only with a body to sample
+/// it on.
+fn resting_anchor(
+    com: DVec3,
+    eye_m: f64,
+    centre: Option<DVec3>,
+    floor: &mut dyn FnMut(DVec3) -> f64,
+) -> DVec3 {
+    let Some(centre) = centre else {
+        return com;
+    };
+    let rel = com - centre;
+    let r = rel.norm();
+    if !(r > 0.0 && eye_m > 0.0) {
+        return com;
+    }
+    let dir = rel / r;
+    let floor_r = floor(dir);
+    let depth = floor_r - r;
+    if depth > 0.0 {
+        centre + dir * (floor_r + depth.min(eye_m))
+    } else {
+        com
+    }
+}
+
+/// How much of what the previous focus left in hand a travel still
+/// carries: nothing once it is done, everything while more than an eye
+/// distance of it is left, and between those the share of that last eye
+/// distance which is left. A travel shorter than an eye distance fades
+/// over its whole length, so it starts carrying everything.
+fn travel_blend(remaining_m: f64, start_m: f64, eye_m: f64) -> f64 {
+    let reach_m = eye_m.min(start_m);
+    if reach_m <= TRAVEL_DONE_M {
+        return 0.0;
+    }
+    ((remaining_m - TRAVEL_DONE_M) / (reach_m - TRAVEL_DONE_M)).clamp(0.0, 1.0)
+}
+
+/// The travelling anchor: `anchor` itself — the straight line from the
+/// previous focus's resting anchor to this one — unless it has gone under
+/// the floor. A long line crosses the planet; an anchor below the floor
+/// is lifted radially to the floor plus a margin of its depth up to one
+/// eye distance `eye_m`. At the full margin the whole orbit sphere clears
+/// the ground, so the floor has nothing to clamp mid-travel; the margin
+/// shrinks with the travel that is left and is zero one eye distance
+/// out, and both ends of the line are resting anchors, at or above the
+/// floor: the hand-over is continuous. `floor` is sampled only with a
+/// body to sample it on.
+fn travel_anchor(
+    anchor: DVec3,
+    remaining_m: f64,
+    eye_m: f64,
+    centre: Option<DVec3>,
+    floor: &mut dyn FnMut(DVec3) -> f64,
+) -> DVec3 {
+    let Some(centre) = centre else {
+        return anchor;
+    };
+    let rel = anchor - centre;
+    let r = rel.norm();
+    if !(r > 0.0 && remaining_m > 0.0 && eye_m > 0.0) {
+        return anchor;
+    }
+    let dir = rel / r;
+    let floor_r = floor(dir);
+    let depth = floor_r - r;
+    if depth > 0.0 {
+        let margin = depth.min(eye_m) * (remaining_m / eye_m).min(1.0);
+        centre + dir * (floor_r + margin)
+    } else {
+        anchor
     }
 }
 
@@ -1962,8 +4370,8 @@ fn solve_chase_camera(
 pub struct FlightCameraF64(pub MapCameraF64);
 
 /// The R1 cascade arm threshold (terrain-overhaul 3b): the flight
-/// extract solves cascades only while the sun clears the chase
-/// focus's local horizon by more than this (sun·up). 0.06 ≈ 3.4°
+/// extract solves cascades only while the sun clears the focused
+/// craft's local horizon by more than this (sun·up). 0.06 ≈ 3.4°
 /// elevation sits just above the two neighboring cutoffs —
 /// `sun_occlusion`'s ray-march full-occludes below sun·up 0.035 and
 /// the vessel blob disables at 0.04 — so there is no band where the
@@ -1985,18 +4393,28 @@ pub fn cascades_armed(sun_dir: DVec3, up: DVec3) -> bool {
 }
 
 /// 3b: solve the frame's R1 cascade uniforms — pure presentation
-/// math over the SOLVED chase camera + the staged `FlightEnv` sun
-/// (§2.5: RenderExtract owns presentation derivation; nothing here
-/// reads the sim). The camera basis is recovered from `view_proj`
-/// exactly like `sky_view_rot`: the reverse-Z projection's last row
-/// is `[0,0,−1,0]`, so `view_proj`'s row 3 is `−z_out` — the forward
-/// — and the focus recovered as `eye − z_out·distance` (the same
-/// reconstruction `vessel_shadow` uses) supplies the local-level up.
+/// math over the SOLVED chase camera, the focused craft's drawn CoM
+/// (`craft_com`, bubble frame; `None` with nothing focused) and the
+/// staged `FlightEnv` sun (§2.5: RenderExtract owns presentation
+/// derivation; nothing here reads the sim). The camera's forward is
+/// recovered from `view_proj` exactly like `sky_view_rot`: the
+/// reverse-Z projection's last row is `[0,0,−1,0]`, so `view_proj`'s
+/// row 3 is `−z_out`.
+///
+/// The local-level up is the CRAFT's — the direction of its drawn CoM
+/// from the body centre, the blob shadow's anchor — never the camera's:
+/// after a focus change the camera's anchor is still travelling to the
+/// craft, and an up read off it rolled the frustum to the local level
+/// of wherever the anchor happened to be — hundreds of kilometres from
+/// the craft mid-travel — so the shadows did not stay with it. With
+/// nothing focused the camera's own anchor (`eye − z_out·distance`)
+/// supplies the up, so the frame a craft leaves keeps the one it had.
 /// Returns the all-zero DISARMED row when the sun sits at or below
 /// the arm threshold; the solve itself is `csp_render::shadow::
 /// solve_cascades` (f64, texel-snapped — see its docs).
 fn cascade_uniforms(
     cam: &MapCameraF64,
+    craft_com: Option<DVec3>,
     env: &FlightEnv,
     viewport_px: (f64, f64),
 ) -> csp_render::shadow::ShadowUniforms {
@@ -2005,12 +4423,17 @@ fn cascade_uniforms(
         -cam.view_proj[3][1],
         -cam.view_proj[3][2],
     );
-    let focus_rel = (cam.eye - env.body_center) - z_out * cam.distance_m;
-    let fl = focus_rel.norm();
-    let up = if fl > env.radius_m * 1.0e-6 {
-        focus_rel / fl
-    } else {
-        DVec3::Z
+    let unit = |rel: DVec3| {
+        let l = rel.norm();
+        if l > env.radius_m * 1.0e-6 {
+            rel / l
+        } else {
+            DVec3::Z
+        }
+    };
+    let up = match craft_com {
+        Some(com) => unit(com - env.body_center),
+        None => unit((cam.eye - env.body_center) - z_out * cam.distance_m),
     };
     if !cascades_armed(env.sun_dir, up) {
         return csp_render::shadow::ShadowUniforms::default();
@@ -2066,15 +4489,16 @@ const PICK_NEAR_PX: f32 = 48.0;
 /// [`FlightPick::Vessel`] (the whole-vessel action list). `None` = a
 /// total miss — the caller closes any open menu.
 ///
-/// All presentation-side — the staged [`FlightBody`] transforms plus
-/// the presentation camera, never the sim.
+/// All presentation-side — the staged [`FlightBody`] parts placed at the
+/// pose the frame DRAWS the focus at ([`DrawnPose`], the one under the
+/// solved chase camera), never the sim.
 pub(crate) fn pick_part(
     cam: &FlightCameraF64,
-    focus: Option<&FlightBody>,
+    focus: Option<(&FlightBody, DrawnPose)>,
     content: egui::Rect,
     cursor: egui::Pos2,
 ) -> Option<FlightPick> {
-    let focus = focus?;
+    let (focus, pose) = focus?;
     if !cam.0.valid || focus.parts.is_empty() {
         return None;
     }
@@ -2098,7 +4522,7 @@ pub(crate) fn pick_part(
         for x in [p.lo.x, p.hi.x] {
             for y in [p.lo.y, p.hi.y] {
                 for z in [p.lo.z, p.hi.z] {
-                    let w = focus.pos + focus.rot.rotate(DVec3::new(x, y, z));
+                    let w = pose.pos + pose.rot.rotate(DVec3::new(x, y, z));
                     depth2 = depth2.min((w - cam.0.eye).norm_squared());
                     if let Some(s) = to_screen(w) {
                         pts.push(s);
@@ -2111,7 +4535,7 @@ pub(crate) fn pick_part(
         }
         let rect = egui::Rect::from_points(&pts);
         hull = hull.union(rect);
-        let center_w = focus.pos + focus.rot.rotate((p.lo + p.hi) * 0.5);
+        let center_w = pose.pos + pose.rot.rotate((p.lo + p.hi) * 0.5);
         if let Some(cs) = to_screen(center_w) {
             let d = cs.distance(cursor);
             if nearest.is_none_or(|(bd, _)| d < bd) {
@@ -2142,18 +4566,179 @@ pub(crate) fn pick_part(
     (hull.is_positive() && hull.expand(PICK_NEAR_PX).contains(cursor)).then_some(FlightPick::Vessel)
 }
 
-/// `Presentation` schedule — chase-camera solve + HUD mirrors + the
-/// §3.7 SFX cue edges (the schedule's "VFX, audio cues" slot).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // the camera solve carries the terrain floor; per-vessel stage plans add the hud_plan read
+/// `Presentation` schedule — §2.5's interpolation, declared
+/// `.before(flight_camera)`: age every staged vessel's pose history and
+/// solve what the frame draws.
+///
+/// The snapshot holds each vessel at its LAST simulation tick; drawn
+/// there, a 60 fps frame steps one tick of motion fifteen frames in
+/// sixteen and two in the sixteenth — the view hitch-steps. With the
+/// frame's fractional tick remainder each vessel is instead drawn one
+/// tick of latency back, between its previous and current pose, so
+/// consecutive frames advance evenly. [`crate::TickFraction`] is the
+/// remainder — handed over by `csp-app`'s warp controller, never read
+/// off the clock here — and `0` (a harness that supplies none) draws
+/// every pose exactly as staged.
+pub(crate) fn flight_interp(
+    snap: Res<FlightSnapshot>,
+    clock: Res<crate::Clock>,
+    frac: Res<crate::TickFraction>,
+    mut history: ResMut<PoseHistory>,
+    mut scene: ResMut<DrawnScene>,
+) {
+    let tick = clock.0.ticks();
+    // Into `[0, 1)`, so the drawn instant never passes the clock's own
+    // pose. A non-finite remainder carries no interpolation: 0.
+    let frac = if frac.0.is_finite() {
+        frac.0.clamp(0.0, 1.0 - f64::EPSILON)
+    } else {
+        0.0
+    };
+    scene.poses = history.advance(&snap.vessels, tick, frac);
+    let drawn = if frac > 0.0 {
+        (tick.saturating_sub(1) as f64) + frac
+    } else {
+        tick as f64
+    };
+    scene.time_s = Some(drawn / csp_core::TICK_HZ as f64);
+    // The staged spin phase is `ω·t` at the clock's tick. Rolled back
+    // to the drawn instant, the ground turns under the craft at the
+    // rate the craft is drawn moving — a latched hull stays on its pad.
+    scene.env = snap.env.as_ref().map(|staged| {
+        let mut env = staged.clone();
+        env.spin_phase -=
+            staged.body_spin.norm() * (tick as f64 - drawn) / csp_core::TICK_HZ as f64;
+        env
+    });
+}
+
+/// The chase camera's frame inputs, kept as one SystemParam so
+/// `flight_camera` fits the argument budget (the `FlightScene`
+/// precedent in `lib.rs`).
+#[derive(bevy_ecs::system::SystemParam)]
+pub(crate) struct ChaseInputs<'w> {
+    /// The camera's session state — the angles, the eased distance,
+    /// the travel memory.
+    input: ResMut<'w, FlightInput>,
+    /// The mirrored flight scene — where the focus is resolved from.
+    snap: Res<'w, FlightSnapshot>,
+    /// The poses that scene is drawn at this frame.
+    scene: Res<'w, DrawnScene>,
+    /// The pin-aware focus resolver.
+    focus_override: Res<'w, FlightFocusOverride>,
+    /// The body's terrain table and heightfield cache — the floor
+    /// under the eye.
+    terrain_cfg: Res<'w, TerrainConfig>,
+    terrain_cache: ResMut<'w, TerrainCache>,
+    /// Every staged vessel's bounding radius — the focus's framing input.
+    radii: Res<'w, CraftRadii>,
+    /// The open canopies — how far the focus's reaches.
+    canopies: Res<'w, CanopiesStaged>,
+    /// The frame's wall time — what the easing advances by.
+    session: Res<'w, crate::SessionMirror>,
+}
+
+/// `Presentation` schedule — the chase-camera step for the frame's
+/// focus ([`step_chase_camera`]), solved from the pose the craft is
+/// DRAWN at: the interpolated CoM under the drawn spin phase, so the
+/// floor it clamps against is the terrain the frame shows. Independent
+/// of `flight_present`: nothing in Presentation reads the camera, and
+/// the focus edge is the camera's own memory.
+pub(crate) fn flight_camera(inputs: ChaseInputs, mut cam: ResMut<FlightCameraF64>) {
+    let ChaseInputs {
+        mut input,
+        snap,
+        scene,
+        focus_override,
+        terrain_cfg,
+        mut terrain_cache,
+        radii,
+        canopies,
+        session,
+    } = inputs;
+    // THE focus — the pin-aware resolver `flight_present`, the SFX
+    // edges and the extract's blob shadow share. A pin whose vessel is
+    // not staged falls through to the newest staged vessel here, exactly
+    // the vessel it resolves to once `flight_present` releases it later
+    // this frame.
+    let Some(focus) = focus_override.resolve(&snap.vessels) else {
+        // Nothing to orbit: whatever takes the focus next is a first
+        // focus, with no earlier eye to be continuous with.
+        input.travel.last = None;
+        return;
+    };
+    let env = scene.env.as_ref().or(snap.env.as_ref());
+    // The floor — under the eye and under the craft: the heightfield's
+    // own surface there (a point sample — `ground_radius` with no ring),
+    // plus the clearance; under an ocean that is the seabed.
+    let mut floor = |dir: DVec3| match env {
+        Some(e) => eye_floor(crate::terrain::ground_radius(
+            &terrain_cfg,
+            &mut terrain_cache,
+            e,
+            dir,
+            0.0,
+        )),
+        None => f64::NEG_INFINITY,
+    };
+    cam.0 = step_chase_camera(
+        &mut input,
+        &ChaseFrame {
+            id: focus.id,
+            com: scene.pose_of(focus).com,
+            radius_m: radii
+                .0
+                .iter()
+                .find(|(id, _)| *id == focus.id)
+                .map_or(0.0, |(_, r)| *r),
+            canopy_m: {
+                // The craft's centre of mass in its own frame, as the
+                // staged rows' geometry is.
+                let com_local = focus.rot.conjugate().rotate(focus.com - focus.pos);
+                canopies
+                    .0
+                    .iter()
+                    .filter(|c| c.vessel == focus.id)
+                    .map(|c| c.reach_m(com_local))
+                    .fold(0.0, f64::max)
+            },
+            centre: env.map(|e| e.body_center),
+            axis: env.map_or(DVec3::Z, |e| e.spin_axis),
+            dt_wall_ms: session.dt_wall_ms,
+        },
+        &mut floor,
+    );
+}
+
+/// `Presentation` — whether the dominant body's heightfield is still
+/// to land this frame ([`FlightUiData::terrain_pending`]). Polled here,
+/// not in the extract: UiBuild runs before RenderExtract (§2.5), and
+/// the loading screen must cover the FIRST sky-only frame, not the one
+/// after it.
+pub(crate) fn flight_terrain_pending(
+    terrain_cfg: Res<TerrainConfig>,
+    mut terrain_cache: ResMut<TerrainCache>,
+    snap: Res<FlightSnapshot>,
+    scene: Res<DrawnScene>,
+    mut ui: ResMut<FlightUiData>,
+) {
+    ui.terrain_pending =
+        scene.env.as_ref().or(snap.env.as_ref()).is_some_and(|env| {
+            crate::terrain::field_pending(&terrain_cfg, &mut terrain_cache, env)
+        });
+}
+
+/// `Presentation` schedule — the HUD mirrors + the §3.7 SFX cue edges
+/// (the schedule's "VFX, audio cues" slot). The chase camera is
+/// [`flight_camera`]'s.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // every HUD mirror is its own resource; per-vessel stage plans add the hud_plan read
 pub(crate) fn flight_present(
-    mut input: ResMut<FlightInput>,
     snap: Res<FlightSnapshot>,
     live: Res<LiveVesselCount>,
     rails: Res<RailsStaged>,
+    canopies: Res<CanopiesStaged>,
     plans: Res<StagePlans>,
     prop: Res<VesselPropulsionStaged>,
-    terrain_cfg: Res<TerrainConfig>,
-    mut terrain_cache: ResMut<TerrainCache>,
     mut cam: ResMut<FlightCameraF64>,
     mut ui: ResMut<FlightUiData>,
     mut sfx: ResMut<FlightSfx>,
@@ -2188,19 +4773,12 @@ pub(crate) fn flight_present(
     // (`sfx_edges` used to baseline on `vessels.last()` alone, so a
     // recover_control pin tracked cues on the wrong vessel — P04-F4.)
     let focus = focus_override.resolve(&snap.vessels);
-    // C19-F4: reframe on a focus-id change — a kept zoom would frame
-    // the NEW vessel at the OLD one's distance (zoom to 3 m on a
-    // canister, then a fragment or second launch inherits a 3 m
-    // chase). Orientation keeps (the player's orbit drag is session
-    // intent); only the range resets to the default frame.
-    if sfx.prev.map(|p| p.focus) != focus.map(|f| f.id) {
-        input.distance_m = FLIGHT_DEFAULT_DIST;
-    }
     // §3.7 edge detection on the staged snapshot — cue pushes and
     // TTL aging live in `sfx_edges` (kept out of this system under
     // the line budget). The edges baseline on the same resolved
     // focus the camera follows.
-    ui.sfx = sfx_edges(&mut sfx, ui.debris_count, live.0, &rails.0, focus);
+    let canopy = focus.is_some_and(|f| canopies.0.iter().any(|c| c.vessel == f.id));
+    ui.sfx = sfx_edges(&mut sfx, ui.debris_count, live.0, &rails.0, focus, canopy);
     // The audio backend's focus mirror: voices key off this, not a
     // `vessels.last()` of their own (P07-F1).
     sfx.focus_vessel = focus.map(|f| f.id);
@@ -2229,13 +4807,6 @@ pub(crate) fn flight_present(
         stage_propulsion(&mut ui, None, &[], 0.0, None, None);
         return;
     };
-    cam.0 = solve_chase_camera(
-        &input,
-        snap.env.as_ref(),
-        focus,
-        &terrain_cfg,
-        &mut terrain_cache,
-    );
     ui.has_vessel = true;
     ui.focus = Some(focus.id);
     ui.latched = focus.latched;
@@ -2347,6 +4918,7 @@ fn sfx_edges(
     live_vessels: usize,
     rails: &[u64],
     focus: Option<&FlightBody>,
+    canopy: bool,
 ) -> Vec<String> {
     let cur = focus.map(|f| SfxPrev {
         focus: f.id,
@@ -2357,6 +4929,7 @@ fn sfx_edges(
         rails: rails.contains(&f.id),
         contact: f.contact,
         latched: f.latched,
+        canopy,
     });
     match (sfx.prev, cur) {
         (Some(p), Some(c)) => {
@@ -2377,6 +4950,12 @@ fn sfx_edges(
                 }
                 if c.contact && !p.contact {
                     push("CONTACT");
+                }
+                // The first canopy the simulation holds open over the
+                // craft — the moment it starts inflating, not the press
+                // that fired the chute (that cue names the firing).
+                if c.canopy && !p.canopy {
+                    push("CANOPY OPEN");
                 }
                 // §2.6.4: the settle → surface-rails transition — the
                 // "parked on the pad" edge.
@@ -2874,11 +5453,14 @@ fn f3(v: DVec3) -> [f32; 3] {
 
 /// An unlit-stream vertex — sky quads, plumes, the plasma sheath, the
 /// contact-dust ring: `nrm` ≈ 0 marks the fragment-shader passthrough
-/// so `color` lands unchanged.
-fn unlit_v(pos: [f32; 3], color: [f32; 4]) -> csp_render::flight::FlightVertex {
+/// so `color` lands unchanged, save for water in front of it, which
+/// `flight.wgsl` measures from `world_rel` — the vertex's place relative
+/// to the eye. A vertex with no place of its own (the clip-space sky
+/// quad) passes `DVec3::ZERO`: it sits at the eye, where no water lies.
+fn unlit_v(pos: [f32; 3], world_rel: DVec3, color: [f32; 4]) -> csp_render::flight::FlightVertex {
     csp_render::flight::FlightVertex {
         pos,
-        world: [0.0; 3],
+        world: f3(world_rel),
         nrm: [0.0; 3],
         color,
         mat: [0.0; 3],
@@ -2887,8 +5469,8 @@ fn unlit_v(pos: [f32; 3], color: [f32; 4]) -> csp_render::flight::FlightVertex {
 
 /// All-or-nothing emission of one world-space triangle into the
 /// clip-space stream: every corner is projected first and the tri is
-/// pushed whole or dropped whole — the same rule the part pass and
-/// the VAB packet use. A per-vertex `push` would let one behind-eye
+/// pushed whole or dropped whole — the same rule the part pass and the
+/// VAB packet use. A per-vertex `push` would let one behind-eye
 /// corner shift every later triangle in the shared unindexed
 /// `TriangleList` stream.
 fn emit_tri(
@@ -2903,8 +5485,8 @@ fn emit_tri(
     let [Some(c0), Some(c1), Some(c2)] = [a, b, c].map(|q| project_into(vp, eye, q)) else {
         return;
     };
-    for pos in [c0, c1, c2] {
-        v.push(unlit_v(pos, color));
+    for (pos, q) in [(c0, a), (c1, b), (c2, c)] {
+        v.push(unlit_v(pos, q - eye, color));
     }
 }
 
@@ -2922,8 +5504,8 @@ fn emit_tri3(
     let [Some(c0), Some(c1), Some(c2)] = [a, b, c].map(|q| project_into(vp, eye, q)) else {
         return;
     };
-    for (pos, color) in [(c0, colors[0]), (c1, colors[1]), (c2, colors[2])] {
-        v.push(unlit_v(pos, color));
+    for (pos, q, color) in [(c0, a, colors[0]), (c1, b, colors[1]), (c2, c, colors[2])] {
+        v.push(unlit_v(pos, q - eye, color));
     }
 }
 
@@ -2937,6 +5519,7 @@ fn emit_plumes(
     vp: &[[f64; 4]; 4],
     eye: DVec3,
     b: &FlightBody,
+    pose: &DrawnPose,
     expand: f64,
     t_s: f64,
 ) {
@@ -2954,10 +5537,10 @@ fn emit_plumes(
             continue;
         }
         let dir_w = {
-            let d = b.rot.rotate(*dir);
+            let d = pose.rot.rotate(*dir);
             d / d.norm()
         };
-        let tip = b.pos + b.rot.rotate(*p0);
+        let tip = pose.pos + pose.rot.rotate(*p0);
         let len = 4.5 + 22.0 * drive;
         let exit_r = 0.30 + 0.38 * drive;
         let (u1, u2) = {
@@ -3029,11 +5612,13 @@ fn emit_plumes(
 /// reads as glowing inside its shock layer. `plasma_i` is the staged
 /// convective input normalized through the display window; the shell
 /// is flat-lit (emissive).
+#[allow(clippy::too_many_arguments)] // the drawn pose rides beside the staged body it places
 fn emit_sheath(
     v: &mut Vec<csp_render::flight::FlightVertex>,
     vp: &[[f64; 4]; 4],
     eye: DVec3,
     b: &FlightBody,
+    pose: &DrawnPose,
     flow: DVec3,
     plasma_i: f64,
     tris: &mut Vec<crate::part_mesh::SmoothTri>,
@@ -3045,9 +5630,9 @@ fn emit_sheath(
         tris.clear();
         crate::part_mesh::emit_smooth(&shell, tris);
         for t in tris.iter() {
-            let world = |q: DVec3| b.pos + b.rot.rotate(p.transform.apply(q));
+            let world = |q: DVec3| pose.pos + pose.rot.rotate(p.transform.apply(q));
             let cols = [(t.a, t.na), (t.b, t.nb), (t.c, t.nc)].map(|(_q, n)| {
-                let n_w = b.rot.rotate(p.transform.apply_dir(n));
+                let n_w = pose.rot.rotate(p.transform.apply_dir(n));
                 let facing = if flow == DVec3::ZERO {
                     // Coasting: wrap the glow evenly rather than
                     // guess a leading side.
@@ -3101,19 +5686,20 @@ fn kind_mat(kind: PartKind) -> [f32; 3] {
 fn emit_model_part(
     v: &mut Vec<csp_render::flight::FlightVertex>,
     b: &FlightBody,
+    pose: &DrawnPose,
     p: &FlightPart,
     tris: &[crate::part_mesh::ModelTri],
     vp: &[[f64; 4]; 4],
     eye: DVec3,
 ) {
     for t in tris.iter() {
-        let world = [t.a, t.b, t.c].map(|q| b.pos + b.rot.rotate(p.transform.apply(q)));
+        let world = [t.a, t.b, t.c].map(|q| pose.pos + pose.rot.rotate(p.transform.apply(q)));
         let [Some(c0), Some(c1), Some(c2)] = world.map(|q| project_into(vp, eye, q)) else {
             continue;
         };
         for k in 0..3 {
             let (nrm, alb, mt) = [(t.na, t.ca, t.ma), (t.nb, t.cb, t.mb), (t.nc, t.cc, t.mc)][k];
-            let n_w = b.rot.rotate(p.transform.apply_dir(nrm));
+            let n_w = pose.rot.rotate(p.transform.apply_dir(nrm));
             let rel = world[k] - eye;
             let (color, mat) = if b.debris {
                 (
@@ -3131,6 +5717,243 @@ fn emit_model_part(
                 mat,
             });
         }
+    }
+}
+
+/// [`emit_tri`] for a lit triangle: each corner's world normal, one
+/// color and one material row — shaded by the fragment pass as a part's
+/// are.
+fn emit_lit(
+    v: &mut Vec<csp_render::flight::FlightVertex>,
+    vp: &[[f64; 4]; 4],
+    eye: DVec3,
+    corners: [DVec3; 3],
+    normals: [DVec3; 3],
+    color: [f32; 4],
+    mat: [f32; 3],
+) {
+    let [Some(c0), Some(c1), Some(c2)] = corners.map(|q| project_into(vp, eye, q)) else {
+        return;
+    };
+    for (k, pos) in [c0, c1, c2].into_iter().enumerate() {
+        v.push(csp_render::flight::FlightVertex {
+            pos,
+            world: f3(corners[k] - eye),
+            nrm: f3(normals[k]),
+            color,
+            mat,
+        });
+    }
+}
+
+/// One triangle of the unit canopy's dome — its corners and normals in
+/// the canopy's own frame (radius 1, rim on `z = `[`CANOPY_LINES`], the
+/// point it hangs over at the origin) — and whether it is a striped gore.
+struct CanopyTri {
+    /// Corner a.
+    a: DVec3,
+    /// Corner b.
+    b: DVec3,
+    /// Corner c.
+    c: DVec3,
+    /// Normal at a.
+    na: DVec3,
+    /// Normal at b.
+    nb: DVec3,
+    /// Normal at c.
+    nc: DVec3,
+    /// The orange gore; the others are undyed.
+    striped: bool,
+}
+
+/// The canopy drawn over an open chute, in unit radii: made once at run
+/// time ([`CanopyMesh::unit`]) and kept by the geometry cache — the art
+/// packs carry the packed canister alone.
+struct CanopyMesh {
+    /// The dome: a fan from the apex, then two triangles per gore per
+    /// ring down to the rim.
+    dome: Vec<CanopyTri>,
+    /// Where each suspension line leaves the rim.
+    lines: Vec<DVec3>,
+}
+
+/// The dome is cut into this many gores round it — striped and undyed
+/// alternating, every other seam carrying a line — and this many rings
+/// from the apex to the rim.
+const CANOPY_GORES: usize = 32;
+const CANOPY_RINGS: usize = 6;
+
+/// The triangles one open canopy adds to the craft's stream: the
+/// dome's — a fan of `CANOPY_GORES` from the apex, then two a gore over
+/// each of the `CANOPY_RINGS − 1` below it — and its lines', two each,
+/// one line to every other seam. 384, 1 152 vertices.
+pub const CANOPY_TRIANGLES: usize = CANOPY_GORES * (2 * CANOPY_RINGS - 1) + CANOPY_GORES;
+
+/// A suspension line's width, metres: a cord is millimetres wide, and
+/// would not cover a pixel at the distance a canopy is framed from.
+const CANOPY_LINE_WIDTH_M: f64 = 0.12;
+
+/// The canopy's cloth, gore by gore: safety orange — the recovery class
+/// the packed canister is painted — and undyed cloth, striped so the
+/// dome reads as a parachute and its turn shows.
+const CANOPY_CLOTH: [[f32; 4]; 2] = [[0.80, 0.26, 0.05, 1.0], [0.82, 0.80, 0.74, 1.0]];
+
+/// Cloth is matte: the sun lights it, and it barely sheens.
+const CANOPY_CLOTH_MAT: [f32; 3] = [0.08, 10.0, 1.0];
+
+/// The suspension lines: aramid cord, a dull gold.
+const CANOPY_CORD: [f32; 4] = [0.52, 0.42, 0.18, 1.0];
+const CANOPY_CORD_MAT: [f32; 3] = [0.05, 10.0, 1.0];
+
+impl CanopyMesh {
+    /// The unit canopy: a dome whose profile is a half-ellipse — the
+    /// rim a unit out, the apex [`CANOPY_HEIGHT`] over it — with smooth
+    /// normals, and a line at every other seam of the rim.
+    fn unit() -> Self {
+        let quarter = core::f64::consts::FRAC_PI_2 / CANOPY_RINGS as f64;
+        let slice = core::f64::consts::TAU / CANOPY_GORES as f64;
+        // The point of the surface at `ring` steps from the apex and
+        // `seam` steps round, and its outward normal.
+        let surface = |ring: usize, seam: usize| -> (DVec3, DVec3) {
+            let (sin_t, cos_t) = ((ring as f64) * quarter).sin_cos();
+            let (sin_p, cos_p) = ((seam as f64) * slice).sin_cos();
+            let out = DVec3::new(sin_t * cos_p, sin_t * sin_p, 0.0);
+            let normal = out * CANOPY_HEIGHT + DVec3::Z * cos_t;
+            (
+                out + DVec3::Z * (CANOPY_LINES + CANOPY_HEIGHT * cos_t),
+                normal / normal.norm(),
+            )
+        };
+        let mut dome = Vec::with_capacity(CANOPY_GORES * (2 * CANOPY_RINGS - 1));
+        for ring in 0..CANOPY_RINGS {
+            for gore in 0..CANOPY_GORES {
+                let striped = gore % 2 == 0;
+                let (next, over) = (gore + 1, ring + 1);
+                let tri = |a: (DVec3, DVec3), b: (DVec3, DVec3), c: (DVec3, DVec3)| CanopyTri {
+                    a: a.0,
+                    b: b.0,
+                    c: c.0,
+                    na: a.1,
+                    nb: b.1,
+                    nc: c.1,
+                    striped,
+                };
+                if ring == 0 {
+                    // The innermost ring is the apex: one triangle a
+                    // gore, not two with a corner on itself.
+                    dome.push(tri(surface(0, gore), surface(1, gore), surface(1, next)));
+                    continue;
+                }
+                let (here, there) = (surface(ring, gore), surface(over, gore));
+                let (here_next, there_next) = (surface(ring, next), surface(over, next));
+                dome.push(tri(here, there, there_next));
+                dome.push(tri(here, there_next, here_next));
+            }
+        }
+        Self {
+            dome,
+            lines: (0..CANOPY_GORES)
+                .step_by(2)
+                .map(|seam| surface(CANOPY_RINGS, seam).0)
+                .collect(),
+        }
+    }
+}
+
+/// Every staged vessel's open canopies, each drawn where the simulation
+/// hangs it.
+fn emit_canopies(
+    v: &mut Vec<csp_render::flight::FlightVertex>,
+    vp: &[[f64; 4]; 4],
+    eye: DVec3,
+    geom: &mut FlightGeomCache,
+    vessels: &[FlightBody],
+    scene: &DrawnScene,
+    canopies: &[FlightCanopy],
+) {
+    if canopies.is_empty() {
+        return;
+    }
+    let mesh = geom.canopy.get_or_insert_with(CanopyMesh::unit);
+    for body in vessels {
+        let pose = scene.pose_of(body);
+        for canopy in canopies.iter().filter(|c| c.vessel == body.id) {
+            emit_canopy(v, vp, eye, mesh, &pose, canopy);
+        }
+    }
+}
+
+/// One open canopy, drawn where the simulation hangs it: the dome over
+/// `on_axis` up the craft's axis, its suspension lines from the rim down
+/// to the canister, the whole of it at the simulation's inflation. Lit
+/// like the hull — the frame's sun and ambient, and the water in front
+/// of it — and cast into the cascade with it, as the same stream.
+fn emit_canopy(
+    v: &mut Vec<csp_render::flight::FlightVertex>,
+    vp: &[[f64; 4]; 4],
+    eye: DVec3,
+    mesh: &CanopyMesh,
+    pose: &DrawnPose,
+    canopy: &FlightCanopy,
+) {
+    let scale = canopy.radius_m();
+    // The canopy's frame set in the craft: z up the axis, x and y two
+    // perpendicular ways round it — the stripes have no anchor to keep.
+    let reference = if canopy.axis.z.abs() < 0.9 {
+        DVec3::Z
+    } else {
+        DVec3::X
+    };
+    let u = canopy.axis.cross(reference);
+    let u = u / u.norm();
+    let w = canopy.axis.cross(u);
+    let hang = |p: DVec3| {
+        let out = u * p.x + w * p.y + canopy.axis * p.z;
+        pose.pos + pose.rot.rotate(canopy.on_axis + out * scale)
+    };
+    let turn = |n: DVec3| pose.rot.rotate(u * n.x + w * n.y + canopy.axis * n.z);
+    for t in &mesh.dome {
+        emit_lit(
+            v,
+            vp,
+            eye,
+            [hang(t.a), hang(t.b), hang(t.c)],
+            [turn(t.na), turn(t.nb), turn(t.nc)],
+            CANOPY_CLOTH[!t.striped as usize],
+            CANOPY_CLOTH_MAT,
+        );
+    }
+    // Each line a ribbon turned to face the eye, so a cord shows from
+    // every side; its normal is the way it faces.
+    let end = pose.pos + pose.rot.rotate(canopy.canister);
+    for rim in &mesh.lines {
+        let from = hang(*rim);
+        let across = (from - end).cross((from + end) * 0.5 - eye);
+        let length = across.norm();
+        if length == 0.0 {
+            // Seen along its own length, a line is a point.
+            continue;
+        }
+        let side = across * (CANOPY_LINE_WIDTH_M * 0.5 / length);
+        let facing = [across / length; 3];
+        emit_lit(
+            v,
+            vp,
+            eye,
+            [from - side, from + side, end + side],
+            facing,
+            CANOPY_CORD,
+            CANOPY_CORD_MAT,
+        );
+        emit_lit(
+            v,
+            vp,
+            eye,
+            [from - side, end + side, end - side],
+            facing,
+            CANOPY_CORD,
+            CANOPY_CORD_MAT,
+        );
     }
 }
 
@@ -3300,6 +6123,9 @@ pub(crate) struct FlightGeomCache {
     /// Scratch tri stream reused across frames (`emit_sheath`'s
     /// target — the old per-extract `Vec::new()` pair).
     pub(crate) sheath_tris: Vec<crate::part_mesh::SmoothTri>,
+    /// The unit canopy mesh, made the first frame an open chute is
+    /// drawn.
+    canopy: Option<CanopyMesh>,
     /// Last frame's vertex count — the capacity hint that spares the
     /// packet's stream its growth-realloc chain (allocation only;
     /// no output effect).
@@ -3373,13 +6199,15 @@ pub(crate) fn extract_flight(
     input: Res<FlightInput>,
     map_input: Res<MapInput>,
     snap: Res<FlightSnapshot>,
+    scene: Res<DrawnScene>,
+    focus_override: Res<FlightFocusOverride>,
     cam: Res<FlightCameraF64>,
     terrain_cfg: Res<TerrainConfig>,
     mut terrain_cache: ResMut<TerrainCache>,
-    mut flight_ui: ResMut<FlightUiData>,
     sites: Res<crate::structures::SiteTable>,
     clock: Res<crate::Clock>,
     mut geom: ResMut<FlightGeomCache>,
+    canopies: Res<CanopiesStaged>,
     mut frame: ResMut<FlightFrame>,
 ) {
     let mut packet = csp_render::flight::FlightPacket::default();
@@ -3389,6 +6217,21 @@ pub(crate) fn extract_flight(
     if geom.vert_hint > 0 {
         packet.vertices = Vec::with_capacity(geom.vert_hint);
     }
+    // Every clock-driven quantity is taken at the drawn instant. The
+    // default scene — nothing drawn — reads as the staged snapshot at
+    // the clock's own tick.
+    let env = scene.env.as_ref().or(snap.env.as_ref());
+    let time_s = scene
+        .time_s
+        .unwrap_or_else(|| clock.0.ticks() as f64 / csp_core::TICK_HZ as f64);
+    // The blob shadow and the cascade's local up are the FOCUS's: its
+    // drawn CoM goes to both by name, never recovered from the camera
+    // matrix — whose anchor is still travelling to the craft for the
+    // first frames after a focus change, which is where the blob used
+    // to ride and the shadow frustum used to turn.
+    let focus_com = focus_override
+        .resolve(&snap.vessels)
+        .map(|f| scene.pose_of(f).com);
     // R2 surface pass: when a physical world is present and the chase
     // camera solved, the quadtree terrain + LUT sky replace the M4c
     // gradient/disc. Without an environment the flat gradient stays —
@@ -3398,21 +6241,21 @@ pub(crate) fn extract_flight(
     //
     // While the body's heightfield bakes on the background thread the
     // packet comes back sky-only (M5 §5.2-R2 arrival polish) — the
-    // HUD mirrors that wait below.
-    let mut terrain_pending = false;
+    // loading screen covers those frames (`flight_terrain_pending`).
     if map_input.mode == MapMode::Flight
         && cam.0.valid
-        && let Some(env) = &snap.env
+        && let Some(env) = env
     {
         let tp = crate::terrain::build_packet(
             &terrain_cfg,
             &mut terrain_cache,
             env,
             &cam.0,
+            focus_com,
             input.viewport_px,
-            clock.0.ticks() as f64 / csp_core::TICK_HZ as f64,
+            time_s,
         );
-        terrain_pending = tp.heightfield.is_none();
+        let terrain_pending = tp.heightfield.is_none();
         packet.terrain = Some(tp);
         // R1/3b: solve the cascade uniforms beside the packet they
         // shadow — the app feeds this row to `draw_shadow` before the
@@ -3433,10 +6276,9 @@ pub(crate) fn extract_flight(
         packet.shadow = if terrain_pending {
             csp_render::shadow::ShadowUniforms::default()
         } else {
-            cascade_uniforms(&cam.0, env, input.viewport_px)
+            cascade_uniforms(&cam.0, focus_com, env, input.viewport_px)
         };
     }
-    flight_ui.terrain_pending = terrain_pending;
     let v = &mut packet.vertices;
     if packet.terrain.is_none() {
         // Sky fallback: a far-depth fullscreen space backdrop (two
@@ -3459,7 +6301,7 @@ pub(crate) fn extract_flight(
             ([-1.0, 1.0, 0.0], zenith),
         ];
         for (pos, color) in q {
-            packet.far_vertices.push(unlit_v(pos, color));
+            packet.far_vertices.push(unlit_v(pos, DVec3::ZERO, color));
         }
     }
     if !cam.0.valid {
@@ -3476,7 +6318,7 @@ pub(crate) fn extract_flight(
     // terrain the craft rests on (the extract's `packet.terrain` gate
     // is exactly "env + solved camera + flight mode").
     if packet.terrain.is_some()
-        && let Some(env) = &snap.env
+        && let Some(env) = env
         && let Some(body) = &env.body
         && let Some(site) = sites.launch_site(body)
     {
@@ -3510,16 +6352,17 @@ pub(crate) fn extract_flight(
             s / s.norm()
         });
     // The part-lighting uniform for this frame: the staged sun plus a
-    // hemisphere ambient keyed to the focus vessel's local up — sky
+    // hemisphere ambient keyed to the lowest-id vessel's local up — sky
     // bounce above it, dim ground bounce below — so hull shading reads
     // like the scene the terrain pass draws (same sun direction).
     packet.light = {
+        let first = snap.vessels.first().map(|b| scene.pose_of(b));
         let up = snap
             .env
             .as_ref()
             .and_then(|e| {
-                snap.vessels.first().map(|b| {
-                    let d = b.com - e.body_center;
+                first.map(|p| {
+                    let d = p.com - e.body_center;
                     let l = d.norm();
                     if l > 1.0 { d / l } else { DVec3::Z }
                 })
@@ -3533,10 +6376,8 @@ pub(crate) fn extract_flight(
         // local transmittance exactly like the ground under it.
         // The base color mirrors fs_terrain's `sun_lum` ([1.0,0.98,0.92]).
         let sun_col = snap.env.as_ref().map_or([1.0, 0.98, 0.92], |e| {
-            let alt = snap
-                .vessels
-                .first()
-                .map(|b| ((b.com - e.body_center).norm() - e.radius_m).max(0.0))
+            let alt = first
+                .map(|p| ((p.com - e.body_center).norm() - e.radius_m).max(0.0))
                 .unwrap_or(0.0);
             if e.atm_top_m <= 0.0 {
                 [1.0, 0.98, 0.92] // vacuum — full sun
@@ -3560,9 +6401,22 @@ pub(crate) fn extract_flight(
             amb_up: [0.16, 0.20, 0.27, 0.0],
             amb_dn: [0.065, 0.060, 0.055, 0.0],
             hemi: [up.x as f32, up.y as f32, up.z as f32, 0.10],
+            // The water the hull is seen through: the eye from the body
+            // centre and the ocean's surface — all zero without an
+            // environment, the surface zero without an ocean.
+            water: snap.env.as_ref().map_or([0.0; 4], |e| {
+                let eye = cam.0.eye - e.body_center;
+                [
+                    eye.x as f32,
+                    eye.y as f32,
+                    eye.z as f32,
+                    crate::terrain::ocean_datum_m(&terrain_cfg, e).unwrap_or(0.0) as f32,
+                ]
+            }),
         }
     };
     for b in &snap.vessels {
+        let pose = scene.pose_of(b);
         for p in b.parts.iter() {
             // C1: the part's local silhouette comes from the geometry
             // cache — `emit_smooth` re-tessellation, the livery tint
@@ -3573,7 +6427,7 @@ pub(crate) fn extract_flight(
             if let Some(m) = &p.model {
                 let (mlo, mhi) = p.shape.local_aabb();
                 let tris = geom.model_tris(m, mlo, mhi);
-                emit_model_part(v, b, p, &tris, vp, eye);
+                emit_model_part(v, b, &pose, p, &tris, vp, eye);
                 continue;
             }
             let baked = geom.smooth_tris(&p.shape, &p.shape_key, p.kind, b.debris);
@@ -3581,12 +6435,13 @@ pub(crate) fn extract_flight(
                 // A tri with any corner behind the eye plane drops
                 // whole — the same all-or-nothing rule the VAB packet
                 // uses — rather than emitting a corrupted fan.
-                let world = [t.a, t.b, t.c].map(|q| b.pos + b.rot.rotate(p.transform.apply(q)));
+                let world =
+                    [t.a, t.b, t.c].map(|q| pose.pos + pose.rot.rotate(p.transform.apply(q)));
                 let [Some(c0), Some(c1), Some(c2)] = world.map(|q| project_into(vp, eye, q)) else {
                     continue;
                 };
                 for (k, nrm) in [t.na, t.nb, t.nc].iter().enumerate() {
-                    let n_w = b.rot.rotate(p.transform.apply_dir(*nrm));
+                    let n_w = pose.rot.rotate(p.transform.apply_dir(*nrm));
                     v.push(csp_render::flight::FlightVertex {
                         pos: [c0, c1, c2][k],
                         world: f3(world[k] - eye),
@@ -3607,14 +6462,13 @@ pub(crate) fn extract_flight(
             // sea-level ones (ratio keyed to the atmosphere top).
             let expand = snap.env.as_ref().map_or(1.0, |e| {
                 if e.atm_top_m > 0.0 {
-                    let alt = ((b.com - e.body_center).norm() - e.radius_m).max(0.0);
+                    let alt = ((pose.com - e.body_center).norm() - e.radius_m).max(0.0);
                     1.0 + 1.8 * (alt / e.atm_top_m).clamp(0.0, 1.0)
                 } else {
                     2.6
                 }
             });
-            let t_s = clock.0.ticks() as f64 / csp_core::TICK_HZ as f64;
-            emit_plumes(v, vp, eye, b, expand, t_s);
+            emit_plumes(v, vp, eye, b, &pose, expand, time_s);
         }
 
         // §3.7 reentry plasma: an emissive sheath grown off the hull —
@@ -3624,10 +6478,9 @@ pub(crate) fn extract_flight(
         // `v_rel` convention) — its magnitude is also the speed the
         // C19-F1 gate reads, so the sheath can't light on a slow
         // ascent pass however dense the air.
-        let v_rel = snap
-            .env
-            .as_ref()
-            .map_or(b.vel, |e| b.vel - e.body_spin.cross(b.com - e.body_center));
+        let v_rel = snap.env.as_ref().map_or(b.vel, |e| {
+            b.vel - e.body_spin.cross(pose.com - e.body_center)
+        });
         let plasma_i = plasma_intensity(b.plasma_w_m2, v_rel.norm());
         if plasma_i > 0.0 {
             let flow = if v_rel.norm_squared() > 1.0 {
@@ -3635,15 +6488,15 @@ pub(crate) fn extract_flight(
             } else {
                 DVec3::ZERO
             };
-            emit_sheath(v, vp, eye, b, flow, plasma_i, &mut geom.sheath_tris);
+            emit_sheath(v, vp, eye, b, &pose, flow, plasma_i, &mut geom.sheath_tris);
         }
 
         // §3.7 ground-contact dust: a translucent tan ring hugging
         // the surface under the vessel's lowest hull vertex.
         if b.contact
-            && let Some(env) = snap.env.as_ref()
+            && let Some(env) = env
         {
-            let mut low = b.com;
+            let mut low = pose.com;
             let mut low_alt = f64::MAX;
             let mut extent = 1.0_f64;
             for p in b.parts.iter() {
@@ -3657,8 +6510,8 @@ pub(crate) fn extract_flight(
                     DVec3::new(p.hi.x, p.hi.y, p.hi.z),
                     DVec3::new(p.lo.x, p.hi.y, p.hi.z),
                 ] {
-                    let w = b.pos + b.rot.rotate(c);
-                    extent = extent.max((w - b.pos).norm());
+                    let w = pose.pos + pose.rot.rotate(c);
+                    extent = extent.max((w - pose.pos).norm());
                     let alt = (w - env.body_center).norm() - env.radius_m;
                     if alt < low_alt {
                         low_alt = alt;
@@ -3675,14 +6528,16 @@ pub(crate) fn extract_flight(
                 }
             };
             // Puff sits a hair above the LOCAL terrain surface — the
-            // baked heightfield's floor radius under `dir`, not the
-            // bare datum: a datum-anchored ring buries under up to
-            // `amplitude_m` of positive relief and floats over dips
-            // (P07-F2/P08-F3; `surface_floor_radius` is the same tap
-            // the camera floor uses).
+            // baked heightfield's neighbourhood ceiling under `dir`
+            // (a ring sample, so the ring never hangs over an un-sampled
+            // dip), not the bare datum: a datum-anchored ring buries
+            // under up to `amplitude_m` of positive relief and floats
+            // over dips (P07-F2/P08-F3). Under an ocean that surface is
+            // the seabed the craft rests on: the ring stays on the
+            // bottom, seen through the water, not on the surface above.
             let floor =
                 crate::terrain::surface_floor_radius(&terrain_cfg, &mut terrain_cache, env, dir);
-            let base = env.body_center + dir * (floor.max(env.radius_m) + 0.3);
+            let base = env.body_center + dir * (floor + 0.3);
             let (t1, t2) = {
                 let a = if dir.y.abs() < 0.9 {
                     DVec3::Y
@@ -3708,6 +6563,7 @@ pub(crate) fn extract_flight(
             }
         }
     }
+    emit_canopies(v, vp, eye, &mut geom, &snap.vessels, &scene, &canopies.0);
     geom.vert_hint = packet.vertices.len();
     frame.0 = Some(packet);
 }
@@ -3745,17 +6601,52 @@ mod tests {
         });
         world.insert_resource(snap);
         world.insert_resource(FlightCameraF64(cam));
+        // No interpolation has run in this rig — the extract reads the
+        // default scene as the staged snapshot itself.
+        world.insert_resource(DrawnScene::default());
         world.insert_resource(TerrainConfig::default());
         world.insert_resource(TerrainCache::default());
-        // The HUD mirror the extract writes the terrain-bake wait to.
-        world.insert_resource(FlightUiData::default());
+        // The extract resolves the focus for the blob shadow.
+        world.insert_resource(FlightFocusOverride::default());
         world.insert_resource(crate::structures::SiteTable::default());
         world.insert_resource(crate::Clock::default());
         world.insert_resource(FlightFrame::default());
         world.insert_resource(FlightGeomCache::default());
+        world.insert_resource(CanopiesStaged::default());
         let mut sched = Schedule::default();
         sched.add_systems(extract_flight);
         (world, sched)
+    }
+
+    /// Pump the rig until the background heightfield bake lands: the
+    /// packet of the first pass that carries it.
+    fn waited_pass(
+        world: &mut bevy_ecs::world::World,
+        sched: &mut Schedule,
+    ) -> csp_render::flight::FlightPacket {
+        for _ in 0..4_000 {
+            let packet = extract_pass(world, sched);
+            if packet
+                .terrain
+                .as_ref()
+                .is_some_and(|t| t.heightfield.is_some())
+            {
+                return packet;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the background bake never landed for the rig");
+    }
+
+    /// The rig's terrain packet once the background heightfield bake has
+    /// landed.
+    fn waited_terrain(
+        world: &mut bevy_ecs::world::World,
+        sched: &mut Schedule,
+    ) -> csp_render::terrain::TerrainPacket {
+        waited_pass(world, sched)
+            .terrain
+            .expect("the packet carries terrain")
     }
 
     /// One extract pass over the rig; takes the frame's packet.
@@ -3774,6 +6665,83 @@ mod tests {
     fn run_extract(snap: FlightSnapshot, cam: MapCameraF64) -> csp_render::flight::FlightPacket {
         let (mut world, mut sched) = extract_rig(snap, cam);
         extract_pass(&mut world, &mut sched)
+    }
+
+    /// An open chute is drawn as the canopy mesh — dome and lines, every
+    /// corner lit and opaque — hung over its canister up the craft's
+    /// axis, its rim a drag-area radius out, at the staged inflation:
+    /// nothing in the near stream without a staged canopy, the mesh's
+    /// own count with one, and a smaller canopy rather than a lesser
+    /// one as it inflates.
+    #[test]
+    fn an_open_chute_is_drawn_as_its_canopy_over_its_canister() {
+        let cam = crate::map::solve_orbit_camera(
+            0.0,
+            0.0,
+            600.0,
+            (1920.0, 1080.0),
+            DVec3::ZERO,
+            FLIGHT_FOV_Y,
+            0.1,
+        );
+        let eye = cam.eye;
+        let (mut world, mut sched) = extract_rig(
+            FlightSnapshot {
+                env: None,
+                vessels: vec![bare_body(7, false)],
+            },
+            cam,
+        );
+        let mesh = CanopyMesh::unit();
+        assert_eq!(
+            mesh.dome.len() + 2 * mesh.lines.len(),
+            CANOPY_TRIANGLES,
+            "the stated count is the mesh's"
+        );
+        let mesh_verts = 3 * CANOPY_TRIANGLES;
+        let packed = extract_pass(&mut world, &mut sched);
+        assert!(packed.vertices.is_empty(), "no open canopy, nothing drawn");
+        let radius = test_canopy(7, 1.0).radius_m();
+        assert!((radius - (700.0 / core::f64::consts::PI).sqrt()).abs() < 1e-9);
+        for inflation in [1.0, 0.5, 0.02] {
+            world.resource_mut::<CanopiesStaged>().0 = vec![test_canopy(7, inflation)];
+            let packet = extract_pass(&mut world, &mut sched);
+            assert_eq!(packet.vertices.len(), mesh_verts, "inflation {inflation}");
+            assert!(
+                packet
+                    .vertices
+                    .iter()
+                    .all(|v| v.nrm != [0.0; 3] && v.color[3] == 1.0),
+                "lit and opaque"
+            );
+            let corners: Vec<DVec3> = packet
+                .vertices
+                .iter()
+                .map(|v| eye + DVec3::new(v.world[0] as f64, v.world[1] as f64, v.world[2] as f64))
+                .collect();
+            let r = radius * inflation;
+            let top = corners
+                .iter()
+                .map(|c| c.z)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let bottom = corners.iter().map(|c| c.z).fold(f64::INFINITY, f64::min);
+            let out = corners
+                .iter()
+                .map(|c| (c.x * c.x + c.y * c.y).sqrt())
+                .fold(0.0, f64::max);
+            assert!(
+                (top - (CANOPY_LINES + CANOPY_HEIGHT) * r).abs() < 1e-3,
+                "apex {top}"
+            );
+            assert!(
+                bottom.abs() < CANOPY_LINE_WIDTH_M,
+                "lines reach the canister: {bottom}"
+            );
+            assert!((out - r).abs() < CANOPY_LINE_WIDTH_M, "rim {out} vs {r}");
+        }
+        // Gone from the stage — back past a gate — gone from the stream.
+        world.resource_mut::<CanopiesStaged>().0.clear();
+        assert!(extract_pass(&mut world, &mut sched).vertices.is_empty());
     }
 
     /// A throttle-open vessel whose plume base ring lies exactly on
@@ -4105,7 +7073,8 @@ mod tests {
                 content.top() + (0.5 - ndc[1] * 0.5) * content.height(),
             )
         };
-        let pick = |p: egui::Pos2| pick_part(&cam, Some(&vessel), content, p);
+        let staged = DrawnPose::staged(&vessel);
+        let pick = |p: egui::Pos2| pick_part(&cam, Some((&vessel, staged)), content, p);
         // Dead center = node 1's AABB.
         assert_eq!(pick(to_screen(DVec3::ZERO)), Some(FlightPick::Part(1)));
         // Node 2's projected center is up-screen → its menu.
@@ -4127,7 +7096,7 @@ mod tests {
         assert_eq!(
             pick_part(
                 &FlightCameraF64::default(),
-                Some(&vessel),
+                Some((&vessel, staged)),
                 content,
                 to_screen(DVec3::ZERO)
             ),
@@ -4495,6 +7464,20 @@ mod tests {
         assert!((loads.g_for(2) - 2.0).abs() < 1e-9, "g {}", loads.g_for(2));
     }
 
+    /// An open canopy — the shipped s125's 700 m² at `inflation` —
+    /// hanging over vessel `vessel`'s canister at the origin, up +z.
+    fn test_canopy(vessel: u64, inflation: f64) -> FlightCanopy {
+        FlightCanopy {
+            vessel,
+            node: 3,
+            inflation,
+            canister: DVec3::ZERO,
+            on_axis: DVec3::ZERO,
+            axis: DVec3::Z,
+            drag_area_m2: 700.0,
+        }
+    }
+
     /// A bare `FlightBody` for the focus-rule tests — every field the
     /// rule ignores sits at its zero value.
     fn bare_body(id: u64, debris: bool) -> FlightBody {
@@ -4541,6 +7524,149 @@ mod tests {
         assert!(focus_vessel(&[]).is_none());
     }
 
+    /// A craft for the restored-plan tests: one node per
+    /// `(catalog part, parent row, chute)` row, `None` for the root.
+    /// Returns the craft and the catalog its part ids resolve against.
+    fn restored_craft(
+        rows: &[(&str, Option<usize>, bool)],
+    ) -> (
+        csp_sim::CraftDef,
+        BTreeMap<csp_data::PartId, csp_data::PartDef>,
+    ) {
+        let blank = crate::stock_flight_craft().parts[3].clone();
+        let mut graph = csp_phys::PartGraph::new(csp_phys::PartNodeId(1));
+        let mut parts = Vec::new();
+        let mut catalog = BTreeMap::new();
+        for (i, &(id, parent, chute)) in rows.iter().enumerate() {
+            let above = parent.map(|p| csp_phys::PartNodeId(p as u64 + 1));
+            graph.insert(
+                csp_phys::PartNodeId(i as u64 + 1),
+                csp_phys::PartNode::new(above, csp_phys::PartTransform::IDENTITY, i as u32),
+            );
+            let mut part = blank.clone();
+            if chute {
+                part.parachute = Some(csp_phys::ParachuteSpec {
+                    deploy_alt_m: 0.0,
+                    deploy_speed_mps: 0.0,
+                    packed_drag_area_m2: 0.0,
+                    deployed_drag_area_m2: 0.0,
+                    deploy_time_s: 0.0,
+                });
+            }
+            parts.push(part);
+            let decoupler = id == "r.dec";
+            let def = readout_def(
+                id,
+                10.0,
+                decoupler
+                    .then_some(csp_data::ModuleDef::Decoupler)
+                    .into_iter()
+                    .collect(),
+            );
+            catalog.insert(def.id.clone(), def);
+        }
+        (
+            csp_sim::CraftDef {
+                hash_memo: Default::default(),
+                graph,
+                parts,
+                part_costs: Vec::new(),
+                reliability: Vec::new(),
+                part_ids: rows
+                    .iter()
+                    .map(|&(id, _, _)| csp_data::PartId::from(id))
+                    .collect(),
+                part_build_resources: Vec::new(),
+            },
+            catalog,
+        )
+    }
+
+    /// A restored craft stages by its shape: the deepest decoupler's
+    /// subtree drops first, the next decoupler's after it minus what the
+    /// first firing took (the decoupler itself stays parent-side), and
+    /// the chutes nothing drops deploy last.
+    #[test]
+    fn restored_plan_drops_deepest_first_and_deploys_last() {
+        let (craft, catalog) = restored_craft(&[
+            ("r.pod", None, false),
+            ("r.chute", Some(0), true),
+            ("r.dec", Some(0), false),
+            ("r.tank", Some(2), false),
+            ("r.eng", Some(3), false),
+            ("r.dec", Some(4), false),
+            ("r.boost", Some(5), false),
+        ]);
+        let node = |i: u64| vec![csp_phys::PartNodeId(i)];
+        assert_eq!(
+            restored_stage_actions(&craft, &BTreeMap::new(), &catalog),
+            vec![
+                StageActions {
+                    jettisons: node(7),
+                    deploys: Vec::new(),
+                },
+                StageActions {
+                    jettisons: (4..=6).map(csp_phys::PartNodeId).collect(),
+                    deploys: Vec::new(),
+                },
+                StageActions {
+                    jettisons: Vec::new(),
+                    deploys: node(2),
+                },
+            ]
+        );
+    }
+
+    /// Decouplers at one depth fire together — a booster pair separates
+    /// as one stage — a chute inside a drop set leaves with it rather
+    /// than deploying, and a chute the save shows already deployed is
+    /// not offered again.
+    #[test]
+    fn restored_plan_groups_a_depth_and_skips_spent_chutes() {
+        let (craft, catalog) = restored_craft(&[
+            ("r.pod", None, false),
+            ("r.dec", Some(0), false),
+            ("r.boost", Some(1), false),
+            ("r.chute", Some(2), true),
+            ("r.dec", Some(0), false),
+            ("r.boost", Some(4), false),
+            ("r.chute", Some(0), true),
+        ]);
+        let deployed = BTreeMap::from([(
+            csp_phys::PartNodeId(7),
+            csp_sim::DeployRecord {
+                deployed_tick: 1,
+                opened_tick: None,
+            },
+        )]);
+        assert_eq!(
+            restored_stage_actions(&craft, &deployed, &catalog),
+            vec![StageActions {
+                jettisons: vec![
+                    csp_phys::PartNodeId(3),
+                    csp_phys::PartNodeId(4),
+                    csp_phys::PartNodeId(6),
+                ],
+                deploys: Vec::new(),
+            }]
+        );
+    }
+
+    /// A craft with nothing to drop and nothing to deploy stages nothing:
+    /// it gets no plan, and the press reports a single-stage craft.
+    #[test]
+    fn restored_plan_is_empty_for_a_single_stage_craft() {
+        let (craft, catalog) = restored_craft(&[
+            ("r.pod", None, false),
+            ("r.tank", Some(0), false),
+            ("r.eng", Some(1), false),
+        ]);
+        assert!(restored_stage_actions(&craft, &BTreeMap::new(), &catalog).is_empty());
+        // A decoupler with nothing left under it drops nothing either.
+        let (spent, catalog) = restored_craft(&[("r.pod", None, false), ("r.dec", Some(0), false)]);
+        assert!(restored_stage_actions(&spent, &BTreeMap::new(), &catalog).is_empty());
+    }
+
     /// C19-F5's sync half: `sync_flight` MOVES the staged buffers into
     /// the mirror — `FlightSyncInput` is rebuilt per `end_frame` and
     /// read by nothing after `stage_program`, so the mirror takes the
@@ -4557,11 +7683,15 @@ mod tests {
                 ..VesselPropulsion::default()
             }],
             rails: vec![7],
+            radii: vec![(7, 2.5)],
+            canopies: vec![test_canopy(7, 0.5)],
         });
         world.insert_resource(FlightSnapshot::default());
         world.insert_resource(LiveVesselCount::default());
         world.insert_resource(VesselPropulsionStaged::default());
         world.insert_resource(RailsStaged::default());
+        world.insert_resource(CraftRadii::default());
+        world.insert_resource(CanopiesStaged::default());
         let mut sched = Schedule::default();
         sched.add_systems(sync_flight);
         sched.run(&mut world);
@@ -4573,10 +7703,17 @@ mod tests {
         assert_eq!(world.resource::<LiveVesselCount>().0, 1);
         assert_eq!(world.resource::<VesselPropulsionStaged>().0[0].vessel, 7);
         assert_eq!(world.resource::<RailsStaged>().0, vec![7]);
+        assert_eq!(world.resource::<CraftRadii>().0, vec![(7, 2.5)]);
+        assert_eq!(
+            world.resource::<CanopiesStaged>().0,
+            vec![test_canopy(7, 0.5)]
+        );
         assert!(
             world.resource::<FlightSyncInput>().vessels.is_empty()
                 && world.resource::<FlightSyncInput>().propulsion.is_empty()
-                && world.resource::<FlightSyncInput>().rails.is_empty(),
+                && world.resource::<FlightSyncInput>().rails.is_empty()
+                && world.resource::<FlightSyncInput>().radii.is_empty()
+                && world.resource::<FlightSyncInput>().canopies.is_empty(),
             "the staged input must be consumed, not copied"
         );
     }
@@ -4595,6 +7732,7 @@ mod tests {
             });
             world.insert_resource(LiveVesselCount::default());
             world.insert_resource(RailsStaged::default());
+            world.insert_resource(CanopiesStaged::default());
             // The plan is bound to `plan_vessel`; the staged focus is
             // vessel 7 — `hud_plan` borrows the newest live plan.
             world.insert_resource(StagePlans::single(StagePlan::bound_to(
@@ -4605,6 +7743,7 @@ mod tests {
             world.insert_resource(TerrainConfig::default());
             world.insert_resource(TerrainCache::default());
             world.insert_resource(FlightCameraF64::default());
+            world.insert_resource(DrawnScene::default());
             world.insert_resource(FlightUiData::default());
             world.insert_resource(FlightSfx::default());
             world.insert_resource(crate::Clock::default());
@@ -4627,6 +7766,68 @@ mod tests {
         );
     }
 
+    /// `CANOPY OPEN` lands the frame a canopy is first staged over the
+    /// focused craft — once, not again while it stays open or grows,
+    /// and never for another craft's canopy.
+    #[test]
+    fn a_canopy_opening_over_the_focus_posts_its_cue_once() {
+        let mut world = bevy_ecs::world::World::new();
+        world.insert_resource(FlightInput::default());
+        world.insert_resource(FlightSnapshot {
+            env: None,
+            vessels: vec![bare_body(7, false)],
+        });
+        world.insert_resource(LiveVesselCount::default());
+        world.insert_resource(RailsStaged::default());
+        world.insert_resource(StagePlans::default());
+        world.insert_resource(VesselPropulsionStaged::default());
+        world.insert_resource(CanopiesStaged::default());
+        world.insert_resource(TerrainConfig::default());
+        world.insert_resource(TerrainCache::default());
+        world.insert_resource(FlightCameraF64::default());
+        world.insert_resource(DrawnScene::default());
+        world.insert_resource(FlightUiData::default());
+        world.insert_resource(FlightSfx::default());
+        world.insert_resource(crate::Clock::default());
+        world.insert_resource(FlightFocusOverride::default());
+        world.insert_resource(crate::ProgramMirror::default());
+        let mut sched = Schedule::default();
+        sched.add_systems(flight_present);
+        let open_cues = |world: &bevy_ecs::world::World| {
+            world
+                .resource::<FlightUiData>()
+                .sfx
+                .iter()
+                .filter(|c| *c == "CANOPY OPEN")
+                .count()
+        };
+        // The first frame is a baseline: nothing is posted.
+        sched.run(&mut world);
+        assert_eq!(open_cues(&world), 0);
+        // Another craft's canopy opens: the focus's cue stack is silent.
+        world.resource_mut::<CanopiesStaged>().0 = vec![test_canopy(9, 0.5)];
+        sched.run(&mut world);
+        assert_eq!(
+            open_cues(&world),
+            0,
+            "another craft's canopy is not the focus's"
+        );
+        // The focus's canopy starts opening: the cue lands — and is not
+        // posted again while it inflates and hangs.
+        world.resource_mut::<CanopiesStaged>().0 = vec![test_canopy(9, 0.5), test_canopy(7, 0.02)];
+        sched.run(&mut world);
+        assert_eq!(open_cues(&world), 1);
+        for inflation in [0.5, 1.0, 1.0] {
+            world.resource_mut::<CanopiesStaged>().0[1] = test_canopy(7, inflation);
+            sched.run(&mut world);
+        }
+        assert_eq!(
+            open_cues(&world),
+            1,
+            "a canopy that stays open does not post again"
+        );
+    }
+
     /// The launch-UX camera hold: an empty arena with a build order
     /// on the books is a delivery in flight — the no-focus branch
     /// must KEEP the last solved pose (the pad the launch pressed
@@ -4645,6 +7846,7 @@ mod tests {
             });
             world.insert_resource(LiveVesselCount::default());
             world.insert_resource(RailsStaged::default());
+            world.insert_resource(CanopiesStaged::default());
             world.insert_resource(StagePlans::default());
             world.insert_resource(VesselPropulsionStaged::default());
             world.insert_resource(TerrainConfig::default());
@@ -4654,6 +7856,7 @@ mod tests {
             let mut cam = FlightCameraF64::default();
             cam.0.valid = true;
             world.insert_resource(cam);
+            world.insert_resource(DrawnScene::default());
             world.insert_resource(FlightUiData::default());
             world.insert_resource(FlightSfx::default());
             world.insert_resource(crate::Clock::default());
@@ -4854,6 +8057,217 @@ mod tests {
         );
         assert!(!packet.shadow.armed());
         assert!(packet.terrain.is_none());
+    }
+
+    /// The blob shadow lands under the FOCUSED CRAFT, not wherever the
+    /// camera points. After a far focus change the camera's anchor is
+    /// still hundreds of kilometres from the craft; the blob used to be
+    /// read back out of the camera matrix and sat under the camera. Run
+    /// through `extract_rig`'s real Schedule, over a flat body so the
+    /// bake cannot move the surface under the assertion.
+    #[test]
+    fn extract_puts_the_blob_shadow_under_the_focused_craft() {
+        let r = 600_000.0;
+        let env = FlightEnv {
+            body_center: DVec3::ZERO,
+            radius_m: r,
+            atm_top_m: 0.0,
+            atm_scale_height_m: 0.0,
+            mu_m3_per_s2: 1.0,
+            body: Some(csp_data::BodyId::from("flat")),
+            sun_dir: DVec3::new(0.8, 0.6, 0.0),
+            spin_axis: DVec3::Z,
+            spin_phase: 0.0,
+            body_spin: DVec3::ZERO,
+        };
+        let flat = TerrainConfig {
+            bodies: std::collections::BTreeMap::from([(
+                "flat".to_owned(),
+                crate::terrain::TerrainBody {
+                    seed: 0,
+                    amplitude_m: 0.0,
+                    profile: csp_core::terrain::ReliefProfile::Legacy,
+                    ocean_datum_m: None,
+                    biome: None,
+                },
+            )]),
+            ..TerrainConfig::default()
+        };
+        let craft = DVec3::new(r + 5.0, 0.0, 0.0);
+        let mut body = bare_body(7, false);
+        body.pos = craft;
+        body.com = craft;
+        // The camera orbits a point a quarter of the way round the
+        // planet — 850 km from the craft, where a travel to it starts.
+        let anchor = DVec3::new(0.0, r + 5.0, 0.0);
+        let level = level_frame(anchor, Some(DVec3::ZERO), DVec3::Z);
+        let cam = chase_camera(
+            anchor + level.dir(0.7, 0.25) * 12.0,
+            anchor,
+            &level,
+            (320.0, 240.0),
+        );
+        let (mut world, mut sched) = extract_rig(
+            FlightSnapshot {
+                env: Some(env.clone()),
+                vessels: vec![body],
+            },
+            cam,
+        );
+        world.insert_resource(flat);
+        let terrain = waited_terrain(&mut world, &mut sched);
+        let blob = terrain.uniforms.shadow;
+        let dir = DVec3::new(f64::from(blob[0]), f64::from(blob[1]), f64::from(blob[2]));
+        assert!(blob[3] > 0.0, "no blob for a landed craft in daylight");
+        assert!(
+            dir.dot(DVec3::X) > 0.999_999,
+            "the blob points {dir:?}, not up the craft's own radial"
+        );
+        assert!(
+            dir.dot(DVec3::Y).abs() < 0.001,
+            "the blob points at the camera's anchor, 850 km away"
+        );
+        assert_eq!(terrain.uniforms.atmo[2], 5.0, "the craft's altitude");
+
+        // Nothing focused: no craft, no blob.
+        world.insert_resource(FlightSnapshot {
+            env: Some(env),
+            vessels: Vec::new(),
+        });
+        let terrain = extract_pass(&mut world, &mut sched)
+            .terrain
+            .expect("the env gate built a terrain packet");
+        assert_eq!(
+            (terrain.uniforms.shadow, terrain.uniforms.atmo[2]),
+            ([0.0; 4], 0.0)
+        );
+    }
+
+    /// A rig over an ocean: Terrin's field at its authored amplitude on a
+    /// 600 km body, the datum on the body's radius, no spin, no craft.
+    /// Returns the rig, the environment, the level frame and the radius of
+    /// the surface under +X as the extract samples it, with the bake
+    /// landed. A bevy world lends one resource out at a time, so the
+    /// cache leaves for that sample and goes straight back.
+    fn ocean_rig() -> (bevy_ecs::world::World, Schedule, FlightEnv, LevelFrame, f64) {
+        let r = 600_000.0;
+        let env = FlightEnv {
+            body_center: DVec3::ZERO,
+            radius_m: r,
+            atm_top_m: 0.0,
+            atm_scale_height_m: 0.0,
+            mu_m3_per_s2: 1.0,
+            body: Some(csp_data::BodyId::from("sea")),
+            sun_dir: DVec3::new(0.8, 0.6, 0.0),
+            spin_axis: DVec3::Z,
+            spin_phase: 0.0,
+            body_spin: DVec3::ZERO,
+        };
+        let sea = TerrainConfig {
+            bodies: std::collections::BTreeMap::from([(
+                "sea".to_owned(),
+                crate::terrain::TerrainBody {
+                    seed: 601,
+                    amplitude_m: 3_600.0,
+                    profile: csp_core::terrain::ReliefProfile::Legacy,
+                    ocean_datum_m: Some(r),
+                    biome: None,
+                },
+            )]),
+            ..TerrainConfig::default()
+        };
+        let level = level_frame(DVec3::X * r, Some(DVec3::ZERO), DVec3::Z);
+        let nowhere = chase_camera(DVec3::X * (r + 50.0), DVec3::X * r, &level, (320.0, 240.0));
+        let (mut world, mut sched) = extract_rig(
+            FlightSnapshot {
+                env: Some(env.clone()),
+                vessels: Vec::new(),
+            },
+            nowhere,
+        );
+        world.insert_resource(sea);
+        waited_pass(&mut world, &mut sched);
+        let mut cache = world
+            .remove_resource::<TerrainCache>()
+            .expect("the terrain cache is installed");
+        let cfg = world.resource::<TerrainConfig>();
+        let floor_r = crate::terrain::surface_floor_radius(cfg, &mut cache, &env, DVec3::X);
+        world.insert_resource(cache);
+        (world, sched, env, level, floor_r)
+    }
+
+    /// The ground-contact dust ring of a craft resting on the seabed sits
+    /// on the seabed — 0.3 m over it, seen through the water — not on the
+    /// ocean's surface above. A craft in contact where Terrin's field lies
+    /// deep under the datum gets its ring's every vertex 0.3 m over that
+    /// ground, as far under the surface as it is, and the vertices carry
+    /// their place relative to the eye, by which `flight.wgsl` measures
+    /// the water in front of them. Run through `extract_rig`'s real
+    /// Schedule, with the bake landed.
+    #[test]
+    fn the_dust_ring_of_a_craft_on_the_seabed_sits_on_the_seabed() {
+        let (mut world, mut sched, env, level, floor_r) = ocean_rig();
+        let r = env.radius_m;
+        assert!(
+            floor_r < r - 50.0,
+            "the scene needs a seabed: the surface under +X is {:.1} m over the datum",
+            floor_r - r
+        );
+
+        let com = DVec3::X * (floor_r + 2.0);
+        let mut body = bare_body(7, false);
+        body.pos = com;
+        body.com = com;
+        body.contact = true;
+        // The camera 12 m from the craft, looking down at it.
+        let eye = com + level.dir(0.7, 0.25) * 12.0;
+        world.insert_resource(FlightSnapshot {
+            env: Some(env),
+            vessels: vec![body],
+        });
+        world.insert_resource(FlightCameraF64(chase_camera(
+            eye,
+            com,
+            &level,
+            (320.0, 240.0),
+        )));
+        let packet = extract_pass(&mut world, &mut sched);
+        let dust = |v: &csp_render::flight::FlightVertex| {
+            v.nrm == [0.0; 3] && v.color == [0.62, 0.55, 0.42, 0.35]
+        };
+        let ring: Vec<DVec3> = packet
+            .vertices
+            .iter()
+            .filter(|v| dust(v))
+            .map(|v| {
+                eye + DVec3::new(
+                    f64::from(v.world[0]),
+                    f64::from(v.world[1]),
+                    f64::from(v.world[2]),
+                )
+            })
+            .collect();
+        assert_eq!(ring.len(), 36, "the ring is twelve fan triangles");
+        let ring_centre = DVec3::X * (floor_r + EYE_GROUND_CLEARANCE_M);
+        for p in &ring {
+            // The rim leaves the sphere's tangent: 2.6² / 2R = 5.6 μm out.
+            close(
+                p.norm(),
+                floor_r + EYE_GROUND_CLEARANCE_M,
+                1.0e-4,
+                "a ring vertex's radius: on the seabed, not the surface",
+            );
+        }
+        let on_rim = ring
+            .iter()
+            .filter(|p| ((**p - ring_centre).norm() - 2.6).abs() <= 1.0e-5)
+            .count();
+        assert_eq!(on_rim, 24, "the fan's rim: two rim corners per triangle");
+        eprintln!(
+            "dust ring on the seabed: the surface under the craft {:.1} m under the datum, the ring {:.3} m under the ocean's",
+            r - floor_r,
+            r - ring_centre.norm()
+        );
     }
 
     // ==================== C1: extract geometry cache ================
@@ -5185,5 +8599,3962 @@ mod tests {
         );
         g.model_tris(&m, lo, DVec3::new(2.0, 1.0, 1.0));
         assert_eq!(g.model_bakes, 3, "a different fit AABB bakes");
+    }
+
+    /// §2.5's pose history ages by tick, not by frame. A vessel first
+    /// seen draws at its staged pose; across a one-tick step it draws
+    /// the remainder of the way; a frame that carried several ticks
+    /// draws across the whole span; a zero-tick frame keeps closing on
+    /// the same current pose and never passes it; a clock that went
+    /// backwards, or a vessel that left and returned, starts over; and
+    /// at remainder 0 every pose is the staged one, exactly.
+    #[test]
+    fn pose_history_advances_by_tick_not_by_frame() {
+        // Origin `x` metres along +X, CoM a metre above it.
+        let body = |x: f64| FlightBody {
+            pos: DVec3::new(x, 0.0, 0.0),
+            com: DVec3::new(x, 0.0, 1.0),
+            ..bare_body(7, false)
+        };
+        let near = |a: DVec3, b: DVec3| assert!((a - b).norm() < 1e-9, "{a:?} vs {b:?}");
+        let mut h = PoseHistory::default();
+
+        let drawn = h.advance(&[body(10.0)], 100, 0.5);
+        assert_eq!(drawn, vec![DrawnPose::staged(&body(10.0))]);
+
+        // Tick 101, a quarter past it: a quarter of the 100 → 101 step.
+        let drawn = h.advance(&[body(10.4)], 101, 0.25)[0];
+        near(drawn.pos, DVec3::new(10.1, 0.0, 0.0));
+        near(drawn.com, DVec3::new(10.1, 0.0, 1.0));
+
+        // A frame that carried four ticks (×4 warp at 60 fps): the span
+        // is 101 → 105 and the drawn instant `(105 − 1) + 0.5`, so
+        // 3.5 of the 4 ticks across.
+        let drawn = h.advance(&[body(12.0)], 105, 0.5)[0];
+        near(drawn.pos, DVec3::new(10.4 + 1.6 * 0.875, 0.0, 0.0));
+
+        // A zero-tick frame: the same tick restaged, the remainder
+        // grown — still closing on tick 105's pose.
+        let drawn = h.advance(&[body(12.0)], 105, 0.75)[0];
+        near(drawn.pos, DVec3::new(10.4 + 1.6 * 0.9375, 0.0, 0.0));
+        // The largest remainder there is stops short of it — to within
+        // a rounding step of the arithmetic.
+        let drawn = h.advance(&[body(12.0)], 105, 1.0 - f64::EPSILON)[0];
+        assert!(
+            drawn.pos.x > 11.99 && drawn.pos.x <= 12.0,
+            "{}",
+            drawn.pos.x
+        );
+
+        // Remainder 0: the staged pose, bit for bit.
+        assert_eq!(
+            h.advance(&[body(12.0)], 106, 0.0)[0],
+            DrawnPose::staged(&body(12.0))
+        );
+
+        // The clock went backwards — a world restored at an earlier
+        // tick: the samples describe a discarded timeline.
+        let drawn = h.advance(&[body(3.0)], 90, 0.5)[0];
+        assert_eq!(drawn, DrawnPose::staged(&body(3.0)));
+
+        // A vessel absent for a frame has left the path.
+        assert!(h.advance(&[], 91, 0.5).is_empty());
+        let drawn = h.advance(&[body(3.1)], 92, 0.5)[0];
+        assert_eq!(drawn, DrawnPose::staged(&body(3.1)));
+    }
+
+    /// The drawn rotation is a unit rotation on the shorter arc between
+    /// its endpoints — `q` and `−q` are the same rotation, so the
+    /// negated end pose is not the long way round — exact at both ends
+    /// and half-way between them at the middle.
+    #[test]
+    fn rot_between_takes_the_shortest_arc() {
+        // The same rotation, to the last digit — whichever sign each
+        // quaternion carries.
+        let same = |a: DQuat, b: DQuat| {
+            let flip = if a.dot(b) < 0.0 { -1.0 } else { 1.0 };
+            assert!(
+                [
+                    a.x * flip - b.x,
+                    a.y * flip - b.y,
+                    a.z * flip - b.z,
+                    a.w * flip - b.w
+                ]
+                .iter()
+                .all(|d| d.abs() < 1e-12),
+                "{a:?} vs {b:?}"
+            );
+        };
+        let q0 = DQuat::from_axis_angle(DVec3::new(0.3, -0.5, 0.8), 0.4);
+        let q1 = DQuat::from_axis_angle(DVec3::new(0.3, -0.5, 0.8), 0.5);
+        let neg = DQuat::new(-q1.x, -q1.y, -q1.z, -q1.w);
+        let mid = DQuat::from_axis_angle(DVec3::new(0.3, -0.5, 0.8), 0.45);
+        for end in [q1, neg] {
+            same(rot_between(q0, end, 0.0), q0);
+            same(rot_between(q0, end, 1.0), end);
+            same(rot_between(q0, end, 0.5), mid);
+            assert!((rot_between(q0, end, 0.3).norm() - 1.0).abs() < 1e-12);
+        }
+    }
+
+    // --- Chase camera (terrain-overhaul 3.2) --------------------------
+
+    /// A chase frame in deep space — no body, so no floor — for vessel
+    /// `id` at the origin, no canopy over it.
+    fn space_frame(id: u64, radius_m: f64, dt_ms: f64) -> ChaseFrame {
+        ChaseFrame {
+            id,
+            com: DVec3::ZERO,
+            radius_m,
+            canopy_m: 0.0,
+            centre: None,
+            axis: DVec3::Z,
+            dt_wall_ms: dt_ms,
+        }
+    }
+
+    fn no_floor(_: DVec3) -> f64 {
+        f64::NEG_INFINITY
+    }
+
+    /// `input` came to rest on vessel `id` at the origin last frame, so a
+    /// frame for `id` keeps its zoom instead of framing.
+    fn held(input: &mut FlightInput, id: u64) {
+        input.travel.last = Some(Last {
+            id,
+            anchor: DVec3::ZERO,
+            look_at: DVec3::ZERO,
+            skirt: DVec3::ZERO,
+            eye: DVec3::ZERO,
+            carried: DVec3::ZERO,
+            moved_m: None,
+            travelled: 0.0,
+        });
+    }
+
+    /// A camera that holds a vessel of radius 2 m at a set distance.
+    fn camera_at(distance_m: f64) -> FlightInput {
+        let mut input = FlightInput::default();
+        input.set_distance(distance_m);
+        input
+    }
+
+    fn close(actual: f64, want: f64, tol: f64, what: &str) {
+        assert!(
+            (actual - want).abs() <= tol,
+            "{what}: {actual} vs {want} (tol {tol})"
+        );
+    }
+
+    /// R9: the render gates place the camera by setting its distance
+    /// directly. That sets the current AND the target distance, so no
+    /// frame eases it toward anything; an unusable value changes nothing.
+    #[test]
+    fn a_directly_set_distance_is_current_and_target() {
+        let mut input = FlightInput::default();
+        assert_eq!(
+            (input.distance_m(), input.distance_target_m()),
+            (60.0, 60.0)
+        );
+        input.set_distance(300.0);
+        assert_eq!(
+            (input.distance_m(), input.distance_target_m()),
+            (300.0, 300.0)
+        );
+        // The gates set it before the first focus and hand over no
+        // frame time: the first focus frames the target, the eye stays.
+        step_chase_camera(&mut input, &space_frame(1, 10.0, 0.0), &mut no_floor);
+        assert_eq!(input.distance_m(), 300.0);
+        // On a held focus with frame time flowing, nothing eases either.
+        input.set_distance(300.0);
+        let cam = step_chase_camera(&mut input, &space_frame(1, 10.0, 16.0), &mut no_floor);
+        assert_eq!(input.distance_m(), 300.0);
+        assert_eq!(input.distance_target_m(), 300.0);
+        assert_eq!(cam.distance_m, 300.0);
+        for unusable in [f64::NAN, f64::INFINITY, 0.0, -5.0] {
+            input.set_distance(unusable);
+        }
+        assert_eq!(input.distance_m(), 300.0);
+        assert_eq!(input.distance_target_m(), 300.0);
+    }
+
+    /// R2: the wheel moves the target and the distance closes on it with
+    /// an 80 ms half-life — the share closed depends on wall time alone,
+    /// so 30, 60 and 144 fps land on the same figure and no frame steps
+    /// past the target. After 8 1/3 half-lives (2/3 s) 0.31 % is left;
+    /// after 6 1/4 (1/2 s) 1.33 % still is, so the 1 % bound has teeth.
+    #[test]
+    fn zoom_eases_with_an_80_ms_half_life_at_any_frame_rate() {
+        for (fps, at_half_s, at_two_thirds_s) in [(30.0, 15, 20), (60.0, 30, 40), (144.0, 72, 96)] {
+            for (start, target) in [(60.0, 20.0), (20.0, 300.0)] {
+                let mut input = camera_at(start);
+                held(&mut input, 1);
+                input.distance_target_m = target;
+                let dt_ms = 1000.0 / fps;
+                let share = ease_fraction(dt_ms / 1000.0, EASE_HALF_LIFE_S);
+                let mut left_at_half_s = f64::NAN;
+                for frame in 1..=at_two_thirds_s {
+                    let before = input.distance_m();
+                    step_chase_camera(&mut input, &space_frame(1, 0.0, dt_ms), &mut no_floor);
+                    let now = input.distance_m();
+                    let closed = (now - before) * (target - start).signum();
+                    assert!(closed > 0.0, "{fps} fps, frame {frame}: stalled");
+                    assert!(
+                        (now - target) * (start - target) > 0.0,
+                        "{fps} fps, frame {frame}: overshot the target"
+                    );
+                    // Each frame closes exactly its share of what was left.
+                    close(
+                        closed,
+                        share * (before - target).abs(),
+                        1.0e-9,
+                        "frame step",
+                    );
+                    let left = (now - target).abs() / (start - target).abs();
+                    if frame == at_half_s {
+                        left_at_half_s = left;
+                    }
+                }
+                let left = (input.distance_m() - target).abs() / (start - target).abs();
+                close(left, 2.0_f64.powf(-25.0 / 3.0), 1.0e-9, "2/3 s: share left");
+                close(
+                    left_at_half_s,
+                    2.0_f64.powf(-6.25),
+                    1.0e-9,
+                    "1/2 s: share left",
+                );
+                assert!(left < 0.01, "{fps} fps: {left} left after 2/3 s");
+                assert!(left_at_half_s > 0.01, "{fps} fps: 1/2 s is too early");
+            }
+        }
+    }
+
+    /// R3/R4: a vessel frames at four bounding radii the frame it takes
+    /// the focus — first focus or change — clamped between 3 m (or 1.5
+    /// radii, for a craft that big) and 1e6 m. The distance the camera
+    /// is AT does not snap with it: the next frame eases from where it
+    /// was.
+    #[test]
+    fn a_focus_frames_at_four_radii_clamped_to_the_limits() {
+        assert_eq!(min_distance(0.0), 3.0);
+        assert_eq!(min_distance(1.9), 3.0);
+        assert_eq!(min_distance(10.0), 15.0);
+        assert_eq!(frame_distance(10.0), 40.0);
+        assert_eq!(frame_distance(0.5), 3.0);
+        assert_eq!(frame_distance(1.0e7), MAX_DISTANCE_M);
+        assert_eq!(min_distance(f64::INFINITY), MAX_DISTANCE_M);
+        assert_eq!(min_distance(f64::NAN), 3.0);
+
+        let mut input = camera_at(3.0);
+        step_chase_camera(&mut input, &space_frame(2, 10.0, 0.0), &mut no_floor);
+        assert_eq!(input.distance_target_m(), 40.0);
+        assert_eq!(input.distance_m(), 3.0, "no frame time: nothing moves");
+        step_chase_camera(
+            &mut input,
+            &space_frame(2, 10.0, 1000.0 / 60.0),
+            &mut no_floor,
+        );
+        close(
+            input.distance_m(),
+            3.0 + 37.0 * ease_fraction(1.0 / 60.0, EASE_HALF_LIFE_S),
+            1.0e-9,
+            "eased",
+        );
+        // A focus change reframes again — a kept zoom never carries over.
+        held(&mut input, 2);
+        step_chase_camera(&mut input, &space_frame(3, 2.0, 0.0), &mut no_floor);
+        assert_eq!(input.distance_target_m(), 8.0);
+        // The same vessel keeps its zoom: only a change reframes.
+        step_chase_camera(&mut input, &space_frame(3, 2.0, 0.0), &mut no_floor);
+        assert_eq!(input.distance_target_m(), 8.0);
+        input.distance_target_m = 1.0;
+        step_chase_camera(&mut input, &space_frame(3, 2.0, 0.0), &mut no_floor);
+        assert_eq!(
+            input.distance_target_m(),
+            3.0,
+            "the floor holds every frame"
+        );
+    }
+
+    /// A canopy opening over the craft the camera already holds frames
+    /// as a focus change would — craft and canopy together at four
+    /// radii — once, on the frame it appears, and only outward: a player
+    /// already further out keeps their view, and the wheel is theirs
+    /// again after it.
+    #[test]
+    fn a_canopy_opening_backs_the_eye_off_to_frame_craft_and_canopy() {
+        let mut frame = space_frame(7, 3.5, 0.0);
+        // A craft framed close, its zoom kept — then its canopy opens.
+        let mut input = camera_at(14.0);
+        held(&mut input, 7);
+        step_chase_camera(&mut input, &frame, &mut no_floor);
+        assert_eq!(
+            input.distance_target_m(),
+            14.0,
+            "no canopy: the zoom is kept"
+        );
+        frame.canopy_m = 26.0;
+        step_chase_camera(&mut input, &frame, &mut no_floor);
+        assert_eq!(
+            input.distance_target_m(),
+            104.0,
+            "framed over the canopy: four of its radii"
+        );
+        // Once: the wheel's zoom after it stands while the canopy stays
+        // open.
+        input.set_distance(60.0);
+        step_chase_camera(&mut input, &frame, &mut no_floor);
+        assert_eq!(
+            input.distance_target_m(),
+            60.0,
+            "a steady canopy does not frame again"
+        );
+        // A player already further out is left where they are.
+        let mut far = camera_at(300.0);
+        held(&mut far, 7);
+        step_chase_camera(&mut far, &space_frame(7, 3.5, 0.0), &mut no_floor);
+        step_chase_camera(&mut far, &frame, &mut no_floor);
+        assert_eq!(far.distance_target_m(), 300.0, "the framing only backs off");
+        // A craft that takes the focus with its canopy already open is
+        // framed over it too — and that framing is the change's, not a
+        // second one.
+        let mut fresh = camera_at(14.0);
+        held(&mut fresh, 3);
+        step_chase_camera(&mut fresh, &frame, &mut no_floor);
+        assert_eq!(fresh.distance_target_m(), 104.0, "framed over the canopy");
+        fresh.set_distance(60.0);
+        step_chase_camera(&mut fresh, &frame, &mut no_floor);
+        assert_eq!(fresh.distance_target_m(), 60.0, "the change framed it once");
+        // And the eye eases to it as to any target.
+        let mut easing = camera_at(14.0);
+        held(&mut easing, 7);
+        step_chase_camera(&mut easing, &space_frame(7, 3.5, 0.0), &mut no_floor);
+        frame.dt_wall_ms = 1000.0 / 60.0;
+        step_chase_camera(&mut easing, &frame, &mut no_floor);
+        close(
+            easing.distance_m(),
+            14.0 + 90.0 * ease_fraction(1.0 / 60.0, EASE_HALF_LIFE_S),
+            1.0e-9,
+            "eased",
+        );
+    }
+
+    /// The reach the camera frames a canopy by is the whole canopy's,
+    /// whatever its row is staged at. A row first shows at 2/96, and
+    /// framed by that it would be a bud's reach: the dome would open
+    /// past the frame. Hung over the Stock Hopper's axis point with the
+    /// CoM 3.07 m below it, the canopy reaches from its apex and from
+    /// its rim alike — and the same at every inflation.
+    #[test]
+    fn a_canopy_is_framed_by_its_whole_reach_from_its_first_tick() {
+        let r = (700.0 / core::f64::consts::PI).sqrt();
+        let com = DVec3::new(0.0, 0.0, -3.07);
+        let whole = test_canopy(7, 1.0).reach_m(com);
+        assert!(
+            whole >= (CANOPY_LINES + CANOPY_HEIGHT) * r + 3.07,
+            "{whole}"
+        );
+        assert!(whole >= ((r + 3.07).powi(2) + r.powi(2)).sqrt(), "{whole}");
+        for inflation in [2.0 / 96.0, 0.02, 0.5] {
+            close(
+                test_canopy(7, inflation).reach_m(com),
+                whole,
+                1.0e-9,
+                "the staged inflation does not reach",
+            );
+        }
+        // Drawn, the same row is its inflation's size.
+        close(
+            test_canopy(7, 2.0 / 96.0).radius_m(),
+            r * 2.0 / 96.0,
+            1.0e-12,
+            "drawn at the staged inflation",
+        );
+    }
+
+    /// R1/R6 through the Input schedule: an orbit event changes yaw and
+    /// pitch by exactly its deltas — nothing smooths a drag — and pitch
+    /// stops at ±89°. R2: a wheel event moves only the TARGET distance,
+    /// held to 3 m…1e6 m.
+    #[test]
+    fn events_follow_the_pointer_and_the_wheel_moves_only_the_target() {
+        let drain = |events: Vec<FlightEvent>| -> FlightInput {
+            let mut world = bevy_ecs::world::World::new();
+            world.insert_resource(FlightInputEvents { pending: events });
+            world.insert_resource(FlightInput::default());
+            let mut sched = Schedule::default();
+            sched.add_systems(apply_flight_input);
+            sched.run(&mut world);
+            world
+                .remove_resource::<FlightInput>()
+                .expect("the camera state is a resource")
+        };
+        let (dyaw, dpitch) = (0.0137, -0.0221);
+        let input = drain(vec![FlightEvent::Orbit { dyaw, dpitch }]);
+        assert_eq!((input.yaw, input.pitch), (0.7 + dyaw, 0.25 + dpitch));
+        let input = drain(vec![FlightEvent::Orbit {
+            dyaw: 0.0,
+            dpitch: 10.0,
+        }]);
+        assert_eq!(input.pitch, PITCH_LIMIT);
+        close(PITCH_LIMIT.to_degrees(), 89.0, 1.0e-9, "the pitch limit");
+        let input = drain(vec![FlightEvent::Orbit {
+            dyaw: 0.0,
+            dpitch: -10.0,
+        }]);
+        assert_eq!(input.pitch, -PITCH_LIMIT);
+
+        let input = drain(vec![FlightEvent::Zoom { factor: 0.05 }]);
+        assert_eq!(input.distance_target_m(), 3.0);
+        assert_eq!(
+            input.distance_m(),
+            60.0,
+            "the wheel does not move the camera"
+        );
+        let input = drain(vec![
+            FlightEvent::Zoom { factor: 1.0e9 },
+            FlightEvent::Zoom { factor: f64::NAN },
+        ]);
+        assert_eq!(input.distance_target_m(), MAX_DISTANCE_M);
+    }
+
+    /// A test body: centred at the origin, 600 km radius, spinning about
+    /// +Z. A craft whose CoM is `height_m` above the ground sits on +X,
+    /// so its local up is +X, north +Z and east +Y.
+    const BODY_R: f64 = 600_000.0;
+
+    fn landed(height_m: f64) -> (DVec3, LevelFrame) {
+        let anchor = DVec3::new(BODY_R + height_m, 0.0, 0.0);
+        let level = level_frame(anchor, Some(DVec3::ZERO), DVec3::Z);
+        (anchor, level)
+    }
+
+    fn flat_floor(_: DVec3) -> f64 {
+        BODY_R + EYE_GROUND_CLEARANCE_M
+    }
+
+    fn orbit(yaw: f64, pitch: f64, distance_m: f64) -> Orbit {
+        Orbit {
+            yaw,
+            pitch,
+            distance_m,
+        }
+    }
+
+    /// A chase frame on the test body for a craft of bounding radius
+    /// `radius_m` whose CoM is `com`.
+    fn craft_frame(id: u64, com: DVec3, radius_m: f64, dt_ms: f64) -> ChaseFrame {
+        ChaseFrame {
+            id,
+            com,
+            radius_m,
+            canopy_m: 0.0,
+            centre: Some(DVec3::ZERO),
+            axis: DVec3::Z,
+            dt_wall_ms: dt_ms,
+        }
+    }
+
+    /// A chase frame on the test body for a craft of bounding radius
+    /// 3 m whose CoM is `com`.
+    fn body_frame(id: u64, com: DVec3, dt_ms: f64) -> ChaseFrame {
+        craft_frame(id, com, 3.0, dt_ms)
+    }
+
+    /// A craft as high as one on +X, a chord of `d0_m` from it along
+    /// the equator — for a long chord the straight line between the two
+    /// crosses the planet.
+    fn neighbour(d0_m: f64) -> DVec3 {
+        let r = BODY_R + 5.0;
+        let half = (d0_m / (2.0 * r)).asin();
+        r * DVec3::new((2.0 * half).cos(), (2.0 * half).sin(), 0.0)
+    }
+
+    /// The share of a `d0_m` travel that one frame of `dt_s` closes.
+    fn travel_share(d0_m: f64, dt_s: f64) -> f64 {
+        ease_fraction(dt_s, travel_half_life(d0_m))
+    }
+
+    /// Two solved cameras showing the same thing — to a tenth of a
+    /// micrometre, the round-trip of a planet-scale anchor through the
+    /// travel offset at the last digit.
+    fn same_view(a: &MapCameraF64, b: &MapCameraF64, what: &str) {
+        close(
+            (a.eye - b.eye).norm(),
+            0.0,
+            1.0e-9,
+            &format!("{what}: the eye moved"),
+        );
+        for (x, y) in a
+            .view_proj
+            .iter()
+            .flatten()
+            .zip(b.view_proj.iter().flatten())
+        {
+            close(*x, *y, 1.0e-12, &format!("{what}: the view turned"));
+        }
+    }
+
+    /// R5: a landed craft, its CoM 5 m up on flat ground. A level orbit
+    /// puts the eye exactly at the CoM's height and a downward drag
+    /// takes it below — to 1.454 m over the ground here. Above the
+    /// floor the eye IS the intent's orbit point.
+    #[test]
+    fn a_landed_craft_is_seen_from_its_own_height_and_below() {
+        let (anchor, level) = landed(5.0);
+        let (level_view, lifted) = solve_orbit(
+            &orbit(0.0, 0.0, 12.0),
+            anchor,
+            &level,
+            DVec3::ZERO,
+            &mut flat_floor,
+        );
+        assert!(!lifted, "nothing lifts a level eye");
+        assert_eq!(level_view, anchor + DVec3::Z * 12.0);
+        let (below, lifted) = solve_orbit(
+            &orbit(0.0, -0.3, 12.0),
+            anchor,
+            &level,
+            DVec3::ZERO,
+            &mut flat_floor,
+        );
+        assert!(!lifted, "above the floor, nothing lifts the eye");
+        assert_eq!(
+            below,
+            anchor + level.dir(0.0, -0.3) * 12.0,
+            "above the floor, the eye is exactly where the angles put it"
+        );
+        close(below.x - BODY_R, 1.4538, 1.0e-3, "height over the ground");
+        assert!(below.x < anchor.x, "the eye is below the craft's CoM");
+    }
+
+    /// How far the eye rides the floor sideways from the point under the
+    /// craft: the craft's CoM `com_r` from the body centre, the eye
+    /// asked `distance_m` out at `pitch` — the asked point's sideways
+    /// offset `d·cos(pitch)`, scaled by its own lift onto the floor at
+    /// `floor_r`.
+    fn sideways_m(com_r: f64, floor_r: f64, distance_m: f64, pitch: f64) -> f64 {
+        let (sideways, up) = (distance_m * pitch.cos(), distance_m * pitch.sin());
+        sideways * floor_r / ((com_r + up).powi(2) + sideways * sideways).sqrt()
+    }
+
+    /// R6 at the solver: dragged under the ground the eye rides the
+    /// floor — the asked point itself lifted radially onto it, 0.3 m
+    /// over the ground and as far from the point under the craft as the
+    /// asked point's sideways offset. From there a rising pitch slides
+    /// the eye away from that point and a falling one toward it; nothing
+    /// is rewritten, since the solve hands back an eye and nothing else.
+    #[test]
+    fn under_the_ground_the_eye_rides_the_floor() {
+        let (anchor, level) = landed(5.0);
+        let floor_r = BODY_R + EYE_GROUND_CLEARANCE_M;
+        let solve = |pitch: f64| {
+            solve_orbit(
+                &orbit(0.0, pitch, 12.0),
+                anchor,
+                &level,
+                DVec3::ZERO,
+                &mut flat_floor,
+            )
+            .0
+        };
+        let sideways = |pitch: f64| sideways_m(anchor.norm(), floor_r, 12.0, pitch);
+        let pinned = solve(-0.5);
+        close(pinned.norm(), floor_r, 1.0e-9, "riding the floor");
+        close(
+            pinned.z,
+            sideways(-0.5),
+            1.0e-9,
+            "sideways from the point under the craft",
+        );
+        close(
+            pinned.z,
+            10.53101,
+            1.0e-5,
+            "sideways from the point under the craft",
+        );
+
+        // The pitch rising to −0.49: the eye slides AWAY, along the floor.
+        let up = solve(-0.49);
+        close(up.norm(), floor_r, 1.0e-9, "still on the floor");
+        close(
+            (up - pinned).norm(),
+            sideways(-0.49) - sideways(-0.5),
+            1.0e-9,
+            "a rising pitch slides the eye away",
+        );
+        close(
+            (up - pinned).norm(),
+            0.05700,
+            1.0e-5,
+            "a rising pitch slides the eye away",
+        );
+        // The pitch falling to −0.51: the eye slides TOWARD the point under
+        // the craft — it no longer holds.
+        let down = solve(-0.51);
+        close(down.norm(), floor_r, 1.0e-9, "still on the floor");
+        close(
+            (down - pinned).norm(),
+            sideways(-0.5) - sideways(-0.51),
+            1.0e-9,
+            "a falling pitch slides the eye toward the point under the craft",
+        );
+        close(
+            (down - pinned).norm(),
+            0.05805,
+            1.0e-5,
+            "a falling pitch slides the eye toward the point under the craft",
+        );
+
+        // Walking the pitch up across the floor: the asked point reaches
+        // it at −0.4024 rad. Under it the eye is exactly on the floor,
+        // over it exactly the asked point, and no step moves the eye
+        // further than it moved the asked point.
+        let crossing = ((floor_r - anchor.norm()) / 12.0).asin();
+        close(
+            crossing,
+            -0.40244,
+            1.0e-5,
+            "where the asked point reaches the floor",
+        );
+        let mut previous = solve(crossing - 0.01);
+        let asked_step = 12.0 * 2.0 * (5.0e-5_f64).sin();
+        for step in 1..=200 {
+            let pitch = crossing - 0.01 + f64::from(step) * 1.0e-4;
+            let (eye, lifted) = solve_orbit(
+                &orbit(0.0, pitch, 12.0),
+                anchor,
+                &level,
+                DVec3::ZERO,
+                &mut flat_floor,
+            );
+            let asked = anchor + level.dir(0.0, pitch) * 12.0;
+            let moved = (eye - previous).norm();
+            assert!(moved > 0.0, "pitch {pitch}: the drag did not move the eye");
+            assert!(
+                moved <= asked_step * 1.000_001,
+                "pitch {pitch}: the eye moved {moved} m for a drag of {asked_step} m"
+            );
+            if asked.norm() >= floor_r {
+                assert!(!lifted, "pitch {pitch}: over the floor");
+                assert_eq!(eye, asked, "pitch {pitch}: over the floor");
+            } else {
+                assert!(lifted, "pitch {pitch}: under the floor");
+                close(
+                    eye.norm(),
+                    floor_r,
+                    1.0e-9,
+                    &format!("pitch {pitch}: under the floor"),
+                );
+            }
+            previous = eye;
+        }
+    }
+
+    /// R5 on a hillside: the floor is the ground under the EYE, not the
+    /// highest ground around it. The craft lies on a 20 % slope with a
+    /// 2 000 m ridge 3 km downhill; the eye looks downhill, where a
+    /// neighbourhood ceiling would lift it kilometres. It rides its own
+    /// ground instead: 0.3 m over it, wherever the ground is.
+    #[test]
+    fn on_a_slope_the_eye_follows_its_own_ground_not_the_ridge_above() {
+        let (anchor, level) = landed(5.0);
+        // Height over the datum along the slope (`y` = metres east),
+        // with the ridge spanning 3…5 km west of the craft.
+        let ground = |dir: DVec3| {
+            let y = dir.y * BODY_R;
+            BODY_R + 0.2 * y + 2000.0 * (1.0 - (y + 4000.0).abs() / 1000.0).max(0.0)
+        };
+        let mut floor = |dir: DVec3| ground(dir) + EYE_GROUND_CLEARANCE_M;
+        let mut solve = |pitch: f64| {
+            solve_orbit(
+                &orbit(-core::f64::consts::FRAC_PI_2, pitch, 12.0),
+                anchor,
+                &level,
+                DVec3::ZERO,
+                &mut floor,
+            )
+            .0
+        };
+        let over_own_ground = |eye: DVec3| {
+            let r = eye.norm();
+            r - ground(eye / r)
+        };
+        assert_eq!(
+            ground(DVec3::X),
+            BODY_R,
+            "the craft's ground is on the datum"
+        );
+        // Looking 11° down: the eye is above the floor and stays exactly
+        // where the angles put it — 4.96 m over its own ground.
+        let free = solve(-0.2);
+        assert_eq!(
+            free,
+            anchor + level.dir(-core::f64::consts::FRAC_PI_2, -0.2) * 12.0,
+            "above the floor, the eye is exactly where the angles put it"
+        );
+        close(
+            over_own_ground(free),
+            4.965,
+            1.0e-2,
+            "free eye over its ground",
+        );
+        // Looking 34° down: the floor catches it. The asked point is
+        // lifted radially onto the floor sampled under the point ITSELF,
+        // so the eye ends 0.3 m over its own ground — to the last digit.
+        let pinned = solve(-0.6);
+        close(
+            over_own_ground(pinned),
+            EYE_GROUND_CLEARANCE_M,
+            1.0e-9,
+            "lifted onto its own ground",
+        );
+        assert!(
+            pinned.norm() < BODY_R + 100.0,
+            "the ridge 3 km away must not lift the eye; it sits {} m up",
+            pinned.norm() - BODY_R
+        );
+        // From there the pitch falling further slides the eye along that
+        // ground toward the point under the craft; it does not hold.
+        let further = solve(-0.62);
+        close(
+            over_own_ground(further),
+            EYE_GROUND_CLEARANCE_M,
+            1.0e-9,
+            "still riding its own ground",
+        );
+        let slid = (further - pinned).norm();
+        assert!(
+            (0.13..=0.15).contains(&slid),
+            "a falling pitch slid the eye {slid} m"
+        );
+    }
+
+    /// R5: a capsized craft, its CoM 1 m up, can be viewed level — on a
+    /// dry body and at an ocean's waterline alike, because the floor is
+    /// 0.3 m over the ground — and, 0.5 m up, from below its CoM.
+    #[test]
+    fn a_capsized_craft_can_be_viewed_level() {
+        let (anchor, level) = landed(1.0);
+        let datum_ground = |_: DVec3| BODY_R;
+        let mut shore = move |dir: DVec3| eye_floor(datum_ground(dir));
+        let (view, lifted) = solve_orbit(
+            &orbit(0.0, 0.0, 10.0),
+            anchor,
+            &level,
+            DVec3::ZERO,
+            &mut shore,
+        );
+        assert!(!lifted, "nothing lifts a level eye");
+        assert_eq!(view, anchor + level.dir(0.0, 0.0) * 10.0);
+        close(view.x, anchor.x, 1.0e-9, "level with the CoM");
+        close(view.norm() - BODY_R, 1.0, 1.0e-3, "height over the ground");
+        let (below, lifted) = solve_orbit(
+            &orbit(0.0, -0.05, 10.0),
+            anchor,
+            &level,
+            DVec3::ZERO,
+            &mut shore,
+        );
+        assert!(!lifted, "nothing lifts this one either");
+        assert_eq!(below, anchor + level.dir(0.0, -0.05) * 10.0);
+        close(
+            below.norm() - BODY_R,
+            1.0 - 10.0 * 0.05_f64.sin(),
+            1.0e-3,
+            "height over the ground, below the CoM",
+        );
+    }
+
+    /// The floor is 0.3 m over the ground: on land, at the waterline, and
+    /// under an ocean's surface, where it keeps the eye down to the
+    /// seabed. Walking the ground from 2 m above the datum to 4 m below,
+    /// the floor moves exactly as the ground does — no cliff, no ramp, at
+    /// the waterline.
+    #[test]
+    fn the_floor_is_the_ground_on_land_and_under_water() {
+        let r = BODY_R;
+        close(eye_floor(r + 40.0), r + 40.3, 1.0e-6, "land");
+        close(eye_floor(r), r + 0.3, 1.0e-6, "the waterline");
+        close(
+            eye_floor(r - 0.5),
+            r - 0.2,
+            1.0e-6,
+            "half a metre deep: under the surface",
+        );
+        close(
+            eye_floor(r - 3000.0),
+            r - 2999.7,
+            1.0e-6,
+            "3 000 m of water: 2 999.7 m under the surface",
+        );
+        for step in 0..=600 {
+            let ground = r + 2.0 - step as f64 * 0.01;
+            close(
+                eye_floor(ground),
+                ground + EYE_GROUND_CLEARANCE_M,
+                1.0e-9,
+                "the floor follows the ground",
+            );
+        }
+    }
+
+    /// Over water the eye goes under the surface, down to 0.3 m over the
+    /// seabed. A craft afloat with its CoM on the surface of 200 m of
+    /// water is framed at 300 m: dragged straight down, its eye is lifted
+    /// onto the seabed's floor — 199.7 m under the surface — and 30 m
+    /// under the surface at pitch −0.1 rad nothing lifts it at all. The
+    /// surface is no floor; the seabed is the land's rule.
+    #[test]
+    fn over_water_the_eye_goes_down_to_the_seabed() {
+        let com = DVec3::X * BODY_R;
+        let seabed_r = BODY_R - 200.0;
+        let frame = craft_frame(7, com, 1.0, 1000.0 / 60.0);
+        let level = level_frame(com, Some(DVec3::ZERO), DVec3::Z);
+        let seabed = |_: DVec3| seabed_r;
+        let mut floor = |dir: DVec3| eye_floor(seabed(dir));
+        let mut input = camera_at(300.0);
+        held(&mut input, 7);
+        input.yaw = 0.0;
+        input.pitch = -PITCH_LIMIT;
+        let down = step_chase_camera(&mut input, &frame, &mut floor);
+        close(
+            down.eye.norm(),
+            seabed_r + EYE_GROUND_CLEARANCE_M,
+            1.0e-9,
+            "dragged straight down, the eye is 0.3 m over the seabed",
+        );
+        close(
+            BODY_R - down.eye.norm(),
+            199.7,
+            1.0e-9,
+            "…and so this far under the surface",
+        );
+        input.pitch = -0.1;
+        let shallow = step_chase_camera(&mut input, &frame, &mut floor);
+        let asked = com + level.dir(0.0, -0.1) * 300.0;
+        close(
+            (shallow.eye - asked).norm(),
+            0.0,
+            1.0e-9,
+            "30 m under the surface, the eye is exactly where the angles put it",
+        );
+        assert!(
+            shallow.eye.norm() < BODY_R && shallow.eye.norm() > seabed_r + 1.0,
+            "the eye is under the surface and well over the seabed: {:.3} m under",
+            BODY_R - shallow.eye.norm()
+        );
+    }
+
+    /// R6 frame to frame, at 60 fps through the per-frame step, for a
+    /// craft whose CoM is 2 m up: dragged under the ground the eye rides
+    /// the floor 0.3 m over it and the stored pitch is the asked one. The
+    /// eye is below the craft's level there, so the slide runs the other
+    /// way round from a view from above: a drag that raises the pitch
+    /// (−0.48) slides the eye away from the point under the craft, and
+    /// the next frame's drag that lowers it slides it toward again —
+    /// each on the very next frame, by the drag's sideways share, each
+    /// reaching the pitch whole. A frame with no drag leaves both where
+    /// they are.
+    #[test]
+    fn a_pinned_camera_reverses_on_the_next_frame() {
+        let com = DVec3::new(BODY_R + 2.0, 0.0, 0.0);
+        let frame = ChaseFrame {
+            com,
+            centre: Some(DVec3::ZERO),
+            ..space_frame(7, 1.0, 1000.0 / 60.0)
+        };
+        let mut input = camera_at(10.0);
+        held(&mut input, 7);
+        input.yaw = 0.0;
+        input.pitch = -0.5;
+        let floor_r = BODY_R + EYE_GROUND_CLEARANCE_M;
+        let sideways = |pitch: f64| sideways_m(com.norm(), floor_r, 10.0, pitch);
+        let pinned = step_chase_camera(&mut input, &frame, &mut flat_floor);
+        assert_eq!(input.pitch, -0.5, "the floor rewrote the pitch");
+        close(pinned.eye.norm(), floor_r, 1.0e-9, "riding the floor");
+
+        // A raised pitch on the next frame (−0.48): the eye slides AWAY
+        // along the floor — 9.4 cm, the drag's sideways share of its 20 cm.
+        input.pitch = -0.48;
+        let up = step_chase_camera(&mut input, &frame, &mut flat_floor);
+        let slid = (up.eye - pinned.eye).norm();
+        close(
+            slid,
+            sideways(-0.48) - sideways(-0.5),
+            1.0e-9,
+            "a raised pitch slides the eye away",
+        );
+        close(slid, 0.09412, 1.0e-5, "a raised pitch slides the eye away");
+        assert!(
+            slid > 0.0 && slid <= 10.0 * 2.0 * (0.01_f64).sin() * 1.000_1,
+            "the eye moved {slid} m for a drag of {} m",
+            10.0 * 2.0 * (0.01_f64).sin()
+        );
+        close(up.eye.norm(), floor_r, 1.0e-9, "still on the floor");
+
+        // The pitch back down on the next frame (−0.5): slides toward
+        // the point under the craft, onto where it started.
+        input.pitch = -0.5;
+        let back = step_chase_camera(&mut input, &frame, &mut flat_floor);
+        assert_eq!((back.eye, back.view_proj), (pinned.eye, pinned.view_proj));
+
+        // Lower still (−0.52): the eye used to hold here, dead. It slides
+        // on toward the point under the craft, and the drag reaches the
+        // pitch whole.
+        input.pitch = -0.52;
+        let down = step_chase_camera(&mut input, &frame, &mut flat_floor);
+        let slid = (down.eye - back.eye).norm();
+        close(
+            slid,
+            sideways(-0.5) - sideways(-0.52),
+            1.0e-9,
+            "a falling pitch slides the eye toward the point under the craft",
+        );
+        close(
+            slid,
+            0.09763,
+            1.0e-5,
+            "a falling pitch slides the eye toward the point under the craft",
+        );
+        assert_eq!(input.pitch, -0.52, "the drag reached the pitch whole");
+
+        // A frame with no drag leaves both where they are.
+        let still = step_chase_camera(&mut input, &frame, &mut flat_floor);
+        assert_eq!(
+            (still.eye, still.view_proj),
+            (down.eye, down.view_proj),
+            "stationary"
+        );
+    }
+
+    /// The starter craft's bounding radius as first measured on the
+    /// real pad, before it flew with its chute (M4c): 3.062 m — the
+    /// least distance 4.593 m — framed at 12.248 m. The synthetic
+    /// tests' stand-in; the shipped starter measures 3.329 m with the
+    /// canister on the pod's top node
+    /// (`on_the_real_pad_the_eye_goes_round_the_starter_craft`).
+    const STARTER_RADIUS_M: f64 = 3.062;
+
+    /// What [`sweep_the_zone`] saw.
+    struct Zone {
+        /// The pitch of the frame the eye entered the zone on (rad), and
+        /// how far out along the yaw's line its orbit point was on the
+        /// frame before and on that frame (m): the zone's edge lies
+        /// between the two.
+        entry: (f64, [f64; 2]),
+        /// The eye at the pitch limit.
+        at_limit: DVec3,
+        /// The least and the most the eye moved on any frame outside the
+        /// zone — the frame that entered it and the frame that left it
+        /// included (m).
+        moved_m: [f64; 2],
+        /// The most the eye moved on any frame inside the zone, and the
+        /// most that was for a metre of its orbit point's slide along the
+        /// floor (m).
+        inside_moved_m: [f64; 2],
+    }
+
+    /// One frame of a drag: the eye moved, by more than nothing and by no
+    /// more than the drag's own step, and never came nearer than `rmin` to
+    /// the craft's CoM. Returns the move (m).
+    fn dragged(
+        com: DVec3,
+        rmin: f64,
+        drag_step: f64,
+        eye: DVec3,
+        previous: DVec3,
+        what: &str,
+    ) -> f64 {
+        let moved = (eye - previous).norm();
+        assert!(moved > 0.0, "{what}: the drag did not move the eye");
+        assert!(
+            moved <= drag_step * 1.000_000_1,
+            "{what}: the eye moved {moved} m for a drag of {drag_step} m"
+        );
+        let to_com = (eye - com).norm();
+        assert!(
+            to_com >= rmin - SKIRT_PRECISION_M,
+            "{what}: the eye came {to_com} m from the CoM, inside the least distance {rmin}"
+        );
+        moved
+    }
+
+    /// How far a floor point is along the yaw's line from the point under
+    /// the craft — the rule's own measure: its angle from the vertical
+    /// through the CoM, times the floor's radius there. The body is
+    /// centred on the origin.
+    fn along_m(eye: DVec3, com: DVec3, along: DVec3, floor_r: f64) -> f64 {
+        let up = com / com.norm();
+        eye.dot(along).atan2(eye.dot(up)) * floor_r
+    }
+
+    /// The circle about a craft whose CoM is `com_r` from the body's
+    /// centre, on a level floor of radius `floor_r`: its angular radius,
+    /// where the floor is `rmin` from the CoM (rad).
+    fn zone_angle(com_r: f64, floor_r: f64, rmin: f64) -> f64 {
+        // From `1 − cos ρ`, which is all of two parts in 1e11 here: the
+        // law of cosines itself would cancel down to its last digits.
+        let sag = (rmin * rmin - (com_r - floor_r) * (com_r - floor_r)) / (2.0 * com_r * floor_r);
+        2.0 * (0.5 * sag).sqrt().asin()
+    }
+
+    /// What one frame of [`sweep_the_zone`] did.
+    struct Frame {
+        /// The orbit point is inside the zone.
+        inside: bool,
+        /// How far the eye moved (m).
+        moved: f64,
+        /// How far that was for a metre of the orbit point's slide, on a
+        /// frame that follows one inside the zone too (m).
+        pace: f64,
+    }
+
+    /// Hold one frame of [`sweep_the_zone`] to the rule and report it.
+    /// `shot` is the eye, its orbit point lifted and not kept out, and the
+    /// frame before's eye; `before` the orbit point's place along the
+    /// yaw's line on this frame and on the frame before, and whether it
+    /// was inside the zone then; `bounds` the drag's own step and the most
+    /// metres of eye a metre of slide may move inside the zone. Outside
+    /// the zone the eye is the orbit point itself; inside it the eye is on
+    /// the floor and exactly the least distance from the CoM. The eye
+    /// moves, by no more than the drag's own step unless the frame before
+    /// was inside the zone too.
+    fn zone_frame(
+        com: DVec3,
+        rmin: f64,
+        shot: (DVec3, DVec3, DVec3),
+        before: ([f64; 2], bool),
+        bounds: [f64; 2],
+        floor: &mut dyn FnMut(DVec3) -> f64,
+        what: &str,
+    ) -> Frame {
+        let (eye, point, previous) = shot;
+        let inside = (point - com).norm() < rmin;
+        let moved = (eye - previous).norm();
+        if inside {
+            close(
+                eye.norm() - floor(eye / eye.norm()),
+                0.0,
+                1.0e-9,
+                &format!("{what}: the eye is not on the floor"),
+            );
+            let to_com = (eye - com).norm();
+            assert!(
+                (-SKIRT_PRECISION_M..=1.0e-6).contains(&(to_com - rmin)),
+                "{what}: the eye is {to_com} m from the CoM, not on the least distance {rmin}"
+            );
+        } else {
+            assert_eq!(
+                eye, point,
+                "{what}: outside the zone, the eye is the lifted orbit point"
+            );
+        }
+        if inside && before.1 {
+            let slid = (before.0[0] - before.0[1]).abs();
+            assert!(moved > 0.0, "{what}: the drag did not move the eye");
+            let pace = moved / slid;
+            assert!(
+                pace <= bounds[1] * 1.000_001,
+                "{what}: the eye moved {moved} m inside the zone for a slide of {slid} m"
+            );
+            Frame {
+                inside,
+                moved,
+                pace,
+            }
+        } else {
+            dragged(com, rmin, bounds[0], eye, previous, what);
+            Frame {
+                inside,
+                moved,
+                pace: 0.0,
+            }
+        }
+    }
+
+    /// A vertical drag, in steps of 0.0025 rad, from the level down to the
+    /// pitch limit and back up again, about a craft of bounding radius
+    /// `radius_m` whose CoM is `com`, the eye held at `eye_m` and yaw
+    /// `yaw`, through the per-frame step on `floor` (the eye's least
+    /// radius from the body's centre, centred on the origin, along a
+    /// direction): what the least-distance rule did, and the eyes of the
+    /// way down. `pace` is the most metres of eye a metre of the orbit
+    /// point's slide may move inside the zone. Outside the zone the eye is
+    /// the lifted orbit point itself, on it; inside it the eye is on the
+    /// floor and exactly the least distance from the CoM. Every frame
+    /// moves; a frame that enters or leaves the zone moves no further than
+    /// the drag's own step, and a frame inside it no further than `pace`
+    /// times the orbit point's slide along the floor. The way up retraces
+    /// the way down, frame for frame.
+    fn sweep_the_zone(
+        com: DVec3,
+        radius_m: f64,
+        eye_m: f64,
+        yaw: f64,
+        pace: f64,
+        floor: &mut dyn FnMut(DVec3) -> f64,
+    ) -> (Zone, Vec<DVec3>) {
+        let centre = DVec3::ZERO;
+        let frame = craft_frame(7, com, radius_m, 1000.0 / 60.0);
+        let rmin = min_distance(radius_m);
+        let level = level_frame(com, Some(centre), DVec3::Z);
+        let along = level.dir(yaw, 0.0);
+        let floor_r = floor(level.up);
+        let step_rad = 0.0025;
+        let drag_step = full_step(eye_m, step_rad);
+        let bounds = [drag_step, pace];
+        let frames = (PITCH_LIMIT / step_rad).ceil() as usize;
+        let pitch_at = |step: usize| (-(step as f64) * step_rad).max(-PITCH_LIMIT);
+        // The intent's orbit point at `pitch`, lifted onto the floor and
+        // not kept out.
+        let point = |pitch: f64, floor: &mut dyn FnMut(DVec3) -> f64| {
+            solve_orbit(&orbit(yaw, pitch, eye_m), com, &level, centre, floor).0
+        };
+        let place = |eye: DVec3| along_m(eye, com, along, floor_r);
+        let mut input = camera_at(eye_m);
+        held(&mut input, 7);
+        input.yaw = yaw;
+        input.pitch = 0.0;
+        let mut cam = step_chase_camera(&mut input, &frame, floor);
+        let mut path = Vec::with_capacity(frames);
+        let (mut moved_m, mut inside_moved_m) = ([f64::MAX, 0.0_f64], [0.0_f64; 2]);
+        let mut entry = None;
+        let (mut previous, mut before) = (cam.eye, (place(cam.eye), false));
+        for step in 1..=frames {
+            input.pitch = pitch_at(step);
+            cam = step_chase_camera(&mut input, &frame, floor);
+            let what = format!("yaw {yaw}, pitch {}", input.pitch);
+            let shot = (cam.eye, point(input.pitch, floor), previous);
+            let now = place(shot.1);
+            let seen = zone_frame(
+                com,
+                rmin,
+                shot,
+                ([now, before.0], before.1),
+                bounds,
+                floor,
+                &what,
+            );
+            if seen.inside {
+                inside_moved_m = [
+                    inside_moved_m[0].max(seen.moved),
+                    inside_moved_m[1].max(seen.pace),
+                ];
+            } else {
+                moved_m = [moved_m[0].min(seen.moved), moved_m[1].max(seen.moved)];
+            }
+            if seen.inside && !before.1 {
+                entry = Some((input.pitch, [before.0, now]));
+            }
+            path.push(cam.eye);
+            (previous, before) = (cam.eye, (now, seen.inside));
+        }
+        let (at_limit, end_inside) = (cam.eye, before.1);
+        let entry = entry.expect("the eye never entered the zone");
+        // Reversed: the same pitches back up move the eye along the same
+        // path, to the last digit.
+        let mut was_inside = end_inside;
+        for step in (1..frames).rev() {
+            input.pitch = pitch_at(step);
+            cam = step_chase_camera(&mut input, &frame, floor);
+            assert_eq!(
+                cam.eye,
+                path[step - 1],
+                "yaw {yaw}, pitch {}: a reversed drag left the path",
+                input.pitch
+            );
+            let inside = (point(input.pitch, floor) - com).norm() < rmin;
+            if was_inside && !inside {
+                dragged(
+                    com,
+                    rmin,
+                    drag_step,
+                    cam.eye,
+                    path[step],
+                    &format!("yaw {yaw}, pitch {}: leaving the zone", input.pitch),
+                );
+            }
+            was_inside = inside;
+        }
+        (
+            Zone {
+                entry,
+                at_limit,
+                moved_m,
+                inside_moved_m,
+            },
+            path,
+        )
+    }
+
+    /// The floor lift never takes the eye inside the craft. Dragged
+    /// straight down, the starter craft's lifted eye used to end 2.636 m
+    /// from its CoM — the least distance is 4.593 m — and a craft with its
+    /// CoM 1 m up, 0.721 m: inside the craft. The eye goes round the craft
+    /// on the floor instead. It slides toward the craft along the ground,
+    /// enters the zone at the turn — where the floor first is the least
+    /// distance from the CoM — and from there rides the circle at exactly
+    /// that distance, round the yaw's own side: every frame moving, the
+    /// frame that enters by no more than the drag's own step, no frame
+    /// inside by more than [`skirt_plateau`] times the orbit point's
+    /// slide, and never nearer than the least distance. At the pitch
+    /// limit it sits where `skirt_azimuth` says, and a reversed drag
+    /// retraces the path, frame for frame.
+    #[test]
+    fn the_lifted_eye_goes_round_the_craft_at_the_least_distance() {
+        let radius_m = STARTER_RADIUS_M;
+        let eye_m = 4.0 * radius_m;
+        close(eye_m, 12.248, 1.0e-9, "the starter craft's frame distance");
+        close(
+            min_distance(radius_m),
+            4.593,
+            1.0e-9,
+            "the starter craft's least distance",
+        );
+        let (floor_r, rmin) = (BODY_R + EYE_GROUND_CLEARANCE_M, min_distance(radius_m));
+        let step_m = full_step(eye_m, 0.0025);
+        for (what, com_height_m) in [
+            (
+                "the starter craft, its CoM 2.892 m over the ground as on the real pad",
+                2.892,
+            ),
+            ("a craft with its CoM 1 m over the ground", 1.0),
+        ] {
+            let (com, level) = landed(com_height_m);
+            let height_m = com_height_m - EYE_GROUND_CLEARANCE_M;
+            let turn_m = (rmin * rmin - height_m * height_m).sqrt();
+            for yaw in [0.0, 0.7, 2.6] {
+                let (zone, _) =
+                    sweep_the_zone(com, radius_m, eye_m, yaw, skirt_plateau(), &mut flat_floor);
+                let (entry_pitch, [before, at]) = zone.entry;
+                assert!(
+                    before >= turn_m - 1.0e-4 && at <= turn_m + 1.0e-4,
+                    "{what}, yaw {yaw}: the eye entered the zone between {before} and {at} m out, not at the turn {turn_m}"
+                );
+                // At the pitch limit: on the circle, where `skirt_azimuth` says.
+                let along = level.dir(yaw, 0.0);
+                let mut limit_floor = flat_floor;
+                let point = solve_orbit(
+                    &orbit(yaw, -PITCH_LIMIT, eye_m),
+                    com,
+                    &level,
+                    DVec3::ZERO,
+                    &mut limit_floor,
+                )
+                .0;
+                let bearing =
+                    skirt_azimuth((turn_m - along_m(point, com, along, floor_r)) / turn_m);
+                let (reach, side) = (zone_angle(com.x, floor_r, rmin), along.cross(level.up));
+                let wanted = level.up * (floor_r * reach.cos())
+                    + (along * bearing.cos() + side * bearing.sin()) * (floor_r * reach.sin());
+                close(
+                    (zone.at_limit - wanted).norm(),
+                    0.0,
+                    1.0e-3,
+                    &format!("{what}, yaw {yaw}: the eye at the pitch limit"),
+                );
+                close(
+                    (zone.at_limit - com).norm(),
+                    rmin,
+                    1.0e-6,
+                    &format!(
+                        "{what}, yaw {yaw}: the eye's distance from the CoM at the pitch limit"
+                    ),
+                );
+                eprintln!(
+                    "{what}, yaw {yaw}: least distance {rmin:.3} m, the turn {turn_m:.3} m out; the eye entered the zone at pitch {entry_pitch:+.4} rad, between {before:.3} and {at:.3} m out; \
+                     at the pitch limit {:.3} m from the CoM, {:.1}° round from the turn; \
+                     outside the zone the eye moved {:.4}..{:.4} m a frame (the drag's own step {:.4} m); inside it at most {:.4} m, {:.2} m per metre of slide (at most {:.2})",
+                    (zone.at_limit - com).norm(),
+                    bearing.to_degrees(),
+                    zone.moved_m[0],
+                    zone.moved_m[1],
+                    step_m,
+                    zone.inside_moved_m[0],
+                    zone.inside_moved_m[1],
+                    skirt_plateau()
+                );
+            }
+        }
+    }
+
+    /// What a sweep of orbit points straight across the zone saw.
+    struct Crossing {
+        /// How far the eye moved on the frame that entered the zone at
+        /// the turn, and the most it moved on any frame (m).
+        turn_step_m: f64,
+        widest_m: f64,
+        /// The nearest the eye came to the CoM (m).
+        nearest_m: f64,
+        /// The least of the eye's share along the yaw's own side — east of
+        /// a craft on +X whose yaw is due north — while it was inside the
+        /// zone (m).
+        off_side_m: f64,
+    }
+
+    /// Sweep orbit points along the floor from 6 m on the yaw's side of
+    /// the craft, whose CoM is `com`, to 6 m on the far side, a centimetre
+    /// at a time, through the rule: the eyes, and what the sweep saw.
+    /// Every centimetre moves the eye, by no more than [`skirt_plateau`]
+    /// centimetres; it never comes nearer than `rmin` to the CoM; outside
+    /// the zone it is the orbit point itself, inside it on the floor and
+    /// exactly `rmin` out.
+    fn sweep_across(
+        com: DVec3,
+        rmin: f64,
+        north: DVec3,
+        floor: &mut dyn FnMut(DVec3) -> f64,
+    ) -> (Vec<DVec3>, Crossing) {
+        let centre = DVec3::ZERO;
+        let (up, floor_r) = (com / com.norm(), floor(com / com.norm()));
+        // The floor point `x` metres north of the point under the craft.
+        let on_floor = |x: f64| {
+            let (sin, cos) = (x / floor_r).sin_cos();
+            (up * cos + north * sin) * floor_r
+        };
+        let (mut eyes, mut crossing) = (
+            Vec::new(),
+            Crossing {
+                turn_step_m: 0.0,
+                widest_m: 0.0,
+                nearest_m: f64::MAX,
+                off_side_m: f64::MAX,
+            },
+        );
+        let (mut previous, mut was_inside) = (on_floor(6.0), false);
+        for step in 0..=1200_usize {
+            let x = 6.0 - step as f64 * 0.01;
+            let eye = skirt_eye(on_floor(x), com, rmin, north, centre, floor);
+            let inside = (on_floor(x) - com).norm() < rmin;
+            let (moved, to_com) = ((eye - previous).norm(), (eye - com).norm());
+            if step > 0 {
+                assert!(moved > 0.0, "x {x}: the sweep did not move the eye");
+                assert!(
+                    moved <= skirt_plateau() * 0.010_000_01,
+                    "x {x}: the eye stepped {moved} m for a centimetre of sweep"
+                );
+            }
+            assert!(
+                to_com >= rmin - SKIRT_PRECISION_M,
+                "x {x}: the eye came {to_com} m from the CoM, inside the least distance {rmin}"
+            );
+            if inside {
+                close(
+                    eye.norm(),
+                    floor_r,
+                    1.0e-9,
+                    &format!("x {x}: the eye left the floor"),
+                );
+                close(
+                    to_com,
+                    rmin,
+                    1.0e-6,
+                    &format!("x {x}: the eye is not on the least distance"),
+                );
+                crossing.off_side_m = crossing.off_side_m.min(eye.y);
+            } else {
+                assert_eq!(
+                    eye,
+                    on_floor(x),
+                    "x {x}: outside the zone, the eye is the orbit point"
+                );
+            }
+            if inside != was_inside && x > 0.0 {
+                crossing.turn_step_m = moved;
+            }
+            crossing.widest_m = crossing.widest_m.max(moved);
+            crossing.nearest_m = crossing.nearest_m.min(to_com);
+            (previous, was_inside) = (eye, inside);
+            eyes.push(eye);
+        }
+        (eyes, crossing)
+    }
+
+    /// A travelling anchor's orbit point can sweep straight across the
+    /// zone — from 6 m on the yaw's side of the craft to 6 m on the far
+    /// side, a centimetre at a time. Outside the zone the eye is the orbit
+    /// point itself; inside it rides the circle at exactly the least
+    /// distance, round one side — the yaw's own, east of a yaw of due
+    /// north — entering at the turn, passing the craft's side where the
+    /// orbit point is under the craft, and leaving at the far edge, every
+    /// centimetre where `skirt_azimuth` says. The frame that enters at the
+    /// turn moves no more than the sweep itself, no frame more than
+    /// [`skirt_plateau`] centimetres, and the way back is the same path to
+    /// the last digit.
+    #[test]
+    fn the_eye_goes_round_on_one_side_across_both_edges() {
+        let radius_m = STARTER_RADIUS_M;
+        let (com, level) = landed(2.892);
+        let rmin = min_distance(radius_m);
+        let floor_r = BODY_R + EYE_GROUND_CLEARANCE_M;
+        let north = level.dir(0.0, 0.0);
+        let east = north.cross(level.up);
+        let reach = zone_angle(com.x, floor_r, rmin);
+        let turn_m = reach * floor_r;
+        let on_floor = |x: f64| {
+            let (sin, cos) = (x / floor_r).sin_cos();
+            (level.up * cos + north * sin) * floor_r
+        };
+        let (eyes, crossing) = sweep_across(com, rmin, north, &mut flat_floor);
+        let Crossing {
+            turn_step_m,
+            widest_m,
+            nearest_m,
+            off_side_m,
+        } = crossing;
+        let at_under = skirt_eye(
+            on_floor(0.0),
+            com,
+            rmin,
+            north,
+            DVec3::ZERO,
+            &mut flat_floor,
+        );
+        assert!(
+            turn_step_m <= 0.010_000_01,
+            "entering the zone at the turn, the eye moved {turn_step_m} m for a centimetre of sweep"
+        );
+        assert!(
+            off_side_m >= -1.0e-9,
+            "the eye crossed the yaw's line to the other side: {off_side_m} m over"
+        );
+        // Where the orbit point is under the craft the eye is round the
+        // circle as far as `skirt_azimuth` says — most of the way to the
+        // craft's side, on the yaw's own side of it.
+        let round = skirt_azimuth(1.0);
+        close(
+            at_under.y,
+            turn_m * round.sin(),
+            1.0e-3,
+            "the eye where the orbit point is under the craft: how far along the yaw's own side",
+        );
+        close(
+            at_under.z,
+            turn_m * round.cos(),
+            1.0e-3,
+            "the eye where the orbit point is under the craft: how far out along the yaw",
+        );
+        // The edges: 3.80 m out the eye is the orbit point, 3.79 m out it
+        // is on the circle; likewise 3.79 and 3.80 m out on the far side.
+        let x_at = |step: f64| 6.0 - step * 0.01;
+        assert_eq!(
+            eyes[220],
+            on_floor(x_at(220.0)),
+            "3.80 m out: the orbit point"
+        );
+        assert_eq!(
+            eyes[980],
+            on_floor(x_at(980.0)),
+            "3.80 m out on the far side: the orbit point"
+        );
+        assert!(
+            (eyes[221] - on_floor(x_at(221.0))).norm() > 0.0,
+            "3.79 m out: on the circle"
+        );
+        assert!(
+            (eyes[979] - on_floor(x_at(979.0))).norm() > 0.0,
+            "3.79 m out on the far side: on the circle"
+        );
+        // Every centimetre inside the zone: where `skirt_azimuth` says.
+        for (step, eye) in eyes.iter().enumerate() {
+            let x = 6.0 - step as f64 * 0.01;
+            if (on_floor(x) - com).norm() < rmin {
+                let bearing = skirt_azimuth(((turn_m - x) / turn_m).clamp(0.0, 2.0));
+                let wanted = level.up * (floor_r * reach.cos())
+                    + (north * bearing.cos() + east * bearing.sin()) * (floor_r * reach.sin());
+                close(
+                    (*eye - wanted).norm(),
+                    0.0,
+                    1.0e-6,
+                    &format!("x {x}: where the eye is put"),
+                );
+            }
+        }
+        // The way back: the same eyes, to the last digit.
+        for (step, eye) in eyes.iter().enumerate().skip(1).rev() {
+            let x = 6.0 - step as f64 * 0.01;
+            assert_eq!(
+                skirt_eye(on_floor(x), com, rmin, north, DVec3::ZERO, &mut flat_floor),
+                *eye,
+                "x {x}: the way back left the path"
+            );
+        }
+        eprintln!(
+            "orbit point swept along the floor from 6 m on the yaw's side of the craft to 6 m on the far side, \
+             rmin {rmin:.3} m, turn {turn_m:.4} m: entering at the turn the eye moved {turn_step_m:.5} m for a centimetre; \
+             the most it moved for a centimetre {widest_m:.5} m (the circle's pace {:.2}); \
+             where the orbit point is under the craft the eye is {:.1}° round from the turn, {:.4} m out and {:.4} m along the yaw's own side; \
+             the least of its share on the yaw's own side {off_side_m:.4} m; nearest to the CoM {nearest_m:.9} m",
+            skirt_plateau(),
+            round.to_degrees(),
+            at_under.z,
+            at_under.y
+        );
+    }
+
+    /// The test body's ground rising 20 % to the east, the eye's floor
+    /// 0.3 m over it.
+    fn slope_floor(dir: DVec3) -> f64 {
+        BODY_R + 0.2 * dir.y * BODY_R + EYE_GROUND_CLEARANCE_M
+    }
+
+    /// On a slope the zone is not a circle about the point under the
+    /// craft: uphill the floor rises toward the CoM, so the least distance
+    /// is further out, downhill nearer. Both edges and the eye's way round
+    /// are measured on the real floor. Dragged straight down with the yaw
+    /// uphill, the eye enters the zone where the sloped floor first is the
+    /// least distance from the CoM, rides 0.3 m over its own ground at
+    /// exactly that distance, and at the pitch limit sits where
+    /// `skirt_azimuth` says — on the first point of that floor along its
+    /// bearing that is the least distance from the CoM, found here afresh.
+    #[test]
+    fn on_a_slope_the_eye_goes_round_the_craft_on_its_own_ground() {
+        let radius_m = STARTER_RADIUS_M;
+        let eye_m = 4.0 * radius_m;
+        let (com, level) = landed(2.892);
+        let (rmin, floor_r) = (min_distance(radius_m), BODY_R + EYE_GROUND_CLEARANCE_M);
+        // The zone's edges along the slope, `x` metres out with the floor
+        // `0.2·x` above the point under the craft: x² + (H ∓ 0.2·x)² = rmin².
+        let height_m = 2.892 - EYE_GROUND_CLEARANCE_M;
+        let root = (0.16 * height_m * height_m + 4.16 * (rmin * rmin - height_m * height_m)).sqrt();
+        let uphill_m = (0.4 * height_m + root) / 2.08;
+        let downhill_m = (root - 0.4 * height_m) / 2.08;
+        let level_m = (rmin * rmin - height_m * height_m).sqrt();
+        assert!(
+            uphill_m > level_m + 0.3 && downhill_m < level_m - 0.3,
+            "on a 20 % slope the zone runs {downhill_m:.3} m downhill and {uphill_m:.3} m uphill, not lop-sided about the {level_m:.3} m of level ground"
+        );
+        // Dragged straight down with the yaw uphill — east.
+        let yaw = core::f64::consts::FRAC_PI_2;
+        let pace = skirt_plateau() * 2.0 * uphill_m / (uphill_m + downhill_m);
+        let (zone, _) = sweep_the_zone(com, radius_m, eye_m, yaw, pace, &mut slope_floor);
+        let along = level.dir(yaw, 0.0);
+        let (entry_pitch, [before, at]) = zone.entry;
+        assert!(
+            before >= uphill_m - 1.0e-3 && at <= uphill_m + 1.0e-3,
+            "the eye entered the zone between {before} and {at} m uphill, not at {uphill_m}"
+        );
+        // At the pitch limit: where `skirt_azimuth` says — `bearing` round
+        // from uphill — on the first point of the sloped floor along that
+        // bearing that is `rmin` from the CoM, bisected here afresh.
+        let point = solve_orbit(
+            &orbit(yaw, -PITCH_LIMIT, eye_m),
+            com,
+            &level,
+            DVec3::ZERO,
+            &mut slope_floor,
+        )
+        .0;
+        let bearing = skirt_azimuth(
+            2.0 * (uphill_m - along_m(point, com, along, floor_r)) / (uphill_m + downhill_m),
+        );
+        let side = along.cross(level.up);
+        let along_bearing = along * bearing.cos() + side * bearing.sin();
+        let on = |angle: f64| {
+            let dir = level.up * angle.cos() + along_bearing * angle.sin();
+            dir * slope_floor(dir)
+        };
+        let (mut low, mut high) = (0.0, 0.02);
+        for _ in 0..60 {
+            let mid = 0.5 * (low + high);
+            if (on(mid) - com).norm() < rmin {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        let wanted = on(high);
+        close(
+            (zone.at_limit - wanted).norm(),
+            0.0,
+            1.0e-3,
+            "the eye at the pitch limit on the slope",
+        );
+        eprintln!(
+            "20 % slope, the yaw uphill: the zone runs {downhill_m:.3} m downhill and {uphill_m:.3} m uphill of the {level_m:.3} m on level ground; \
+             the eye entered it at pitch {entry_pitch:+.4} rad, between {before:.3} and {at:.3} m uphill; \
+             at the pitch limit {:.1}° round from uphill, {:.3} m from the CoM (least distance {rmin:.3} m) and {:.3} m over its own ground there; \
+             inside the zone the eye moved at most {:.2} m per metre of slide (at most {pace:.2})",
+            bearing.to_degrees(),
+            (zone.at_limit - com).norm(),
+            zone.at_limit.norm() - slope_floor(zone.at_limit / zone.at_limit.norm())
+                + EYE_GROUND_CLEARANCE_M,
+            zone.inside_moved_m[1]
+        );
+    }
+
+    /// The intent's orbit point about `anchor`, lifted onto the test body's
+    /// flat floor and not kept out.
+    fn lifted_about(orbit: &Orbit, anchor: DVec3) -> DVec3 {
+        let level = level_frame(anchor, Some(DVec3::ZERO), DVec3::Z);
+        solve_orbit(orbit, anchor, &level, DVec3::ZERO, &mut flat_floor).0
+    }
+
+    /// What a travel, taken frame by frame, saw.
+    struct WentRound {
+        frames: usize,
+        /// The nearest the eye came to the new craft's CoM (m).
+        nearest_m: f64,
+        /// The most the eye moved for a metre of the orbit point's own
+        /// travel.
+        widest: f64,
+        /// How much further the eye went over the travel than the orbit
+        /// point did: its way round the craft's ball, less the orbit
+        /// point's way through it (m).
+        extra_m: f64,
+        /// The most any frame's move was of the one before, over the
+        /// frames moving more than a millimetre.
+        widest_ratio: f64,
+        /// Whether the orbit point was ever inside the new craft's ball.
+        crossed: bool,
+        /// The eye at rest.
+        eye: DVec3,
+        /// The eye and its orbit point, lifted and not kept out, on every
+        /// frame.
+        eyes: Vec<DVec3>,
+        points: Vec<DVec3>,
+    }
+
+    /// Step the travel in hand to its end, 60 fps, a frame at a time,
+    /// about a craft of the starter's size whose CoM is `com`, holding
+    /// every frame to what the keep-out on a travel owes: the eye never
+    /// nearer than the least distance to the CoM; no frame moving it
+    /// further than `pace` times the orbit point's own travel; where a
+    /// `bound` is given, no frame moving beyond that times the one before,
+    /// beyond the millimetre the travel itself snaps at the end; and, all
+    /// its frames together, the eye going no further than the orbit
+    /// point's own travel and the most any nearer way round the ball is
+    /// longer than the way through it — half its circumference less its
+    /// diameter, a diameter's way round. `orbit` is held throughout;
+    /// `start` is the eye and its orbit point on the frame of the change.
+    fn travel_round(
+        input: &mut FlightInput,
+        orbit: &Orbit,
+        com: DVec3,
+        pace: f64,
+        bound: Option<f64>,
+        start: (DVec3, DVec3),
+    ) -> WentRound {
+        let rmin = min_distance(STARTER_RADIUS_M);
+        let frame = craft_frame(2, com, STARTER_RADIUS_M, 1000.0 / 60.0);
+        let (mut previous_eye, mut previous_point, mut last_move) = (start.0, start.1, None);
+        let mut went = WentRound {
+            frames: 0,
+            nearest_m: f64::MAX,
+            widest: 0.0,
+            extra_m: 0.0,
+            widest_ratio: 0.0,
+            crossed: false,
+            eye: start.0,
+            eyes: Vec::new(),
+            points: Vec::new(),
+        };
+        let mut cam;
+        loop {
+            cam = step_chase_camera(input, &frame, &mut flat_floor);
+            went.frames += 1;
+            assert!(went.frames <= 400, "the travel never ended");
+            let anchor = input.travel.last.expect("a focus was just solved").anchor;
+            let point = lifted_about(orbit, anchor);
+            let (moved, step_m) = (
+                (cam.eye - previous_eye).norm(),
+                (point - previous_point).norm(),
+            );
+            let to_com = (cam.eye - com).norm();
+            assert!(
+                to_com >= rmin - SKIRT_PRECISION_M,
+                "frame {}: the eye came {to_com} m from the new craft's CoM, inside the least distance {rmin}",
+                went.frames
+            );
+            if let Some(last) = last_move
+                && last > TRAVEL_DONE_M
+            {
+                let ratio = moved / last;
+                went.widest_ratio = went.widest_ratio.max(ratio);
+                if let Some(bound) = bound {
+                    assert!(
+                        moved <= bound * last + TRAVEL_DONE_M,
+                        "frame {}: the eye moved {moved} m after {last} m, {ratio:.3} times",
+                        went.frames
+                    );
+                }
+            }
+            assert!(
+                step_m <= 1.0e-9 || moved <= pace * step_m * 1.000_001,
+                "frame {}: the eye moved {moved} m for the orbit point's {step_m} m",
+                went.frames
+            );
+            went.nearest_m = went.nearest_m.min(to_com);
+            went.extra_m += moved - step_m;
+            if step_m > 1.0e-6 {
+                went.widest = went.widest.max(moved / step_m);
+            }
+            went.crossed |= (point - com).norm() < rmin;
+            went.eyes.push(cam.eye);
+            went.points.push(point);
+            (previous_eye, previous_point, last_move) = (cam.eye, point, Some(moved));
+            went.eye = cam.eye;
+            if input.travel.offset == DVec3::ZERO {
+                break;
+            }
+        }
+        let roundest_m = (core::f64::consts::PI - 2.0) * rmin;
+        assert!(
+            went.extra_m <= roundest_m + 1.0e-6,
+            "over the travel the eye went {:.3} m further than the orbit point: more than any nearer way round the ball ({roundest_m:.3} m)",
+            went.extra_m
+        );
+        went
+    }
+
+    /// A focus change whose orbit point crosses the new craft's zone
+    /// obliquely, through the per-frame step: two starter crafts, the first
+    /// 8 m south of the second and 4.6 m east of it, the eye dragged down
+    /// to where its orbit point rides the floor 5.06 m out along the yaw —
+    /// outside both zones, so the eye carries no skirt. The frame of the
+    /// change moves neither the eye nor the view. The orbit point then
+    /// travels along the floor toward its rest 5.06 m north of the new
+    /// craft, cutting across that craft's zone from its north-west side to
+    /// its near side, and the eye goes round the circle from where the
+    /// orbit point entered to where it left: exactly the least distance
+    /// from the CoM on every frame, no frame moving it further than the
+    /// circle's own way for the orbit point's travel, all its moves
+    /// together no longer than the orbit point's travel and the way round
+    /// the circle, and no frame a tenth further than the one before —
+    /// beyond the millimetre the travel itself snaps at the end. At rest
+    /// the eye is the orbit point again.
+    #[test]
+    fn a_focus_change_across_the_new_craft_goes_round_it_without_a_jump() {
+        let radius_m = STARTER_RADIUS_M;
+        let eye_m = 4.0 * radius_m;
+        let orbit = orbit(0.0, -1.145, eye_m);
+        let (com_b, _) = landed(2.892);
+        let com_a = com_b - DVec3::Z * 8.0 + DVec3::Y * 4.6;
+        let rmin = min_distance(radius_m);
+        let mut input = camera_at(eye_m);
+        input.travel.last = Some(Last {
+            id: 1,
+            anchor: com_a,
+            look_at: com_a,
+            skirt: DVec3::ZERO,
+            eye: DVec3::ZERO,
+            carried: DVec3::ZERO,
+            moved_m: None,
+            travelled: 0.0,
+        });
+        input.yaw = 0.0;
+        input.pitch = -1.145;
+        let before = step_chase_camera(
+            &mut input,
+            &craft_frame(1, com_a, radius_m, 0.0),
+            &mut flat_floor,
+        );
+        let set_out = lifted_about(&orbit, com_a);
+        assert_eq!(
+            before.eye, set_out,
+            "the eye carries the first craft's skirt"
+        );
+        for com in [com_a, com_b] {
+            assert!(
+                (set_out - com).norm() >= rmin,
+                "the orbit point starts inside a craft's zone: {:.3} m from its CoM",
+                (set_out - com).norm()
+            );
+        }
+
+        // The frame of the change, before any time is put in.
+        let still = step_chase_camera(
+            &mut input,
+            &craft_frame(2, com_b, radius_m, 0.0),
+            &mut flat_floor,
+        );
+        same_view(&still, &before, "the frame of the change");
+        assert!(
+            !input.travel.began_inside,
+            "the orbit point began outside the zone: the keep-out acts at once"
+        );
+
+        // The travel: the circle's own way is 1.13 times the orbit point's
+        // travel along this line.
+        let went = travel_round(
+            &mut input,
+            &orbit,
+            com_b,
+            1.25,
+            Some(1.1),
+            (before.eye, set_out),
+        );
+        let WentRound {
+            frames,
+            nearest_m,
+            extra_m,
+            widest: widest_gain,
+            crossed,
+            eye,
+            ..
+        } = went;
+        assert!(
+            crossed,
+            "the orbit point never crossed the new craft's zone"
+        );
+        assert!(
+            input.travel.ride.is_none(),
+            "at rest nothing is left of the ride"
+        );
+        // At rest: the orbit point itself, 5.06 m out — outside the zone.
+        let at_rest = lifted_about(&orbit, com_b);
+        close(
+            (eye - at_rest).norm(),
+            0.0,
+            1.0e-9,
+            "at rest the eye is not the orbit point",
+        );
+        close(
+            at_rest.z - com_b.z,
+            5.06,
+            1.0e-2,
+            "how far out along the yaw the orbit point rests",
+        );
+        eprintln!(
+            "focus change whose orbit point cuts across the new craft's zone obliquely (from 8 m south and 4.6 m east, the orbit point 5.06 m out along the yaw): \
+             the frame of the change moved the eye 0 m; the eye went round the circle over {frames} frames, \
+             never nearer than {nearest_m:.6} m to the CoM (least distance {rmin:.3} m), its travel exceeding the orbit point's by {extra_m:.3} m at most, moving at most {widest_gain:.2} times the orbit point's own travel; \
+             at rest the eye is the orbit point again",
+        );
+    }
+
+    /// A focus change whose orbit point crosses the new craft's ball IN
+    /// THE AIR. The keep-out used to read only an orbit point the floor
+    /// had lifted, and the eye was carried straight through the craft.
+    /// Two starter crafts 20 m apart along the yaw, the eye at four radii,
+    /// with no skirt of the first craft's to carry. On the default camera
+    /// (+0.25 rad) the way passes 3.031 m above the new craft's CoM and
+    /// the eye goes over the craft on its ball, in the yaw's own vertical
+    /// plane; on a level camera the way is a diameter and the eye goes
+    /// round the yaw's own side, level with the CoM; a tenth of a radian
+    /// under the level the nearer way round is under the floor, and the
+    /// eye rides the floor's circle round the yaw's own side instead. On
+    /// every frame the eye is the orbit point itself while that is
+    /// outside the ball and exactly the least distance from the CoM while
+    /// it is inside — never under the floor — moving no further than 1.75
+    /// times the orbit point's own travel, and all its moves together no
+    /// longer than the orbit point's own travel and the way round the
+    /// ball; over the craft, round its side and along the floor's circle,
+    /// no frame a tenth further than the one before. The frame of the
+    /// change moves nothing, and at rest the eye is the orbit point
+    /// again.
+    #[test]
+    fn a_focus_travel_through_the_air_goes_round_the_craft_on_its_ball() {
+        let radius_m = STARTER_RADIUS_M;
+        let eye_m = 4.0 * radius_m;
+        let rmin = min_distance(radius_m);
+        let floor_r = BODY_R + EYE_GROUND_CLEARANCE_M;
+        let (com_b, level) = landed(2.892);
+        let (north, up) = (level.north, level.up);
+        for (what, pitch, how) in [
+            ("the default camera", 0.25_f64, "over"),
+            ("a level camera", 0.0_f64, "round"),
+            ("0.1 rad under the level", -0.1_f64, "under"),
+        ] {
+            // How far above the anchor's level the orbit point rides.
+            let above_m = eye_m * pitch.sin();
+            let orbit = orbit(0.0, pitch, eye_m);
+            let com_a = com_b - north * 20.0;
+            let mut input = camera_at(eye_m);
+            input.travel.last = Some(Last {
+                id: 1,
+                anchor: com_a,
+                look_at: com_a,
+                skirt: DVec3::ZERO,
+                eye: DVec3::ZERO,
+                carried: DVec3::ZERO,
+                moved_m: None,
+                travelled: 0.0,
+            });
+            input.yaw = 0.0;
+            input.pitch = pitch;
+            let before = step_chase_camera(
+                &mut input,
+                &craft_frame(1, com_a, radius_m, 0.0),
+                &mut flat_floor,
+            );
+            let set_out = lifted_about(&orbit, com_a);
+            assert_eq!(
+                before.eye, set_out,
+                "{what}: the eye carries the first craft's skirt"
+            );
+            let at_rest = lifted_about(&orbit, com_b);
+            for (when, point) in [("where it starts", set_out), ("where it rests", at_rest)] {
+                assert!(
+                    point.norm() > floor_r + 1.0,
+                    "{what}: the orbit point is not in the air {when}"
+                );
+                assert!(
+                    (point - com_b).norm() >= rmin,
+                    "{what}: the orbit point is inside the new craft's ball {when}"
+                );
+                // The first craft's local up tilts from the second's by
+                // its 20 m along the ground.
+                close(
+                    (point - com_b).dot(up),
+                    above_m,
+                    1.0e-3,
+                    &format!("{what}: how far above the CoM the way passes, {when}"),
+                );
+            }
+
+            // The frame of the change, before any time is put in.
+            let still = step_chase_camera(
+                &mut input,
+                &craft_frame(2, com_b, radius_m, 0.0),
+                &mut flat_floor,
+            );
+            same_view(&still, &before, "the frame of the change");
+            assert!(
+                !input.travel.began_inside,
+                "{what}: the eye began outside the ball: the keep-out acts at once"
+            );
+
+            // The way round the ball is at most 1.69 times the orbit
+            // point's own travel along the way.
+            let went = travel_round(
+                &mut input,
+                &orbit,
+                com_b,
+                1.75,
+                Some(1.1),
+                (before.eye, set_out),
+            );
+            assert!(
+                went.crossed,
+                "{what}: the orbit point never crossed the new craft's ball"
+            );
+            assert!(
+                input.travel.ride.is_none(),
+                "{what}: at rest nothing is left of the ride"
+            );
+            close(
+                (went.eye - at_rest).norm(),
+                0.0,
+                1.0e-9,
+                &format!("{what}: at rest the eye is not the orbit point"),
+            );
+            let on_the_ball = eyes_on_the_ball(&went, com_b, rmin, floor_r, what);
+            let how_it_went = how_it_went(&on_the_ball, &level, com_b, rmin, floor_r, how, what);
+            report_through_the_air(what, above_m, rmin, &went, on_the_ball.len(), how_it_went);
+        }
+    }
+
+    /// Print what a focus change through the air came to: `what` naming
+    /// the camera, its way `above_m` over the new craft's CoM, `went` the
+    /// travel, the frames the eye was on the ball and how it went there
+    /// — at its highest over the CoM's level, and at its farthest along
+    /// the yaw's own side (m).
+    fn report_through_the_air(
+        what: &str,
+        above_m: f64,
+        rmin: f64,
+        went: &WentRound,
+        on_the_ball: usize,
+        how_it_went: (f64, f64),
+    ) {
+        let (highest, widest) = how_it_went;
+        eprintln!(
+            "focus change through the air, {what} (the way {above_m:+.3} m above the new craft's CoM, least distance {rmin:.3} m): the frame of the change moved the eye 0 m; \
+             the eye went round the ball over {} frames, on it for {}, \
+             never nearer than {:.6} m to the CoM, its travel exceeding the orbit point's by {:.3} m at most, moving at most {:.2} times the orbit point's own travel, \
+             the most any frame's move {:.3} times the one before; \
+             on the ball it rose at most to {highest:+.3} m over the CoM's level and reached {widest:.3} m along the yaw's own side",
+            went.frames, on_the_ball, went.nearest_m, went.extra_m, went.widest, went.widest_ratio,
+        );
+    }
+
+    /// Hold every frame of `went` — a travel toward a craft whose CoM is
+    /// `com` — to the keep-out's letter, and return the eye's offsets from
+    /// the CoM over the frames it was on the ball, at least two of them.
+    /// Outside the ball the eye is the orbit point itself; on it, exactly
+    /// the least distance out, and never under the floor.
+    fn eyes_on_the_ball(
+        went: &WentRound,
+        com: DVec3,
+        rmin: f64,
+        floor_r: f64,
+        what: &str,
+    ) -> Vec<DVec3> {
+        let mut on_the_ball = Vec::new();
+        for (i, (eye, point)) in went.eyes.iter().zip(&went.points).enumerate() {
+            if (*point - com).norm() >= rmin {
+                assert_eq!(
+                    *eye, *point,
+                    "{what}, frame {i}: outside the ball, the eye is not the orbit point"
+                );
+            } else {
+                let to_com = (*eye - com).norm();
+                assert!(
+                    (-SKIRT_PRECISION_M..=1.0e-6).contains(&(to_com - rmin)),
+                    "{what}, frame {i}: the eye is {to_com} m from the CoM, not on the least distance {rmin}"
+                );
+                assert!(
+                    eye.norm() >= floor_r - 1.0e-9,
+                    "{what}, frame {i}: the eye is under the floor"
+                );
+                on_the_ball.push(*eye - com);
+            }
+        }
+        assert!(
+            on_the_ball.len() >= 2,
+            "{what}: the eye was on the ball for {} frames only",
+            on_the_ball.len()
+        );
+        on_the_ball
+    }
+
+    /// What the eye did on the ball, as offsets from the craft's CoM over
+    /// the frames it was on it, by the way its orbit point crossed it:
+    /// `over` the craft, `round` its yaw's own side, or — the nearer way
+    /// being under the floor — `under`, along the floor's circle round
+    /// that side. Returns the highest it rose above the CoM's level and
+    /// the farthest it reached along the yaw's own side (m). `level` is
+    /// the craft's own frame, the yaw being north.
+    fn how_it_went(
+        on_the_ball: &[DVec3],
+        level: &LevelFrame,
+        com: DVec3,
+        rmin: f64,
+        floor_r: f64,
+        how: &str,
+        what: &str,
+    ) -> (f64, f64) {
+        let (north, east, up) = (level.north, level.east, level.up);
+        let (height, flank) = (
+            |to_com: DVec3| to_com.dot(up),
+            |to_com: DVec3| to_com.dot(east),
+        );
+        let highest = on_the_ball
+            .iter()
+            .map(|to_com| height(*to_com))
+            .fold(f64::MIN, f64::max);
+        let widest = on_the_ball
+            .iter()
+            .map(|to_com| flank(*to_com))
+            .fold(f64::MIN, f64::max);
+        for to_com in on_the_ball {
+            assert!(
+                flank(*to_com) >= -1.0e-9,
+                "{what}: the eye crossed to the far side of the yaw's line"
+            );
+        }
+        match how {
+            "over" => {
+                // Over the craft, in the yaw's own vertical plane.
+                for to_com in on_the_ball {
+                    close(
+                        flank(*to_com),
+                        0.0,
+                        1.0e-9,
+                        &format!("{what}: the eye left the yaw's vertical plane"),
+                    );
+                    assert!(
+                        height(*to_com) > 3.0,
+                        "{what}: the eye sank to {} m above the CoM",
+                        height(*to_com)
+                    );
+                }
+                assert!(
+                    highest > 0.8 * rmin,
+                    "{what}: the eye rose {highest} m above the CoM, not over the craft"
+                );
+            }
+            "round" => {
+                // A diameter: round the yaw's own side, level with the
+                // CoM, from its far side to its near side.
+                for to_com in on_the_ball {
+                    close(
+                        height(*to_com),
+                        0.0,
+                        5.0e-3,
+                        &format!("{what}: the eye off the CoM's level"),
+                    );
+                }
+                // At 60 fps two frames land on that semicircle, each
+                // within 50° of its top.
+                assert!(
+                    widest > 0.7 * rmin,
+                    "{what}: the eye came {widest} m along the yaw's own side"
+                );
+                assert!(
+                    on_the_ball[0].dot(north) < 0.0
+                        && on_the_ball[on_the_ball.len() - 1].dot(north) > 0.0,
+                    "{what}: the eye did not go from the far side round to the near side"
+                );
+            }
+            _ => {
+                // The eye rides the floor's circle, round the yaw's own
+                // side.
+                let on_the_circle = on_the_ball
+                    .iter()
+                    .filter(|to_com| {
+                        ((*(*to_com) + com).norm() - floor_r).abs() <= 1.0e-9
+                            && flank(**to_com) > 2.0
+                    })
+                    .count();
+                assert!(
+                    on_the_circle >= 1,
+                    "{what}: the eye never rode the floor's circle round the yaw's own side"
+                );
+            }
+        }
+        (highest, widest)
+    }
+
+    /// What a change from inside the new craft's ball came to.
+    struct LeftBall {
+        /// The camera at the travel's end.
+        cam: MapCameraF64,
+        /// The travel's frames, the change's own not counted.
+        frames: usize,
+        /// The most any frame's move was of the one before, over the
+        /// frames moving more than a millimetre.
+        widest: f64,
+        /// The eye's move on the travel's last frame (m).
+        last_moved_m: f64,
+        /// Whether anything is left of the ride at the travel's end.
+        riding: bool,
+    }
+
+    /// A focus change on the test body from a craft whose CoM is `com_a`
+    /// to one whose CoM is `com_b`, a metre north of it, the eye dragged
+    /// to the pitch limit on the first — so that it sits on the first
+    /// craft's circle just inside the second's, and the orbit point's own
+    /// way runs on through the second's zone. The frame of the change
+    /// carries `change_dt_ms`: without frame time it moves nothing; with
+    /// it the eye sets off by no more than a tenth beyond the orbit
+    /// point's own step, and no nearer to the second craft's CoM. Returns
+    /// the camera after that frame, the orbit held, the input, and the
+    /// eye's move on it and its distance to the second craft's CoM on the
+    /// frame before.
+    fn change_from_inside(
+        com_a: DVec3,
+        com_b: DVec3,
+        change_dt_ms: f64,
+    ) -> (MapCameraF64, Orbit, FlightInput, f64, f64) {
+        let radius_m = STARTER_RADIUS_M;
+        let eye_m = 4.0 * radius_m;
+        let orbit = orbit(0.0, -PITCH_LIMIT, eye_m);
+        let rmin = min_distance(radius_m);
+        let dt_ms = 1000.0 / 60.0;
+        let mut input = camera_at(eye_m);
+        input.travel.last = Some(Last {
+            id: 1,
+            anchor: com_a,
+            look_at: com_a,
+            skirt: DVec3::ZERO,
+            eye: DVec3::ZERO,
+            carried: DVec3::ZERO,
+            moved_m: None,
+            travelled: 0.0,
+        });
+        input.yaw = 0.0;
+        input.pitch = -PITCH_LIMIT;
+        let before = step_chase_camera(
+            &mut input,
+            &craft_frame(1, com_a, radius_m, dt_ms),
+            &mut flat_floor,
+        );
+        let (com_a_level, mut own_floor) = (landed(2.892).1, flat_floor);
+        let orbit_point = solve_orbit(&orbit, com_a, &com_a_level, DVec3::ZERO, &mut own_floor).0;
+        assert!(
+            (orbit_point - com_b).norm() < rmin,
+            "the orbit point does not start inside the second craft's ball: {:.3} m from its CoM",
+            (orbit_point - com_b).norm()
+        );
+        let start_m = (before.eye - com_b).norm();
+        assert!(
+            start_m < rmin,
+            "the eye does not begin inside the second craft's ball: {start_m:.3} m from its CoM (least distance {rmin:.3} m)"
+        );
+
+        // The frame of the change.
+        let cam = step_chase_camera(
+            &mut input,
+            &craft_frame(2, com_b, radius_m, change_dt_ms),
+            &mut flat_floor,
+        );
+        assert!(
+            input.travel.began_inside,
+            "the eye began the travel inside the ball: it leaves by the nearest way out"
+        );
+        let moved_m = (cam.eye - before.eye).norm();
+        if change_dt_ms == 0.0 {
+            same_view(&cam, &before, "the frame of the change");
+        } else {
+            // The orbit point's own step: how far the carried point moved.
+            let carried = input.travel.last.expect("a focus was just solved").carried;
+            let step_m = (carried - before.eye).norm();
+            assert!(
+                moved_m > 0.0 && moved_m <= PACE_GAIN * step_m * 1.000_001,
+                "the frame of the change moved the eye {moved_m} m for the orbit point's own step {step_m} m"
+            );
+        }
+        assert!(
+            (cam.eye - com_b).norm() >= start_m - 1.0e-9,
+            "the frame of the change brought the eye nearer to the CoM than {start_m} m"
+        );
+        (cam, orbit, input, moved_m, start_m)
+    }
+
+    /// Step the travel that follows such a frame of change to its end, a
+    /// timed frame at a time, and hold every frame to what leaving the
+    /// ball owes (`cam` is the camera after the frame of the change, and
+    /// `last_move` the eye's move on it where it carried frame time): the
+    /// eye's distance to the CoM never falls, and on its way out — still
+    /// inside the least distance — it moves away from the craft along the
+    /// floor, its distance out from the vertical through it never
+    /// falling; from the first frame it is the least distance out it
+    /// never is less again, and is exactly that while the orbit point is
+    /// inside the ball; it never leaves the floor; and no frame moves it a
+    /// tenth beyond the one before, beyond the millimetre the travel
+    /// itself snaps at its end.
+    fn leave_the_ball(
+        cam: MapCameraF64,
+        input: &mut FlightInput,
+        com_b: DVec3,
+        last_move: Option<f64>,
+    ) -> LeftBall {
+        let rmin = min_distance(STARTER_RADIUS_M);
+        let floor_r = BODY_R + EYE_GROUND_CLEARANCE_M;
+        let up = level_frame(com_b, Some(DVec3::ZERO), DVec3::Z).up;
+        let over = |eye: DVec3| {
+            let out = eye - com_b;
+            (out - up * out.dot(up)).norm()
+        };
+        let mut cam = cam;
+        let mut previous = cam.eye;
+        let (mut was_m, mut was_over_m) = ((cam.eye - com_b).norm(), over(cam.eye));
+        let (mut frames, mut widest, mut nearest_out_m, mut last_moved_m) =
+            (0, 0.0_f64, f64::MAX, 0.0_f64);
+        let (mut last_move, mut riding) = (last_move, true);
+        while input.travel.offset != DVec3::ZERO {
+            cam = step_chase_camera(
+                input,
+                &craft_frame(2, com_b, STARTER_RADIUS_M, 1000.0 / 60.0),
+                &mut flat_floor,
+            );
+            frames += 1;
+            assert!(frames <= 400, "the travel never ended");
+            let (to_com, out_m, moved_m) = (
+                (cam.eye - com_b).norm(),
+                over(cam.eye),
+                (cam.eye - previous).norm(),
+            );
+            assert!(
+                to_com >= was_m - 1.0e-9,
+                "frame {frames}: the eye came {to_com} m from the CoM after {was_m} m"
+            );
+            if to_com < rmin - ON_BALL_M {
+                // Still on its way out: along the floor, away from the
+                // craft.
+                assert!(
+                    out_m >= was_over_m - 1.0e-9,
+                    "frame {frames}: on its way out the eye moved back toward the vertical through the craft"
+                );
+            } else {
+                nearest_out_m = nearest_out_m.min(to_com);
+                // On the ball exactly while the orbit point is inside it.
+                let carried = input.travel.last.expect("a focus was just solved").carried;
+                if (carried - com_b).norm() < rmin {
+                    assert!(
+                        (to_com - rmin).abs() <= 1.0e-6,
+                        "frame {frames}: the eye is {to_com} m from the CoM, not on the least distance {rmin}"
+                    );
+                }
+            }
+            close(
+                cam.eye.norm(),
+                floor_r,
+                1.0e-6,
+                &format!("frame {frames}: the eye left the floor"),
+            );
+            if let Some(last) = last_move
+                && last > TRAVEL_DONE_M
+            {
+                let ratio = moved_m / last;
+                widest = widest.max(ratio);
+                assert!(
+                    moved_m <= 1.1 * last + TRAVEL_DONE_M,
+                    "frame {frames}: the eye moved {moved_m} m after {last} m, {ratio:.3} times"
+                );
+            }
+            riding = input.travel.ride.is_some();
+            (previous, was_m, was_over_m, last_move, last_moved_m) =
+                (cam.eye, to_com, out_m, Some(moved_m), moved_m);
+        }
+        assert!(
+            nearest_out_m >= rmin - SKIRT_PRECISION_M,
+            "once out of the ball the eye came back to {nearest_out_m} m from the CoM (least distance {rmin} m)"
+        );
+        LeftBall {
+            cam,
+            frames,
+            widest,
+            last_moved_m,
+            riding,
+        }
+    }
+
+    /// The other way round: the eye itself BEGINS the travel inside the
+    /// new craft's ball — a craft a metre away, the eye dragged to the
+    /// pitch limit, so that it sits on the first craft's circle just
+    /// inside the second's. The orbit point's own way runs on through the
+    /// second craft's zone toward its CoM, and the eye used to be handed
+    /// over along it: nearer to the CoM before it came out. The frame of
+    /// the change moves nothing. Then the eye leaves the ball by the
+    /// nearest way out — along the floor, away from the vertical through
+    /// the craft — and goes round it to the at-rest eye: its distance to
+    /// the CoM never falls on any frame; it is exactly the least distance
+    /// out on every frame the orbit point is inside the ball and the eye
+    /// is out of it, and never inside the ball again; it never leaves the
+    /// floor; no frame moves it a tenth beyond the one before; and the
+    /// travel ends on the at-rest eye with no step. So too where the frame
+    /// of the change itself carries frame time: the eye sets off on it, by
+    /// no more than a tenth beyond the orbit point's own step.
+    #[test]
+    fn a_focus_change_from_inside_the_new_crafts_ball_leaves_by_the_nearest_way_out() {
+        let radius_m = STARTER_RADIUS_M;
+        let rmin = min_distance(radius_m);
+        let (com_a, _) = landed(2.892);
+        let com_b = com_a + DVec3::Z * 1.0;
+        for change_dt_ms in [0.0, 1000.0 / 60.0] {
+            let (cam, orbit, mut input, first_moved_m, start_m) =
+                change_from_inside(com_a, com_b, change_dt_ms);
+            let left = leave_the_ball(
+                cam,
+                &mut input,
+                com_b,
+                (change_dt_ms > 0.0).then_some(first_moved_m),
+            );
+            let LeftBall {
+                cam,
+                frames,
+                widest,
+                last_moved_m,
+                riding,
+            } = left;
+
+            // At rest: kept out of the second craft exactly, and nothing
+            // left of the ride. The travel's last frame is its own snap
+            // of under a millimetre: the ride adds nothing to it.
+            let level_b = level_frame(com_b, Some(DVec3::ZERO), DVec3::Z);
+            let (lifted_b, on_floor) =
+                solve_orbit(&orbit, com_b, &level_b, DVec3::ZERO, &mut flat_floor);
+            assert!(on_floor, "the eye is not lifted at the pitch limit");
+            let kept = skirt_eye(
+                lifted_b,
+                com_b,
+                rmin,
+                level_b.dir(0.0, 0.0),
+                DVec3::ZERO,
+                &mut flat_floor,
+            );
+            close(
+                (cam.eye - kept).norm(),
+                0.0,
+                1.0e-9,
+                "at rest the eye is not kept out of the second craft",
+            );
+            assert!(
+                last_moved_m <= RIDE_DONE_M,
+                "the frame the travel ended on moved the eye {last_moved_m} m: a step"
+            );
+            assert!(
+                !riding && !input.travel.began_inside,
+                "at rest nothing is left of the ride"
+            );
+            eprintln!(
+                "focus change to a craft 1 m away with the eye {start_m:.3} m from its CoM (least distance {rmin:.3} m), the frame of the change carrying {change_dt_ms:.1} ms: \
+                 that frame moved it {:.4} m; then {frames} frames, \
+                 the most any frame's move {widest:.3} times the one before, and never nearer than {start_m:.6} m to the CoM; \
+                 the last frame moved it {last_moved_m:.1e} m; at rest {:.6} m from the CoM",
+                first_moved_m,
+                (cam.eye - com_b).norm(),
+            );
+        }
+    }
+
+    /// How far a free eye `distance_m` from its anchor travels for a drag
+    /// of `drag_rad` — the chord of its orbit.
+    fn full_step(distance_m: f64, drag_rad: f64) -> f64 {
+        distance_m * 2.0 * (0.5 * drag_rad).sin()
+    }
+
+    /// A craft BURIED: its CoM 30 m under the ground, orbited from 12 m —
+    /// deeper than the eye distance, so with the anchor on the CoM every
+    /// orbit point is lifted onto the floor and a vertical drag keeps only
+    /// the sideways share `d·cos(pitch)`: 0.35 m for 0.1 rad, and nothing
+    /// at the craft's own level, where its slope is zero. The anchor is
+    /// lifted instead — 30.3 m of depth plus 12 m, so it is 12 m over the
+    /// floor — and the eye is the intent's orbit point about it at every
+    /// pitch. The camera looks at the craft 42.3 m under its anchor, not
+    /// at the anchor. A 0.01 rad drag at pitch 0, and from ±0.01 rad,
+    /// moves the eye the full 0.12 m a free eye travels; a yaw drag swings
+    /// it the full arc; the angles are the player's own.
+    #[test]
+    fn a_buried_craft_is_orbited_from_over_the_ground() {
+        let com = DVec3::X * (BODY_R - 30.0);
+        let frame = ChaseFrame {
+            com,
+            centre: Some(DVec3::ZERO),
+            ..space_frame(7, 1.0, 1000.0 / 60.0)
+        };
+        let floor_r = BODY_R + EYE_GROUND_CLEARANCE_M;
+        let level = level_frame(com, Some(DVec3::ZERO), DVec3::Z);
+        // What the camera owes the intent: the orbit point about the
+        // anchor, the craft's depth plus the eye distance up.
+        let owed = |input: &FlightInput| {
+            com + level.up * (floor_r - com.x + 12.0) + level.dir(input.yaw, input.pitch) * 12.0
+        };
+        let mut input = camera_at(12.0);
+        held(&mut input, 7);
+        input.yaw = 0.4;
+        input.pitch = 0.0;
+        let first = step_chase_camera(&mut input, &frame, &mut flat_floor);
+        close(
+            (first.eye - owed(&input)).norm(),
+            0.0,
+            1.0e-9,
+            "the eye is not the intent's orbit point, 12 m over the floor",
+        );
+        let back = |cam: &MapCameraF64| {
+            -DVec3::new(
+                cam.view_proj[3][0],
+                cam.view_proj[3][1],
+                cam.view_proj[3][2],
+            )
+        };
+        let to_com = first.eye - com;
+        close(
+            back(&first).dot(to_com / to_com.norm()),
+            1.0,
+            1.0e-12,
+            "the camera does not look at the craft",
+        );
+        close(
+            first.distance_m,
+            to_com.norm(),
+            1.0e-9,
+            "the solved distance is not the eye's distance to the craft",
+        );
+
+        // A 0.01 rad drag at pitch 0 and from either side of it: the full
+        // step of a free eye, on the very next frame.
+        let mut moved = Vec::new();
+        for (from, dpitch) in [(0.0, 0.01), (0.01, -0.01), (0.0, -0.01), (-0.01, 0.01)] {
+            input.pitch = from;
+            let before = step_chase_camera(&mut input, &frame, &mut flat_floor);
+            input.pitch = from + dpitch;
+            let after = step_chase_camera(&mut input, &frame, &mut flat_floor);
+            let step = (after.eye - before.eye).norm();
+            close(
+                step,
+                full_step(12.0, 0.01),
+                1.0e-9,
+                &format!("a 0.01 rad drag from pitch {from}"),
+            );
+            close(
+                (after.eye - owed(&input)).norm(),
+                0.0,
+                1.0e-9,
+                "still the intent's orbit point",
+            );
+            moved.push(step);
+        }
+
+        // Yaw +0.2 rad: the full arc of the 12 m circle.
+        input.pitch = 0.0;
+        let before = step_chase_camera(&mut input, &frame, &mut flat_floor);
+        input.yaw += 0.2;
+        let after = step_chase_camera(&mut input, &frame, &mut flat_floor);
+        let swung = (after.eye - before.eye).norm();
+        close(
+            swung,
+            full_step(12.0, 0.2),
+            1.0e-9,
+            "the yaw drag does not swing the eye the full arc",
+        );
+        assert_eq!(
+            (input.yaw, input.pitch),
+            (0.4 + 0.2, 0.0),
+            "the angles are the player's own, whole"
+        );
+        eprintln!(
+            "buried craft, 30 m down from 12 m: the anchor {:.1} m over the floor and {:.1} m over the CoM, the eye {:.3} m from the craft at pitch 0; \
+             a 0.01 rad drag at pitch 0 / +0.01 / 0 / −0.01 moves the eye {:.4} / {:.4} / {:.4} / {:.4} m (a free eye {:.4}); \
+             yaw +0.2 swings it {:.4} m (free {:.4})",
+            12.0,
+            floor_r - com.x + 12.0,
+            to_com.norm(),
+            moved[0],
+            moved[1],
+            moved[2],
+            moved[3],
+            full_step(12.0, 0.01),
+            swung,
+            full_step(12.0, 0.2),
+        );
+    }
+
+    /// The buried craft zoomed out past its depth — 40 m of eye. The
+    /// anchor is lifted to the floor plus the craft's 30.3 m of depth, so
+    /// the orbit still dips under the floor below −0.864 rad. A pitch drag
+    /// run up through that crossing and back down, 30 frames of 0.03 rad
+    /// each way, moves the eye every frame and never by more than the
+    /// drag's own step: under the floor the eye is on it exactly, over it
+    /// the intent's orbit point exactly, and no step at either crossing.
+    #[test]
+    fn a_buried_crafts_eye_crosses_the_floor_without_a_step() {
+        let com = DVec3::X * (BODY_R - 30.0);
+        let frame = ChaseFrame {
+            com,
+            centre: Some(DVec3::ZERO),
+            ..space_frame(7, 1.0, 1000.0 / 60.0)
+        };
+        let anchor = DVec3::X * (BODY_R + EYE_GROUND_CLEARANCE_M + 30.3);
+        let level = level_frame(anchor, Some(DVec3::ZERO), DVec3::Z);
+        let mut input = camera_at(40.0);
+        held(&mut input, 7);
+        input.yaw = 0.4;
+        input.pitch = -1.2;
+        let floor_r = BODY_R + EYE_GROUND_CLEARANCE_M;
+        let asked = |yaw: f64, pitch: f64| anchor + level.dir(yaw, pitch) * 40.0;
+        let mut cam = step_chase_camera(&mut input, &frame, &mut flat_floor);
+        let drag_step = full_step(40.0, 0.03);
+        let (mut crossings, mut widest, mut narrowest) = (0, 0.0_f64, f64::MAX);
+        let mut at_crossings = Vec::new();
+        for dpitch in [0.03; 30].into_iter().chain([-0.03; 30]) {
+            let before = cam.eye;
+            let was_under = asked(input.yaw, input.pitch).norm() < floor_r;
+            input.pitch += dpitch;
+            cam = step_chase_camera(&mut input, &frame, &mut flat_floor);
+            let point = asked(input.yaw, input.pitch);
+            let moved = (cam.eye - before).norm();
+            let ratio = moved / drag_step;
+            assert!(
+                moved > 0.0,
+                "pitch {}: the drag did not move the eye",
+                input.pitch
+            );
+            assert!(
+                ratio <= 1.000_1,
+                "pitch {}: the eye moved {moved} m for a drag of {drag_step} m",
+                input.pitch
+            );
+            if point.norm() < floor_r {
+                close(
+                    cam.eye.norm(),
+                    floor_r,
+                    1.0e-9,
+                    &format!("pitch {}: under the floor", input.pitch),
+                );
+            } else {
+                assert_eq!(
+                    cam.eye, point,
+                    "pitch {}: over the floor, the eye is the asked point",
+                    input.pitch
+                );
+            }
+            let under = point.norm() < floor_r;
+            if under != was_under {
+                crossings += 1;
+                at_crossings.push((input.pitch, moved, ratio));
+            }
+            widest = widest.max(ratio);
+            narrowest = narrowest.min(ratio);
+        }
+        assert_eq!(crossings, 2, "one crossing each way");
+        close(
+            input.pitch,
+            -1.2,
+            1.0e-12,
+            "the drag came back to where it started",
+        );
+        for (_, moved, ratio) in &at_crossings {
+            close(*moved, 1.04157, 1.0e-4, "the eye's step at the crossing");
+            close(
+                *ratio,
+                0.86801,
+                1.0e-4,
+                "the eye's share of the drag at the crossing",
+            );
+        }
+        eprintln!(
+            "buried craft, 40 m eye, anchor 30.3 m over the floor, drag 0.03 rad a frame ({drag_step:.4} m): eye/drag ratio {narrowest:.4}..={widest:.5}; \
+             crossings (pitch, moved m, ratio): {at_crossings:?}"
+        );
+    }
+
+    /// The ground of a shore for the flooded-craft tests: the waterline
+    /// 20 m east of the craft on +X, the land rising east at 25 % and
+    /// the sea floor falling west the same way, so the water is 5 m deep
+    /// at the craft. `dir` is a unit direction on the test body.
+    fn shore_ground(dir: DVec3) -> f64 {
+        BODY_R + 0.25 * (dir.y * BODY_R - 20.0)
+    }
+
+    /// A craft in the water at a shore: its CoM 3 m under the surface,
+    /// where the water is 5 m deep — 1.7 m over the seabed's floor. The
+    /// surface is no floor: the anchor is the CoM itself, the eye is the
+    /// intent's orbit point about it — under the water, 2 m over the
+    /// seabed — and the camera looks at the craft. A 0.01 rad drag at
+    /// pitch 0, and from ±0.01 rad, moves the eye the full 0.03 m a free
+    /// eye travels.
+    #[test]
+    fn a_craft_in_the_water_is_orbited_under_the_surface() {
+        let com = DVec3::X * (BODY_R - 3.0);
+        let frame = ChaseFrame {
+            com,
+            centre: Some(DVec3::ZERO),
+            ..space_frame(7, 1.0, 1000.0 / 60.0)
+        };
+        let mut shore = |dir: DVec3| eye_floor(shore_ground(dir));
+        let level = level_frame(com, Some(DVec3::ZERO), DVec3::Z);
+        let owed = |input: &FlightInput| com + level.dir(input.yaw, input.pitch) * 3.0;
+        let mut input = camera_at(3.0);
+        held(&mut input, 7);
+        input.yaw = core::f64::consts::FRAC_PI_2;
+        input.pitch = 0.0;
+        let first = step_chase_camera(&mut input, &frame, &mut shore);
+        close(
+            (first.eye - owed(&input)).norm(),
+            0.0,
+            1.0e-9,
+            "the eye is not the intent's orbit point about the CoM",
+        );
+        close(
+            first.eye.norm(),
+            ((BODY_R - 3.0).powi(2) + 9.0).sqrt(),
+            1.0e-9,
+            "the eye is not 3 m out, level with a CoM 3 m under the surface",
+        );
+        close(
+            BODY_R - first.eye.norm(),
+            3.0,
+            1.0e-5,
+            "the eye is not 3 m under the surface",
+        );
+        assert!(
+            first.eye.norm() > shore_ground(first.eye / first.eye.norm()),
+            "the eye is not over the seabed's floor: {:.3} m",
+            first.eye.norm() - shore_ground(first.eye / first.eye.norm())
+        );
+        let to_com = first.eye - com;
+        let back = -DVec3::new(
+            first.view_proj[3][0],
+            first.view_proj[3][1],
+            first.view_proj[3][2],
+        );
+        close(
+            back.dot(to_com / to_com.norm()),
+            1.0,
+            1.0e-12,
+            "the camera does not look at the craft",
+        );
+
+        let mut moved = Vec::new();
+        for (from, dpitch) in [(0.0, 0.01), (0.01, -0.01), (0.0, -0.01), (-0.01, 0.01)] {
+            input.pitch = from;
+            let before = step_chase_camera(&mut input, &frame, &mut shore);
+            input.pitch = from + dpitch;
+            let after = step_chase_camera(&mut input, &frame, &mut shore);
+            let step = (after.eye - before.eye).norm();
+            close(
+                step,
+                full_step(3.0, 0.01),
+                1.0e-9,
+                &format!("a 0.01 rad drag from pitch {from}"),
+            );
+            close(
+                (after.eye - owed(&input)).norm(),
+                0.0,
+                1.0e-9,
+                "still the intent's orbit point",
+            );
+            moved.push(step);
+        }
+        assert_eq!(
+            (input.yaw, input.pitch),
+            (core::f64::consts::FRAC_PI_2, 0.0),
+            "the angles are the player's own, whole"
+        );
+        eprintln!(
+            "craft in the water, CoM 3 m under the surface, from 3 m: the eye {:.3} m from the craft at pitch 0; \
+             a 0.01 rad drag at pitch 0 / +0.01 / 0 / −0.01 moves the eye {:.4} / {:.4} / {:.4} / {:.4} m (a free eye {:.4})",
+            to_com.norm(),
+            moved[0],
+            moved[1],
+            moved[2],
+            moved[3],
+            full_step(3.0, 0.01),
+        );
+    }
+
+    /// The craft in the water, its crossing. Zoomed out to 16 m, the eye
+    /// orbits east towards the shore, where the ground rises from the
+    /// seabed up the shore's slope, and dips under that floor below
+    /// pitch 0.14. A pitch drag run down through the crossing and back
+    /// up, 30 frames of 0.02 rad each way, moves the eye every frame and
+    /// never by more than the drag's own step: on the floor the eye is on
+    /// it exactly, off it the intent's orbit point exactly, and no step
+    /// at either crossing.
+    #[test]
+    fn a_craft_in_the_waters_eye_crosses_the_shore_without_a_step() {
+        let com = DVec3::X * (BODY_R - 3.0);
+        let frame = ChaseFrame {
+            com,
+            centre: Some(DVec3::ZERO),
+            ..space_frame(7, 1.0, 1000.0 / 60.0)
+        };
+        let mut shore = |dir: DVec3| eye_floor(shore_ground(dir));
+        let anchor = resting_anchor(com, 16.0, Some(DVec3::ZERO), &mut shore);
+        close(
+            (anchor - com).norm(),
+            0.0,
+            1.0e-9,
+            "the anchor is not the CoM, 1.7 m over the seabed's floor",
+        );
+        let level = level_frame(anchor, Some(DVec3::ZERO), DVec3::Z);
+        let mut input = camera_at(16.0);
+        held(&mut input, 7);
+        input.yaw = core::f64::consts::FRAC_PI_2;
+        input.pitch = 0.35;
+        let asked = |yaw: f64, pitch: f64| anchor + level.dir(yaw, pitch) * 16.0;
+        // A point's radius from the body centre and the floor along it.
+        let radii = |point: DVec3, shore: &mut dyn FnMut(DVec3) -> f64| {
+            let r = point.norm();
+            (r, shore(point / r))
+        };
+        let mut cam = step_chase_camera(&mut input, &frame, &mut shore);
+        let drag_step = full_step(16.0, 0.02);
+        let (mut crossings, mut widest, mut narrowest) = (0, 0.0_f64, f64::MAX);
+        let mut at_crossings = Vec::new();
+        for dpitch in [-0.02; 30].into_iter().chain([0.02; 30]) {
+            let before = cam.eye;
+            let (was_r, was_floor_r) = radii(asked(input.yaw, input.pitch), &mut shore);
+            input.pitch += dpitch;
+            cam = step_chase_camera(&mut input, &frame, &mut shore);
+            let (now_r, floor_r) = radii(asked(input.yaw, input.pitch), &mut shore);
+            let moved = (cam.eye - before).norm();
+            let ratio = moved / drag_step;
+            assert!(
+                moved > 0.0,
+                "pitch {}: the drag did not move the eye",
+                input.pitch
+            );
+            assert!(
+                ratio <= 1.000_1,
+                "pitch {}: the eye moved {moved} m for a drag of {drag_step} m",
+                input.pitch
+            );
+            if now_r < floor_r {
+                close(
+                    cam.eye.norm(),
+                    floor_r,
+                    1.0e-9,
+                    &format!("pitch {}: on the floor", input.pitch),
+                );
+            } else {
+                assert_eq!(
+                    cam.eye,
+                    asked(input.yaw, input.pitch),
+                    "pitch {}: over the floor, the eye is the asked point",
+                    input.pitch
+                );
+            }
+            if (now_r < floor_r) != (was_r < was_floor_r) {
+                crossings += 1;
+                at_crossings.push((input.pitch, moved, ratio));
+            }
+            widest = widest.max(ratio);
+            narrowest = narrowest.min(ratio);
+        }
+        assert_eq!(crossings, 2, "one crossing each way");
+        close(
+            input.pitch,
+            0.35,
+            1.0e-12,
+            "the drag came back to where it started",
+        );
+        for (pitch, moved, ratio) in &at_crossings {
+            assert!(
+                (*pitch - 0.13).abs() < 1.0e-9 || (*pitch - 0.15).abs() < 1.0e-9,
+                "a crossing at pitch {pitch}, not beside 0.14"
+            );
+            close(*moved, 0.13271, 1.0e-4, "the eye's step at the crossing");
+            close(
+                *ratio,
+                0.41471,
+                1.0e-4,
+                "the eye's share of the drag at the crossing",
+            );
+        }
+        eprintln!(
+            "craft in the water, 16 m eye, drag 0.02 rad a frame ({drag_step:.4} m): eye/drag ratio {narrowest:.4}..={widest:.5}; \
+             crossings (pitch, moved m, ratio): {at_crossings:?}"
+        );
+    }
+
+    /// R7: when the focus moves to a vessel 20 m away the eye does not
+    /// jump. The frame of the change moves it by exactly one step of the
+    /// travel — nothing at all without frame time — and the anchor then
+    /// closes on the new craft by the same share each frame (the
+    /// travel's own half-life) until it is under a millimetre; from then
+    /// on the camera orbits the drawn CoM exactly. A first focus travels
+    /// nothing.
+    #[test]
+    fn a_focus_change_travels_from_the_last_eye() {
+        let com = DVec3::new(20.0, 0.0, 0.0);
+        let start = || {
+            let mut input = camera_at(12.0);
+            held(&mut input, 1);
+            let before = step_chase_camera(
+                &mut input,
+                &space_frame(1, 3.0, 1000.0 / 60.0),
+                &mut no_floor,
+            );
+            (input, before)
+        };
+        // No frame time: the frame of the change moves neither eye nor view.
+        let (mut input, before) = start();
+        let still = step_chase_camera(
+            &mut input,
+            &ChaseFrame {
+                com,
+                ..space_frame(2, 3.0, 0.0)
+            },
+            &mut no_floor,
+        );
+        assert_eq!((still.eye, still.view_proj), (before.eye, before.view_proj));
+
+        let (mut input, _before) = start();
+        let to = ChaseFrame {
+            com,
+            ..space_frame(2, 3.0, 1000.0 / 60.0)
+        };
+        let mut cam = step_chase_camera(&mut input, &to, &mut no_floor);
+        let k = travel_share(20.0, 1.0 / 60.0);
+        close(
+            (cam.eye - before.eye).norm(),
+            20.0 * k,
+            1.0e-9,
+            "one easing step",
+        );
+        let mut left = 20.0 * (1.0 - k);
+        let mut frames = 0;
+        while left >= TRAVEL_DONE_M {
+            let prev = cam.eye;
+            cam = step_chase_camera(&mut input, &to, &mut no_floor);
+            left *= 1.0 - k;
+            // The frame the travel ends snaps the rest (under 1 mm).
+            let step = if left >= TRAVEL_DONE_M { k } else { 1.0 };
+            close(
+                (cam.eye - prev).norm(),
+                left / (1.0 - k) * step,
+                1.0e-9,
+                "travel step",
+            );
+            frames += 1;
+            assert!(frames < 400, "the travel never ended");
+        }
+        close(
+            (cam.eye - com).norm(),
+            input.distance_m(),
+            1.0e-9,
+            "orbiting the drawn CoM",
+        );
+
+        // A first focus starts on the new craft.
+        let mut input = camera_at(12.0);
+        let first = step_chase_camera(
+            &mut input,
+            &ChaseFrame {
+                com,
+                ..space_frame(2, 3.0, 0.0)
+            },
+            &mut no_floor,
+        );
+        close(
+            (first.eye - com).norm(),
+            12.0,
+            1.0e-9,
+            "a first focus travels nothing",
+        );
+    }
+
+    /// The travel's own half-life: the zoom's 80 ms for a short change,
+    /// and for a long one exactly what brings it under a millimetre in
+    /// half a second — the same time for a metre as for 850 km.
+    #[test]
+    fn a_travel_takes_half_a_second_whatever_its_length() {
+        assert_eq!(travel_half_life(1.0e-3 * 1.000_001), EASE_HALF_LIFE_S);
+        assert_eq!(travel_half_life(0.05), EASE_HALF_LIFE_S);
+        for d0_m in [0.1, 20.0, 850_600.0, 1.0e6] {
+            let half = travel_half_life(d0_m);
+            assert!(half < EASE_HALF_LIFE_S, "{d0_m} m: {half}");
+            close(
+                half * (d0_m / TRAVEL_DONE_M).log2(),
+                TRAVEL_SETTLE_S,
+                1.0e-12,
+                &format!("time to done at {d0_m} m"),
+            );
+        }
+        assert!(
+            travel_half_life(850_600.0) < travel_half_life(20.0),
+            "the further, the faster"
+        );
+    }
+
+    /// What [`run_travel`] saw on the way.
+    struct Travel {
+        /// Frames until the travel was done.
+        frames: usize,
+        /// The anchor's radius after the first timed frame (m).
+        first_anchor_r: f64,
+        /// How far under the floor the straight line between the two
+        /// resting anchors goes (m) — `0` where it never dips.
+        deepest_m: f64,
+        /// How far the eye moved on the first timed frame, and on the
+        /// frame of the change itself, which had no frame time (m).
+        moved_m: [f64; 2],
+    }
+
+    /// What every frame of a travel keeps on the flat body: the orbit
+    /// angles whole, the anchor and the eye on or above the floor.
+    fn held_through_travel(
+        input: &FlightInput,
+        cam: &MapCameraF64,
+        angles: (f64, f64),
+        floor_r: f64,
+        frames: usize,
+    ) {
+        let last = input.travel.last.expect("a focus was just solved");
+        assert_eq!(
+            (input.yaw, input.pitch),
+            angles,
+            "frame {frames}: a focus change touched the orbit angles"
+        );
+        assert!(
+            last.anchor.norm() >= floor_r - 1.0e-9,
+            "frame {frames}: the anchor is {} m under the floor",
+            floor_r - last.anchor.norm()
+        );
+        assert!(
+            cam.eye.norm() >= floor_r - 1.0e-9,
+            "frame {frames}: the eye is under the floor"
+        );
+    }
+
+    /// The share a travel closed on one frame: what was left shrank by
+    /// exactly `share`, or — on the frame it ends — snapped with less
+    /// than one step's worth left.
+    fn closed_share(left: f64, now: f64, share: f64, frames: usize) {
+        if now > 0.0 {
+            close(
+                now,
+                left * (1.0 - share),
+                1.0e-9 * left,
+                &format!("frame {frames}: the share changed mid-travel"),
+            );
+        } else {
+            assert!(
+                left * (1.0 - share) < TRAVEL_DONE_M,
+                "frame {frames}: snapped with {left} m left"
+            );
+        }
+    }
+
+    /// At the end of a travel the camera rests on the new craft's anchor
+    /// and looks at the craft.
+    fn rests_on(input: &FlightInput, cam: &MapCameraF64, to_anchor: DVec3, com: DVec3) {
+        let last = input.travel.last.expect("a focus was just solved");
+        assert_eq!(
+            (last.id, last.anchor),
+            (2, to_anchor),
+            "the lift outlived the travel"
+        );
+        close(
+            (last.look_at - com).norm(),
+            0.0,
+            1.0e-9,
+            "at rest the camera does not look at the craft",
+        );
+        close(
+            (cam.eye - to_anchor).norm(),
+            12.0,
+            1.0e-9,
+            "orbiting the new craft's resting anchor at rest",
+        );
+    }
+
+    /// Drive a focus change from a craft at `from` — vessel 1, where the
+    /// camera came to rest — to vessel 2 at `com`, `dt_ms` a frame on the
+    /// flat body, until the travel is done. The frame of the change, with
+    /// no frame time, must move neither the eye, nor the view, nor the
+    /// look-at; every later frame must keep the orbit angles exactly, keep
+    /// the anchor and the eye on or above the floor, and close the same
+    /// share of the travel; at the end the camera must orbit vessel 2's
+    /// resting anchor and look at vessel 2.
+    fn run_travel(from: DVec3, com: DVec3, dt_ms: f64) -> Travel {
+        let resting =
+            |craft: DVec3| resting_anchor(craft, 12.0, Some(DVec3::ZERO), &mut flat_floor);
+        let (from_anchor, to_anchor) = (resting(from), resting(com));
+        let d0_m = (from_anchor - to_anchor).norm();
+        let share = travel_share(d0_m, dt_ms / 1000.0);
+        let floor_r = BODY_R + EYE_GROUND_CLEARANCE_M;
+        let mut input = camera_at(12.0);
+        let settled = step_chase_camera(&mut input, &body_frame(1, from, dt_ms), &mut flat_floor);
+        let settled_look = input.travel.last.expect("a focus was just solved").look_at;
+        let (yaw, pitch) = (input.yaw, input.pitch);
+
+        // The frame of the change, before any time is put in.
+        let still = step_chase_camera(&mut input, &body_frame(2, com, 0.0), &mut flat_floor);
+        same_view(&still, &settled, "the frame of the change");
+        close(
+            (input.travel.last.expect("a focus was just solved").look_at - settled_look).norm(),
+            0.0,
+            1.0e-9,
+            "the frame of the change moved the look-at",
+        );
+        close(
+            input.travel.offset.norm(),
+            d0_m,
+            1.0e-9 * d0_m.max(1.0),
+            "the travel does not run from the previous resting anchor to this one",
+        );
+
+        let mut cam = step_chase_camera(&mut input, &body_frame(2, com, dt_ms), &mut flat_floor);
+        let moved_m = [
+            (cam.eye - settled.eye).norm(),
+            (still.eye - settled.eye).norm(),
+        ];
+        close(
+            input.travel.offset.norm(),
+            d0_m * (1.0 - share),
+            1.0e-9 * d0_m.max(1.0),
+            "the first timed frame closed one travel share",
+        );
+        let first_anchor_r = input
+            .travel
+            .last
+            .expect("a focus was just solved")
+            .anchor
+            .norm();
+        let mut deepest_m: f64 = 0.0;
+        let mut frames = 1;
+        loop {
+            held_through_travel(&input, &cam, (yaw, pitch), floor_r, frames);
+            deepest_m = deepest_m.max(floor_r - (to_anchor + input.travel.offset).norm());
+            if input.travel.offset == DVec3::ZERO {
+                break;
+            }
+            let left = input.travel.offset.norm();
+            cam = step_chase_camera(&mut input, &body_frame(2, com, dt_ms), &mut flat_floor);
+            closed_share(left, input.travel.offset.norm(), share, frames);
+            frames += 1;
+            assert!(frames <= 4_000, "the travel never ended");
+        }
+        rests_on(&input, &cam, to_anchor, com);
+        Travel {
+            frames,
+            first_anchor_r,
+            deepest_m,
+            moved_m,
+        }
+    }
+
+    /// R7 for a far change, on the flat body: from 20 m to a thousand
+    /// kilometres away, at 30, 60 and 144 fps, the travel is done — the
+    /// anchor on the new craft — within half a second plus the frame
+    /// that crosses it, the anchor never dips under the floor, and yaw
+    /// and pitch come out bit-identical. A thousand kilometres away the
+    /// straight line crosses the planet hundreds of kilometres deep: the
+    /// anchor rides the floor plus one eye distance instead. Twenty
+    /// metres away it never dips and is not lifted.
+    #[test]
+    fn a_focus_change_is_done_in_half_a_second_and_keeps_the_orbit() {
+        let from = DVec3::new(BODY_R + 5.0, 0.0, 0.0);
+        let floor_r = BODY_R + EYE_GROUND_CLEARANCE_M;
+        for fps in [30.0, 60.0, 144.0] {
+            let dt_ms = 1000.0 / fps;
+            for (d0_m, crosses) in [(20.0, false), (1.0e6, true)] {
+                let com = neighbour(d0_m);
+                close((from - com).norm(), d0_m, 1.0e-7, "the crafts' distance");
+                let travel = run_travel(from, com, dt_ms);
+                let t_s = travel.frames as f64 * dt_ms / 1000.0;
+                assert!(
+                    t_s <= TRAVEL_SETTLE_S + dt_ms / 1000.0,
+                    "{d0_m} m at {fps} fps: {} frames, {t_s:.3} s",
+                    travel.frames
+                );
+                assert!(
+                    t_s >= TRAVEL_SETTLE_S - dt_ms / 1000.0,
+                    "{d0_m} m at {fps} fps: done in {t_s:.3} s, too fast for its half-life"
+                );
+                eprintln!(
+                    "focus change {d0_m:.0} m at {fps:.0} fps: half-life {:.1} ms, done in {} frames \
+                     ({t_s:.3} s); straight line {:.3} m under the floor at its deepest; \
+                     first anchor {:.6} m over the floor",
+                    travel_half_life(d0_m) * 1000.0,
+                    travel.frames,
+                    travel.deepest_m,
+                    travel.first_anchor_r - floor_r,
+                );
+                if crosses {
+                    assert!(
+                        travel.deepest_m > 12.0,
+                        "the straight line never crossed the planet"
+                    );
+                    close(
+                        travel.first_anchor_r,
+                        floor_r + 12.0,
+                        1.0e-6,
+                        "lifted one eye distance over the floor",
+                    );
+                } else {
+                    assert_eq!(
+                        travel.deepest_m, 0.0,
+                        "a short travel stays above the floor"
+                    );
+                    close(
+                        travel.first_anchor_r,
+                        from.norm(),
+                        1.0e-4,
+                        "a short travel is not lifted",
+                    );
+                }
+            }
+        }
+    }
+
+    /// A focus change FROM a craft under the floor — 30 m down, its
+    /// anchor 12 m over the ground — and one TO it, at 30, 60 and 144
+    /// fps, 20 m and a thousand kilometres. The frame of the change moves
+    /// the eye by nothing at all: it has no frame time, and the travel
+    /// starts where the last frame's eye orbited, which already is the
+    /// buried craft's lifted anchor (it used to start 30 m further down,
+    /// at the CoM, and be lifted in full on that first frame — a jump of
+    /// 12.963 m). The first timed frame moves the eye by one step of the
+    /// travel; the travel is done in half a second plus a frame; and at
+    /// rest the camera orbits the new craft's resting anchor — over the
+    /// ground, for the buried one — and looks at the craft.
+    #[test]
+    fn a_focus_change_from_or_to_a_buried_craft_moves_nothing_on_its_first_frame() {
+        let buried = DVec3::X * (BODY_R - 30.0);
+        let above = DVec3::new(BODY_R + 5.0, 0.0, 0.0);
+        let floor_r = BODY_R + EYE_GROUND_CLEARANCE_M;
+        for fps in [30.0, 60.0, 144.0] {
+            let dt_ms = 1000.0 / fps;
+            for (from, to, what) in [
+                (buried, neighbour(20.0), "from the buried craft, 20 m"),
+                (buried, neighbour(1.0e6), "from the buried craft, 1 000 km"),
+                (above, buried, "to the buried craft, 20 m"),
+            ] {
+                let travel = run_travel(from, to, dt_ms);
+                let t_s = travel.frames as f64 * dt_ms / 1000.0;
+                assert!(
+                    travel.moved_m[1] <= 1.0e-9,
+                    "{what} at {fps:.0} fps: the frame of the change moved the eye {} m",
+                    travel.moved_m[1]
+                );
+                assert!(
+                    t_s <= TRAVEL_SETTLE_S + dt_ms / 1000.0,
+                    "{what} at {fps:.0} fps: {} frames, {t_s:.3} s",
+                    travel.frames
+                );
+                assert!(
+                    t_s >= TRAVEL_SETTLE_S - dt_ms / 1000.0,
+                    "{what} at {fps:.0} fps: done in {t_s:.3} s, too fast for its half-life"
+                );
+                eprintln!(
+                    "focus change {what} at {fps:.0} fps: the frame of the change moved the eye {:.6} m; \
+                     the first timed frame {:.4} m; done in {} frames ({t_s:.3} s); \
+                     straight line {:.3} m under the floor at its deepest; first anchor {:.6} m over the floor",
+                    travel.moved_m[1],
+                    travel.moved_m[0],
+                    travel.frames,
+                    travel.deepest_m,
+                    travel.first_anchor_r - floor_r,
+                );
+            }
+        }
+    }
+
+    /// The resting anchor on its own. A craft under the floor keeps its
+    /// anchor `depth + min(depth, eye distance)` above its CoM: 30.3 m
+    /// down with a 12 m eye, 12 m over the floor; 3 m down with a 12 m
+    /// eye, 3 m over it; 3 m down with a 3 m eye, 3 m over it. A craft at
+    /// or above the floor rests on its CoM, and without a body there is no
+    /// floor to sample.
+    #[test]
+    fn a_craft_under_the_floor_rests_on_an_anchor_over_the_ground() {
+        let floor_r = BODY_R + EYE_GROUND_CLEARANCE_M;
+        let rest = |com: DVec3, eye_m: f64| {
+            resting_anchor(com, eye_m, Some(DVec3::ZERO), &mut flat_floor).x
+        };
+        close(
+            rest(DVec3::X * (BODY_R - 30.0), 12.0),
+            floor_r + 12.0,
+            1.0e-9,
+            "30.3 m down from 12 m",
+        );
+        close(
+            rest(DVec3::X * (floor_r - 3.0), 12.0),
+            floor_r + 3.0,
+            1.0e-9,
+            "3 m down from 12 m",
+        );
+        close(
+            rest(DVec3::X * (floor_r - 3.0), 3.0),
+            floor_r + 3.0,
+            1.0e-9,
+            "3 m down from 3 m",
+        );
+        close(
+            rest(DVec3::X * (floor_r - 1.0e-4), 12.0),
+            floor_r + 1.0e-4,
+            1.0e-12,
+            "a hair under the floor: its depth over the floor",
+        );
+        assert_eq!(
+            rest(DVec3::X * floor_r, 12.0),
+            floor_r,
+            "on the floor: the CoM itself"
+        );
+        assert_eq!(
+            rest(DVec3::X * (BODY_R + 5.0), 12.0),
+            BODY_R + 5.0,
+            "over the floor: the CoM itself"
+        );
+        let mut never = |_: DVec3| -> f64 { panic!("no body, no floor to sample") };
+        let com = DVec3::X * (BODY_R - 30.0);
+        assert_eq!(resting_anchor(com, 12.0, None, &mut never), com);
+    }
+
+    /// The ground rule for a travelling anchor on its own. One under the
+    /// floor is lifted radially to the floor plus its depth up to one
+    /// eye distance: 5 m deep, 5 m up; a tenth of an eye distance deep,
+    /// a tenth up; anything deeper, a full eye distance up, so the whole
+    /// orbit clears the ground. The margin shrinks with the travel that
+    /// is left and is nothing once the travel is done — an at-rest
+    /// anchor is the craft's own, under the floor or not. An anchor above
+    /// the floor, or with no body under it, is handed back untouched.
+    #[test]
+    fn a_travelling_anchor_is_lifted_just_over_the_ground() {
+        let floor_r = BODY_R + EYE_GROUND_CLEARANCE_M;
+        let under = DVec3::X * (BODY_R - 300_000.0);
+        let lifted = |anchor: DVec3, remaining_m: f64, eye_m: f64| {
+            travel_anchor(
+                anchor,
+                remaining_m,
+                eye_m,
+                Some(DVec3::ZERO),
+                &mut flat_floor,
+            )
+        };
+        let over = |got: DVec3, want_r: f64, what: &str| {
+            assert!(got.y == 0.0 && got.z == 0.0, "lifted radially: {got:?}");
+            close(got.x, want_r, 1.0e-9, what);
+        };
+        over(lifted(under, 500_000.0, 12.0), floor_r + 12.0, "deep under");
+        over(
+            lifted(DVec3::X * (floor_r - 5.0), 500_000.0, 12.0),
+            floor_r + 5.0,
+            "5 m under",
+        );
+        over(
+            lifted(DVec3::X * (floor_r - 3.0), 6.0, 12.0),
+            floor_r + 1.5,
+            "3 m under, half an eye distance to go",
+        );
+        // Done (or never started): the anchor is left where it is.
+        assert_eq!(
+            lifted(DVec3::X * (floor_r - 3.0), 0.0, 12.0),
+            DVec3::X * (floor_r - 3.0)
+        );
+        assert_eq!(lifted(under, 500_000.0, 0.0), under);
+        let above = DVec3::new(BODY_R + 5.0, 0.1, 0.2);
+        assert_eq!(lifted(above, 500_000.0, 12.0), above);
+        // No body: nothing to lift against — the floor is not sampled.
+        let mut never = |_: DVec3| -> f64 { panic!("no body, no floor to sample") };
+        assert_eq!(
+            travel_anchor(under, 500_000.0, 12.0, None, &mut never),
+            under
+        );
+    }
+
+    /// A change to a craft already under a millimetre from where the eye
+    /// orbited is no travel at all — the anchor is the new craft's resting
+    /// anchor that same frame — and neither is one from an anchor that is
+    /// not a number.
+    #[test]
+    fn a_focus_change_with_nothing_to_travel_starts_on_the_new_craft() {
+        let com = DVec3::new(BODY_R + 5.0, 20.0, 0.0);
+        let beside = com + DVec3::X * 5.0e-4;
+        assert!((beside - com).norm() < TRAVEL_DONE_M);
+        let nan = DVec3::new(f64::NAN, 0.0, 0.0);
+        let inf = DVec3::new(f64::INFINITY, 0.0, 0.0);
+        for from in [com, beside, nan, inf] {
+            let mut input = camera_at(12.0);
+            input.travel.last = Some(Last {
+                id: 1,
+                anchor: from,
+                look_at: from,
+                skirt: DVec3::ZERO,
+                eye: from,
+                carried: from,
+                moved_m: None,
+                travelled: 0.0,
+            });
+            let cam = step_chase_camera(
+                &mut input,
+                &body_frame(2, com, 1000.0 / 60.0),
+                &mut flat_floor,
+            );
+            assert_eq!(input.travel.offset, DVec3::ZERO, "from {from:?}");
+            assert!(input.travel.half_life_s.is_none(), "from {from:?}");
+            assert_eq!(
+                input.travel.last.map(|l| (l.id, l.anchor)),
+                Some((2, com)),
+                "from {from:?}"
+            );
+            close(
+                (cam.eye - com).norm(),
+                12.0,
+                1.0e-9,
+                &format!("from {from:?}: orbiting the new craft"),
+            );
+        }
+    }
+
+    /// One frame of `csp-app`'s loop without the window, 60 fps: the
+    /// frame's wall time handed over the way `run_frame` does, the
+    /// camera events drained through the Input schedule, the scene clock
+    /// standing still.
+    fn session_frame(view: &mut crate::View) {
+        view.update_session(1000.0 / 60.0, 1, 1, None);
+        view.begin_frame();
+        view.end_frame();
+    }
+
+    /// Pump frames until the flight packet carries the REAL baked
+    /// heightfield of the dominant body — the render gate's wait. Until
+    /// it lands the floor samples the bare datum.
+    fn wait_for_real_heightfield(view: &mut crate::View) {
+        let want = {
+            let cfg = view.world.resource::<crate::terrain::TerrainConfig>();
+            let body_id = view
+                .world
+                .resource::<FlightSnapshot>()
+                .env
+                .as_ref()
+                .and_then(|e| e.body.as_ref())
+                .expect("a dominant body");
+            let body = cfg
+                .bodies
+                .get(body_id.as_str())
+                .expect("a terrain entry for the dominant body");
+            csp_render::terrain::HeightField::bake_profiled_key(body.seed, body.profile)
+        };
+        for _ in 0..12_000 {
+            session_frame(view);
+            if let Some(p) = view.take_flight_packet()
+                && let Some(t) = &p.terrain
+                && let Some(h) = &t.heightfield
+                && h.key == want
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!(
+            "the real heightfield never landed in the flight packet — the background bake stalled?"
+        );
+    }
+
+    /// Where the solved camera and the focused craft sit over the REAL
+    /// surface.
+    struct OverGround {
+        /// The eye's radius from the body centre (m).
+        eye_r: f64,
+        /// The craft's drawn CoM radius (m).
+        com_r: f64,
+        /// The ground radius sampled under the eye (m) — the floor's own
+        /// sampler, [`crate::terrain::ground_radius`].
+        ground_r: f64,
+        /// The body's datum radius (m).
+        datum_r: f64,
+    }
+
+    fn over_ground(view: &mut crate::View, focus: u64) -> OverGround {
+        let (eye, com, env) = {
+            let scene = view.world.resource::<DrawnScene>();
+            let env = scene
+                .env()
+                .or_else(|| view.world.resource::<FlightSnapshot>().env.as_ref())
+                .expect("physics")
+                .clone();
+            let com = scene.drawn(focus).expect("the focus is drawn").com;
+            let eye = view.world.resource::<FlightCameraF64>().0.eye;
+            (eye, com, env)
+        };
+        let rel = eye - env.body_center;
+        let ground_r = {
+            // A bevy world lends one resource out at a time: the cache
+            // leaves it for the sample and goes straight back.
+            let mut cache = view
+                .world
+                .remove_resource::<crate::terrain::TerrainCache>()
+                .expect("the terrain cache is installed");
+            let cfg = view.world.resource::<crate::terrain::TerrainConfig>();
+            let ground_r =
+                crate::terrain::ground_radius(cfg, &mut cache, &env, rel / rel.norm(), 0.0);
+            view.world.insert_resource(cache);
+            ground_r
+        };
+        OverGround {
+            eye_r: rel.norm(),
+            com_r: (com - env.body_center).norm(),
+            ground_r,
+            datum_r: env.radius_m,
+        }
+    }
+
+    /// The floor `flight_camera` solves against along a unit direction on
+    /// the REAL body: [`eye_floor`] over [`crate::terrain::ground_radius`].
+    fn floor_along(view: &mut crate::View, dir: DVec3) -> f64 {
+        let env = view
+            .world
+            .resource::<DrawnScene>()
+            .env()
+            .or_else(|| view.world.resource::<FlightSnapshot>().env.as_ref())
+            .expect("physics")
+            .clone();
+        // A bevy world lends one resource out at a time: the cache
+        // leaves it for the sample and goes straight back.
+        let mut cache = view
+            .world
+            .remove_resource::<crate::terrain::TerrainCache>()
+            .expect("the terrain cache is installed");
+        let cfg = view.world.resource::<crate::terrain::TerrainConfig>();
+        let floor_r = eye_floor(crate::terrain::ground_radius(
+            cfg, &mut cache, &env, dir, 0.0,
+        ));
+        view.world.insert_resource(cache);
+        floor_r
+    }
+
+    /// The eye the camera owes an orbit on the REAL body: the intent's
+    /// orbit point about the focus's drawn CoM, lifted radially onto
+    /// `flight_camera`'s own floor — [`eye_floor`] over
+    /// [`crate::terrain::ground_radius`] — while it is under it.
+    fn owed_eye(view: &mut crate::View, focus: u64) -> DVec3 {
+        let (com, env, yaw, pitch, distance_m) = {
+            let scene = view.world.resource::<DrawnScene>();
+            let env = scene
+                .env()
+                .or_else(|| view.world.resource::<FlightSnapshot>().env.as_ref())
+                .expect("physics")
+                .clone();
+            let com = scene.drawn(focus).expect("the focus is drawn").com;
+            let input = view.world.resource::<FlightInput>();
+            (com, env, input.yaw, input.pitch, input.distance_m())
+        };
+        let asked = com
+            + level_frame(com, Some(env.body_center), env.spin_axis).dir(yaw, pitch) * distance_m;
+        let rel = asked - env.body_center;
+        let r = rel.norm();
+        let dir = rel / r;
+        let floor_r = floor_along(view, dir);
+        if r < floor_r {
+            env.body_center + dir * floor_r
+        } else {
+            asked
+        }
+    }
+
+    /// The solved camera's eye, with the pitch and the distance it was
+    /// solved at.
+    fn solved(view: &crate::View) -> (DVec3, f64, f64) {
+        let (input, cam) = (
+            view.world.resource::<FlightInput>(),
+            view.world.resource::<FlightCameraF64>(),
+        );
+        (cam.0.eye, input.pitch, input.distance_m())
+    }
+
+    /// The starter craft on the REAL pad, the baked heightfield landed and
+    /// the framing settled: the scene both real-pad tests run on. Returns
+    /// the view and the craft's id as the flight scene stages it.
+    fn real_pad_view() -> (crate::View, u64) {
+        let mut view = crate::View::new().expect("data/ load");
+        view.seed_starter_craft().expect("starter seed");
+        view.set_flight_viewport(320.0, 240.0);
+        // The seed lands in its first stepped frames; then the framing
+        // settles and the bake lands on idle ones.
+        for _ in 0..3 {
+            view.begin_frame();
+            view.sim_step(view.sim.clock().ticks() + 1)
+                .expect("sim step");
+            view.end_frame();
+        }
+        wait_for_real_heightfield(&mut view);
+        // The framing eases to a rest: pump until the eye holds still.
+        // The view used to bake its own field here, and those idle
+        // frames finished the settling; it now draws the simulation's
+        // field from the first frame, so the rest is this loop's job.
+        let mut still = 0;
+        for _ in 0..12_000 {
+            let before = solved(&view).0;
+            session_frame(&mut view);
+            still = if solved(&view).0 == before {
+                still + 1
+            } else {
+                0
+            };
+            if still == 8 {
+                break;
+            }
+        }
+        assert_eq!(still, 8, "the framing never came to rest");
+        let focus = view.flight_focus().expect("the starter craft is focused");
+        (view, focus.0)
+    }
+
+    /// The floor under one craft on the REAL body, in the least-distance
+    /// rule's own terms.
+    struct UnderCraft {
+        /// The body's centre.
+        centre: DVec3,
+        /// The craft's local up.
+        up: DVec3,
+        /// The yaw's horizontal at the craft, squared up to `up`.
+        along: DVec3,
+        /// The floor's radius under the craft (m).
+        n_r: f64,
+    }
+
+    impl UnderCraft {
+        fn at(view: &mut crate::View, com: DVec3, yaw: f64) -> Self {
+            let env = view
+                .world
+                .resource::<FlightSnapshot>()
+                .env
+                .as_ref()
+                .expect("physics")
+                .clone();
+            let up = (com - env.body_center) / (com - env.body_center).norm();
+            let along = level_frame(com, Some(env.body_center), env.spin_axis).dir(yaw, 0.0);
+            let n_r = floor_along(view, up);
+            Self {
+                centre: env.body_center,
+                up,
+                along,
+                n_r,
+            }
+        }
+
+        /// How far `point` is along the floor from the point under the
+        /// craft.
+        fn along_to(&self, point: DVec3) -> f64 {
+            let out = point - self.centre;
+            let side = out - self.up * out.dot(self.up);
+            side.norm().atan2(out.dot(self.up)) * self.n_r
+        }
+
+        /// The floor point `x` metres along the floor from the point
+        /// under the craft.
+        fn floor_at(&self, view: &mut crate::View, x: f64) -> DVec3 {
+            let (sin, cos) = (x / self.n_r).sin_cos();
+            let dir = self.up * cos + self.along * sin;
+            self.centre + dir * floor_along(view, dir)
+        }
+    }
+
+    /// What a drag back up out of the zone and down into it again saw.
+    struct GroundSweep {
+        /// The least and the most the eye moved on any frame outside the
+        /// zone — the frame that left it and the frame that entered it
+        /// again included (m).
+        moved_m: [f64; 2],
+        /// The most the eye moved on any frame inside the zone, and the
+        /// most that was for a metre of its orbit point's slide (m).
+        inside_moved_m: [f64; 2],
+        /// The nearest the eye came to the CoM (m).
+        nearest_m: f64,
+        /// The pitch of the frame the eye entered the zone on again (rad),
+        /// and how far out along the yaw's line its orbit point was on the
+        /// frame before and on that frame (m): the turn lies between the
+        /// two.
+        entry: (f64, [f64; 2]),
+    }
+
+    /// From the eye's place at the pitch limit, drag 60 frames of 0.01 rad
+    /// up and the same down through the real input path, a frame at a
+    /// time: every frame 0.3 m over the ground and moving, never nearer
+    /// than `rmin` to the CoM and exactly that distance from it while it
+    /// is inside the zone; by no more than the drag's own step outside the
+    /// zone and on the frames that leave and enter it, by no more than
+    /// [`skirt_plateau`] times the orbit point's slide inside it; the way
+    /// down retracing the way up to a nanometre.
+    fn sweep_the_ground(
+        view: &mut crate::View,
+        focus: u64,
+        com: DVec3,
+        rmin: f64,
+        under: &UnderCraft,
+        start: DVec3,
+    ) -> GroundSweep {
+        let distance_m = view.world.resource::<FlightInput>().distance_m();
+        let drag_step = full_step(distance_m, 0.01);
+        let mut sweep = GroundSweep {
+            moved_m: [f64::MAX, 0.0],
+            inside_moved_m: [0.0; 2],
+            nearest_m: (start - com).norm(),
+            entry: (0.0, [0.0; 2]),
+        };
+        let (mut up_path, mut down_path) = (Vec::new(), Vec::new());
+        // The eye starts at the pitch limit, inside the zone.
+        let (mut previous, mut before) = (start, (0.0, true));
+        for dpitch in [0.01; 60].into_iter().chain([-0.01; 60]) {
+            view.flight_event(FlightEvent::Orbit { dyaw: 0.0, dpitch });
+            session_frame(view);
+            let (eye, pitch, _) = solved(view);
+            let what = format!("pitch {pitch:+.4} rad");
+            let over = over_ground(view, focus);
+            close(
+                over.eye_r - over.ground_r,
+                EYE_GROUND_CLEARANCE_M,
+                1.0e-6,
+                &format!("{what}: the eye over the ground"),
+            );
+            let point = owed_eye(view, focus);
+            let (now, inside) = (under.along_to(point), (point - com).norm() < rmin);
+            let (moved, to_com) = ((eye - previous).norm(), (eye - com).norm());
+            assert!(
+                to_com >= rmin - SKIRT_PRECISION_M,
+                "{what}: the eye came {to_com} m from the CoM, inside the least distance {rmin}"
+            );
+            if inside {
+                close(
+                    to_com,
+                    rmin,
+                    1.0e-6,
+                    &format!("{what}: the eye is not on the least distance"),
+                );
+            }
+            if inside && before.1 {
+                let slid = (now - before.0).abs();
+                assert!(moved > 0.0, "{what}: the drag did not move the eye");
+                assert!(
+                    moved <= skirt_plateau() * slid * 1.001,
+                    "{what}: the eye moved {moved} m inside the zone for a slide of {slid} m"
+                );
+                sweep.inside_moved_m = [
+                    sweep.inside_moved_m[0].max(moved),
+                    sweep.inside_moved_m[1].max(moved / slid),
+                ];
+            } else {
+                dragged(com, rmin, drag_step, eye, previous, &what);
+                sweep.moved_m = [sweep.moved_m[0].min(moved), sweep.moved_m[1].max(moved)];
+            }
+            if inside && !before.1 {
+                sweep.entry = (pitch, [before.0, now]);
+            }
+            sweep.nearest_m = sweep.nearest_m.min(to_com);
+            if dpitch > 0.0 {
+                up_path.push(eye);
+            } else {
+                down_path.push(eye);
+            }
+            (previous, before) = (eye, (now, inside));
+        }
+        close(
+            solved(view).1,
+            -PITCH_LIMIT,
+            1.0e-9,
+            "the drag came back to where it started",
+        );
+        // The sixtieth step down lands where the drag started; the other
+        // fifty-nine on the eyes of the way up.
+        close(
+            (previous - start).norm(),
+            0.0,
+            1.0e-9,
+            "the drag did not come back to the eye it started from",
+        );
+        for (down, up) in down_path.iter().take(59).zip(up_path.iter().rev().skip(1)) {
+            close(
+                (*down - *up).norm(),
+                0.0,
+                1.0e-9,
+                "a reversed drag left the path",
+            );
+        }
+        sweep
+    }
+
+    /// The floor wiring on the REAL body — `flight_camera`'s own sampler
+    /// over the real heightfield, no synthetic floor: the seeded starter
+    /// craft on Terrin's pad, the background bake waited out the way the
+    /// render gate waits for it. Dragged well below the horizon, the eye
+    /// rides the floor exactly 0.3 m over the real ground under it, below
+    /// the craft's CoM, and the pitch is the dragged one — the floor
+    /// rewrites nothing. A reversed drag moves the eye on the very next
+    /// frame, along the ground: to the lifted orbit point to the last
+    /// digit, and never further than the drag itself.
+    #[test]
+    fn on_the_real_pad_the_eye_stops_just_over_the_ground() {
+        let (mut view, focus) = real_pad_view();
+        let framed = over_ground(&mut view, focus);
+        assert!(
+            framed.eye_r > framed.com_r,
+            "by default the craft is framed from above"
+        );
+
+        // Dragged well below the horizon: an upward drag, the pitch
+        // falling to −0.75 rad.
+        view.flight_event(FlightEvent::Orbit {
+            dyaw: 0.0,
+            dpitch: -1.0,
+        });
+        session_frame(&mut view);
+        let low = over_ground(&mut view, focus);
+        let (low_eye, low_pitch, _) = solved(&view);
+        close(
+            low.eye_r - low.ground_r,
+            EYE_GROUND_CLEARANCE_M,
+            1.0e-6,
+            "the eye over the ground under it",
+        );
+        assert!(
+            low.eye_r < low.com_r,
+            "the eye is not below the craft's CoM"
+        );
+        close(
+            low_pitch,
+            0.25 - 1.0,
+            1.0e-12,
+            "the drag reached the pitch whole — the floor rewrote nothing",
+        );
+        close(
+            (low_eye - owed_eye(&mut view, focus)).norm(),
+            0.0,
+            1.0e-9,
+            "the eye is not the asked point lifted onto the real floor",
+        );
+
+        // A reversed drag moves the eye on the very next frame: along the
+        // ground, away from the point under the craft, to the lifted orbit
+        // point — never further than the drag's own step.
+        view.flight_event(FlightEvent::Orbit {
+            dyaw: 0.0,
+            dpitch: 0.02,
+        });
+        session_frame(&mut view);
+        let (risen_eye, now_pitch, distance_m) = solved(&view);
+        close(
+            (risen_eye - owed_eye(&mut view, focus)).norm(),
+            0.0,
+            1.0e-9,
+            "the eye is not the asked point lifted onto the real floor",
+        );
+        let risen = over_ground(&mut view, focus);
+        let moved = (risen_eye - low_eye).norm();
+        let drag_step = distance_m * 2.0 * (0.01_f64).sin();
+        eprintln!(
+            "real pad: ground {:+.3} m over the datum, craft CoM {:.3} m over the ground; dragged to the floor: \
+             eye {:.6} m over the ground, pitch {low_pitch:.4} rad; reversed drag +0.02 rad at {distance_m:.3} m: \
+             the eye moved {moved:.4} m along the ground (the drag's own step {drag_step:.4} m), now {:.6} m over the ground",
+            low.ground_r - low.datum_r,
+            low.com_r - low.ground_r,
+            low.eye_r - low.ground_r,
+            risen.eye_r - risen.ground_r,
+        );
+        assert!(
+            moved > 0.0 && moved <= drag_step * 1.000_1,
+            "the eye moved {moved} m for a drag of {drag_step} m"
+        );
+        close(
+            now_pitch,
+            low_pitch + 0.02,
+            1.0e-12,
+            "the drag reached the pitch whole",
+        );
+    }
+
+    /// The REAL pad, through the input path: the starter craft dragged
+    /// straight down to the pitch limit. Its lifted eye used to end 2.6 m
+    /// from the CoM, inside the craft's least distance; it goes round the
+    /// craft along the real ground instead — 0.300 m over it, exactly the
+    /// least distance from the CoM — and a drag back up out of the zone
+    /// and down into it again, 0.01 rad a frame, moves the eye every
+    /// frame: by no more than the drag's own step outside the zone and on
+    /// the frames that leave and enter it, by no more than the circle's
+    /// pace inside it; and back along the same path. The turn it crosses
+    /// is the real floor's own: where the floor out along the yaw's line
+    /// is first the least distance from the CoM.
+    #[test]
+    fn on_the_real_pad_the_eye_goes_round_the_starter_craft() {
+        let (mut view, focus) = real_pad_view();
+        let radius_m = view
+            .world
+            .resource::<CraftRadii>()
+            .0
+            .iter()
+            .find(|(id, _)| *id == focus)
+            .map_or(0.0, |(_, r)| *r);
+        let com = view
+            .world
+            .resource::<DrawnScene>()
+            .drawn(focus)
+            .expect("the focus is drawn")
+            .com;
+        let rmin = min_distance(radius_m);
+        // The chute's canister on the pod's top node (M4c landing) grew
+        // the starter past the 3.062 m the synthetic tests still pin.
+        close(
+            radius_m,
+            3.329_281_447_275,
+            1.0e-3,
+            "the starter craft's bounding radius",
+        );
+        let (yaw, distance_m) = {
+            let input = view.world.resource::<FlightInput>();
+            (input.yaw, input.distance_m())
+        };
+        let under = UnderCraft::at(&mut view, com, yaw);
+
+        // Straight down: the pitch to its limit in one drag.
+        view.flight_event(FlightEvent::Orbit {
+            dyaw: 0.0,
+            dpitch: -2.0,
+        });
+        session_frame(&mut view);
+        let low = over_ground(&mut view, focus);
+        let (low_eye, low_pitch, _) = solved(&view);
+        close(
+            low_pitch,
+            -PITCH_LIMIT,
+            1.0e-12,
+            "the drag reached the pitch limit",
+        );
+        close(
+            low.eye_r - low.ground_r,
+            EYE_GROUND_CLEARANCE_M,
+            1.0e-6,
+            "the eye over the ground under it",
+        );
+        close(
+            (low_eye - com).norm(),
+            rmin,
+            1.0e-6,
+            "at the pitch limit the eye is on the least distance",
+        );
+
+        // The turn on the real floor, bisected here afresh: where the
+        // floor out along the yaw's line is first the least distance from
+        // the CoM.
+        let turn_m = {
+            let (mut before, mut after) = (0.0, 12.0);
+            for _ in 0..60 {
+                let mid = 0.5 * (before + after);
+                if (under.floor_at(&mut view, mid) - com).norm() < rmin {
+                    before = mid;
+                } else {
+                    after = mid;
+                }
+            }
+            after
+        };
+        close(
+            (under.floor_at(&mut view, turn_m) - com).norm(),
+            rmin,
+            1.0e-9,
+            "the floor's distance from the CoM at the turn",
+        );
+
+        // Back up out of the zone and down into it again.
+        let sweep = sweep_the_ground(&mut view, focus, com, rmin, &under, low_eye);
+        let (entry_pitch, [before, at]) = sweep.entry;
+        assert!(
+            before >= turn_m - 1.0e-9 && at <= turn_m + 1.0e-9,
+            "the eye entered the zone between {before} and {at} m out, not at the turn {turn_m}"
+        );
+        let height_m = low.com_r - low.ground_r - EYE_GROUND_CLEARANCE_M;
+        let (out, side) = (under.along_to(low_eye), under.along.cross(under.up));
+        let over = low_eye - under.centre;
+        let bearing = over.dot(side).atan2(over.dot(under.along));
+        eprintln!(
+            "real pad: radius {radius_m:.3} m, least distance {rmin:.3} m, CoM {:.3} m over the ground, eye {distance_m:.3} m; \
+             dragged to the pitch limit: eye {:.6} m over the ground, {:.6} m from the CoM, {:.3} m out along the yaw's line \
+             and {:.1}° round from the turn; the turn {turn_m:.3} m along the real ground, where the floor is the least distance from the CoM \
+             ({:.3} m on flat ground); back up and down again the eye entered the zone at pitch {entry_pitch:+.4} rad, between {before:.3} and {at:.3} m out; \
+             nearest eye over the sweep {:.9} m; outside the zone the eye moved {:.4}..{:.4} m a frame (the drag's own step {:.4} m), \
+             inside it at most {:.4} m, {:.2} m per metre of slide (at most {:.2}); the reversed drag retraced every frame to a nanometre",
+            low.com_r - low.ground_r,
+            low.eye_r - low.ground_r,
+            (low_eye - com).norm(),
+            out,
+            bearing.to_degrees(),
+            (rmin * rmin - height_m * height_m).sqrt(),
+            sweep.nearest_m,
+            sweep.moved_m[0],
+            sweep.moved_m[1],
+            full_step(distance_m, 0.01),
+            sweep.inside_moved_m[0],
+            sweep.inside_moved_m[1],
+            skirt_plateau()
+        );
+    }
+
+    /// The bounding radius is the farthest collider corner from the CoM.
+    /// A 2 × 2 × 4 m box spanning 1…5 m above a CoM at the origin
+    /// reaches sqrt(1 + 1 + 25) = 5.196 m; from a CoM at its own centre
+    /// 2.449 m. An empty hull's inverted extents bound nothing.
+    #[test]
+    fn bounding_radius_reaches_the_farthest_collider_corner() {
+        let part = |lo: DVec3, hi: DVec3| {
+            let shape = crate::part_mesh::PartShape::Box { lo, hi };
+            FlightPart {
+                node: 0,
+                lo,
+                hi,
+                transform: csp_phys::PartTransform::IDENTITY,
+                shape_key: ShapeKey::of(&shape),
+                shape,
+                kind: PartKind::Structural,
+                model: None,
+            }
+        };
+        let (lo, hi) = (DVec3::new(-1.0, -1.0, 1.0), DVec3::new(1.0, 1.0, 5.0));
+        let parts = [
+            part(lo, hi),
+            part(
+                DVec3::new(f64::MAX, f64::MAX, f64::MAX),
+                DVec3::new(-f64::MAX, -f64::MAX, -f64::MAX),
+            ),
+        ];
+        close(
+            bounding_radius(&parts, DVec3::ZERO),
+            27.0_f64.sqrt(),
+            1.0e-12,
+            "about the origin",
+        );
+        close(
+            bounding_radius(&parts, DVec3::new(0.0, 0.0, 3.0)),
+            6.0_f64.sqrt(),
+            1.0e-12,
+            "about its centre",
+        );
+        assert_eq!(bounding_radius(&[], DVec3::ZERO), 0.0);
     }
 }

@@ -30,10 +30,11 @@ fn frame(view: &mut View, ticks: u64) {
 }
 
 /// The flight-side staging: the seeded "Stock Hopper" is pod/tank/
-/// engine + canister/battery on the nose (W1.5-b), and the propulsion
-/// parts must stage *distinct* silhouettes — a taper, a straight
-/// cylinder, and a bell — not the uniform box the M4c placeholder
-/// tier emitted three times over.
+/// engine + canister/battery on the nose (W1.5-b) + the chute on top
+/// of the pod (M4c landing), and the propulsion parts must stage
+/// *distinct* silhouettes — a taper, a straight cylinder, and a bell —
+/// not the uniform box the M4c placeholder tier emitted three times
+/// over.
 #[test]
 fn starter_stack_stages_distinct_silhouettes() {
     let mut view = View::new().expect("data/ load");
@@ -51,18 +52,19 @@ fn starter_stack_stages_distinct_silhouettes() {
     let vessel = staged.vessels.first().expect("seeded vessel staged");
     assert_eq!(
         vessel.parts.len(),
-        5,
-        "pod + tank + engine + canister + battery"
+        6,
+        "pod + tank + engine + canister + battery + chute"
     );
     // The stack is fully axial: engine (bottom, −z) → tank →
-    // battery → canister → pod (top, +z) — the W1.5-b science pair
-    // flies inline between pod and tank. Sort by z and take the
-    // propulsion triple: the lowest two plus the topmost.
+    // battery → canister → pod → chute (top, +z) — the W1.5-b science
+    // pair flies inline between pod and tank, the chute rides the
+    // pod's top node. Sort by z and take the propulsion triple: the
+    // lowest two plus the pod, second from the top under the chute.
     let mut parts = vessel.parts.to_vec();
     parts.sort_by(|a, b| a.transform.offset.z.total_cmp(&b.transform.offset.z));
     let engine = &parts[0];
     let tank = &parts[1];
-    let pod = parts.last().expect("five parts");
+    let pod = &parts[parts.len() - 2];
 
     // Engine — the bell: max radius on the LOWEST station (nozzle
     // opens −z), a throat, and the mount stepping back up — the
@@ -150,7 +152,7 @@ fn vab_packet_is_kitbash_not_boxes() {
     frame(&mut view, 1);
 
     let scene = view.world.resource::<csp_view::vab::VabScene>();
-    assert_eq!(scene.parts.len(), 5);
+    assert_eq!(scene.parts.len(), 6);
     let lathes = scene
         .parts
         .iter()
@@ -161,10 +163,10 @@ fn vab_packet_is_kitbash_not_boxes() {
         "pod/tank/engine must be lathe silhouettes ({lathes} lathes staged)"
     );
     let packet = view.take_vab_packet().expect("VAB packet emitted");
-    assert_eq!(packet.pick_ids.len(), 5, "one pick id per part");
+    assert_eq!(packet.pick_ids.len(), 6, "one pick id per part");
     assert!(
-        packet.vertices.len() > 180,
-        "kitbash meshes must beat 5 placeholder boxes ({} verts)",
+        packet.vertices.len() > 216,
+        "kitbash meshes must beat 6 placeholder boxes ({} verts)",
         packet.vertices.len()
     );
 }

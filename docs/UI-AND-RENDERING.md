@@ -57,12 +57,12 @@ winit RedrawRequested → App::render (lib.rs:841)
   paint:                                  tessellate FullOutput, draw scene pass + egui pass
 ```
 
-Schedule membership (`crates/csp-view/src/lib.rs:2066-2092`):
+Schedule membership (`crates/csp-view/src/lib.rs:2362-2392`):
 
 - **Input**: `map::apply_map_input`, `vab::apply_vab_input`, `flight::apply_flight_input` — drain event queues staged by `csp-app`.
 - **SimStep**: single-threaded executor; the actual `step_frame` call sits in `View::sim_step` (a bevy system cannot reach `self.sim`).
-- **Sync**: `sync_mirrors` + `map::sync_map` + `flight::sync_flight` — copy staged post-step values into mirrors. The **sole writers** of `Clock`, `WarpMirror`, `FrameStats` (`lib.rs:435`).
-- **Presentation**: `map::map_present`, `vab::vab_present`, `flight::flight_present`, `tutorial::tutorial_drive` — camera solves, LOD, VFX, cue edges.
+- **Sync**: `sync_mirrors` + `map::sync_map` + `flight::sync_flight` — copy staged post-step values into mirrors. The **sole writers** of `Clock`, `WarpMirror`, `FrameStats` (`lib.rs:471`).
+- **Presentation**: `map::map_present`, `vab::vab_present`, `flight::flight_interp` → `flight::flight_camera` → `flight::flight_present`, `tutorial::tutorial_drive` — camera solves, LOD, VFX, cue edges.
 - **UiBuild**: `build_ui` then `map_pointer_input.after(build_ui)` — the entire egui pass.
 - **RenderExtract**: `map::extract_map`, `vab::extract_vab`, `flight::extract_flight` — produce plain-data render packets.
 
@@ -83,7 +83,7 @@ staging calls `stage_vab_tech` (`lib.rs:3548`) and `stage_program`
 | `ProgramMirror` (`lib.rs:231`) | `View::stage_program` | every `end_frame` | the whole progression surface — see §3.7 |
 | `ScriptLogMirror` (`lib.rs:276`) | `View::push_script_log` | per step | rolling 64-line script console tail |
 | `map::MapSnapshot` / `MapScene` / `MapUiData` / `MapPlanning` | `sync_map` / `map_present` / UiBuild | frame | orbit states, polylines, labels, alarm book |
-| `flight::FlightSnapshot` / `FlightUiData` / `VesselPropulsionStaged` / `LiveVesselCount` | `sync_flight` / `flight_present` | frame | InBubble+latched vessels, HUD figures, Δv walk |
+| `flight::FlightSnapshot` / `FlightUiData` / `VesselPropulsionStaged` / `LiveVesselCount` / `CraftRadii` | `sync_flight` / `flight_camera` / `flight_present` | frame | InBubble+latched vessels, HUD figures, Δv walk, bounding radii |
 | `vab::VabSessionRes` | UiBuild + `vab_event` plumbing | on event | the working craft (§5) |
 | `GameMenuRes`, `SettingsPanelRes`, `PartMenuRes`, `PanelFlags`, `tutorial::TutorialRes` | UiBuild / app plumbing | session state | panel visibility & widget state (§2.2-C: never sim state) |
 
@@ -126,7 +126,9 @@ the VAB with the reason on the session's notice row (`launch_refused`,
 
 Load/revert/new-game replace the whole sim through `rebuild_from_snapshot`
 (`lib.rs:1574`): config channels re-installed, `RhaiHost`/`AscentAutopilot`
-re-installed, every sim-keyed session mirror reset, mode forced to Flight.
+re-installed, every sim-keyed session mirror reset, mode forced to Flight. The
+stage plans are refilled in that same step — rebuilt from the restored crafts on a
+load, put back as captured on a revert (`Restage`, `RevertPoint`; §4.4).
 
 ---
 
@@ -158,11 +160,16 @@ event in a fixed order:
      becomes a VAB GPU-pick candidate (`lmb_click_candidate`) whose release
      position is the pick pixel.
    - `CursorMoved` while dragging → orbit deltas per mode
-     (`MapKeyEvent::Orbit` / `VabEvent::Orbit` / `FlightEvent::Orbit`).
-     `last_cursor` updates even on consumed moves (else a drag crossing a
-     panel takes one large jump).
+     (`MapKeyEvent::Orbit` / `VabEvent::Orbit` / `FlightEvent::Orbit`),
+     through `orbit_delta` — the one place the settings reach a drag:
+     `0.005 rad × orbit_sensitivity` per pixel on each axis, the vertical
+     half negated under *invert vertical orbit*. The defaults are the bare
+     `0.005`, the pre-settings drag to the last digit. `last_cursor`
+     updates even on consumed moves (else a drag crossing a panel takes one
+     large jump).
    - `MouseWheel` → multiplicative zoom (`exp(−lines)` — scroll-up is
-     zoom-in in every camera convention).
+     zoom-in in every camera convention; in flight it multiplies the
+     eased distance's target, §5.1).
 
 `key_press` resolves the event through the **live** `Keymap`
 (`settings_io::keycode_token` physical first, `key_token` logical fallback),
@@ -245,7 +252,7 @@ output structs out; the sim is never read (crate doc,
 
 | Panel | Anchor | Purpose |
 |---|---|---|
-| Settings window (`settings_panel`) | `csp-ui/src/settings.rs:754` | Keymap rebind (arms capture), Graphics: vertical sync + render scale (P1, §7.2.2) + ui_scale, warp cap, audio volumes, new-game difficulty flags, reset-to-defaults. Apply rides `settings_apply`; the app owns file IO. |
+| Settings window (`settings_panel`) | `csp-ui/src/settings.rs:842` | Keymap rebind (arms capture), Graphics: vertical sync + render scale (P1, §7.2.2) + ui_scale + orbit sensitivity (0.25–4, default 1.0) + invert vertical orbit, warp cap, audio volumes, new-game difficulty flags, reset-to-defaults. Apply rides `settings_apply`; the app owns file IO. |
 | Crash dialog (`crash_dialog`) | `csp-ui/src/lib.rs:219` | §2.13 Fatal: reason + bug-report bundle path ("send this to the developer"). Session turns read-only. |
 | Tutorial checklist (`tutorial_overlay`) | `csp-ui/src/tutorial.rs:318` | 10-step first-flight checklist (`STEPS`, `tutorial.rs:70`; VAB steps coached from inside the editor). Progress predicates run in Presentation (`csp-view/src/tutorial.rs:62` `tutorial_drive`) against staged mirrors only. Dismiss/Restart are session state; progress survives hide/show. |
 | Debug panel (`debug_panel`) | `csp-ui/src/lib.rs:170` | Dev scaffold: adapter/backend, tick/frame counters, warp requested/effective. Off by default; `ToggleDebug` key. Hidden in VAB. |
@@ -368,9 +375,16 @@ hover pick. Radial symmetry ×1/×2/×4 (`SetSymmetry`). **Bottom attach works**
 the VAB camera's pitch clamp is full ±π so the −z cap and its `bottom` node
 are visible and hittable (`csp-view/src/vab.rs:47`).
 
-Staging: per-node `stage: u32` (higher fires earlier), edited in the
-inspector; `InsertStage`/`RemoveStage`/`CompactStages` maintain the table.
-The plan rides `flight::StagePlan` into launch (below).
+Staging: per-node `stage: u32` (higher fires earlier). The Staging panel
+(`staging_section`) lists `CraftSession::listed_stages` top-first — every populated
+stage plus every one `InsertStage` opened, which stays listed while empty
+(`open_stages`: editor state, not carried by the craft file) — and under each stage
+every part assigned to it (`VabSession::stage_rows`), not only the parts still attached
+when it fires. Clicking a part's row selects it; the selected part's row then carries
+`up`/`down` (`stage_move_buttons`), one `SetStage` per press, alongside the inspector's
+numeric stage field (both, and the header's `+ stage`, stop at stage 64, `STAGE_MAX`).
+`InsertStage`/`RemoveStage`/`CompactStages` maintain the table. The plan rides
+`flight::StagePlan` into launch (below).
 
 Readouts: `VabSession::recompute` (`vab.rs:849`) is dirty-gated — runs
 `csp_phys::readout::analyze` + `session.validate` + `body_transforms` only
@@ -441,9 +455,13 @@ reaches the craft behind it (C14-F2). `vab_pointer_input`
 
 `flight::StagePlan` (`csp-view/src/flight.rs:644`) captures the session's
 stage table at launch (`stage_plan_of`, `lib.rs:4061`); `StagePlans`
-(`flight.rs:758`) holds one plan per launch, bound to its vessel by
-`(min_id, craft fingerprint)` once the spawn lands. `View::fire_stage`
-(`lib.rs:3189`) pops the focused vessel's next stage set (`StageActions`,
+(`flight.rs:758`) holds one plan per launch, bound lazily to its vessel —
+the unique vessel inside its **launch window** (`[plan.min_id, next newer
+plan's min_id)`, newest open) carrying the craft's launch key — so a plan
+never claims a later launch of the same craft (`StagePlans::bind_all`). The
+revert point stores its plans already bound (`captured_for_revert`).
+`View::fire_stage` (`lib.rs:3189`) pops the focused vessel's next stage set
+(`StageActions`,
 `flight.rs:603`: `deploys` + `jettisons`) and issues **one logged `DeployPart`
 per staged deployable (parachutes) BEFORE one logged `JettisonPart` per
 drop-set node** — the staged-chute rule of `7dd4b86`: a chute staged alongside
@@ -451,10 +469,29 @@ the decoupler that drops its own subtree must get its deploy record while the
 node still exists (a `DeployPart` naming a jettisoned node just rejects). All
 of this only after the bound vessel checks bubble-resident (on a latched/rails
 vessel the commands would all reject while eating the stage). Every outcome
-posts a cue, naming deploys vs jettisons ("STAGED — 1 PART(S) DEPLOYED"). Known
+posts a cue, naming jettisons against **chutes fired** ("STAGED — 1 CHUTE(S)
+FIRED", "STAGED — 1 JETTISONED + 1 CHUTE(S) FIRED"): a press fires a chute, it
+does not open it — the canopy waits packed until the flow can hold it (§5.2),
+and "CANOPY OPEN" posts the frame it starts inflating, not the press. Known
 honest limitation (doc at `flight.rs:616-632`): a jettisoned part leaves the
 sim outright — no debris fragment — and engines are globally armed so a firing
 separates but never ignites.
+
+The plan is session state the save format does not carry, so both world-replacing
+verbs handle it explicitly:
+
+- **Revert** — `RevertPoint` stores `StagePlans` beside its snapshot at both capture
+  sites (`launch_craft`, and the delivery-boundary recapture in `sim_step`), and
+  `View::revert_to_launch` puts them back through `rebuild_from_snapshot`'s
+  `Restage::Captured`. The craft back on the pad stages as it did at launch.
+- **Load** — `View::load_game` passes `Restage::FromRestoredCrafts`, and
+  `StagePlans::from_restored_world` derives one plan per restored craft, bound to its
+  vessel (`restored_stage_actions`): a drop stage per decoupler depth, deepest first and
+  decouplers at one depth together, each holding the subtree below its decouplers minus
+  what an earlier firing took; then one deploy stage for the chutes no drop takes and the
+  save does not show deployed (the weld input's own `parachute` flag — the gate
+  `DeployPart` checks). A craft with nothing to stage gets no plan, and the press reports
+  a single-stage craft. The VAB's stage order is not recovered.
 
 ---
 
@@ -474,18 +511,170 @@ fresh launch). The `TakeControl{Player}` lease transfer issues on the pin's
 `seen` edge in `end_frame` (`lib.rs:2261-2283`) — never optimistically at
 press time.
 
-`flight_present` (`flight.rs:1730`) solves the chase camera
-(`solve_chase_camera`, `flight.rs:1524`, FOV 0.9 rad, terrain-floor aware via
-`terrain::surface_floor_radius`) and derives the HUD mirrors: attitude
-(`stage_attitude`, `flight.rs:1974` — heading/pitch/roll, navball
-body-frame up/north/east/prograde, surface-relative speed = v − ω×r) and the
-propulsion walk (`stage_propulsion`/`delta_v_walk_from` → per-stage Δv, TWR,
-burn time — the Kerbal Engineer-equivalent readouts).
+**The chase camera** (`flight_camera` → `step_chase_camera`, FOV 0.9 rad) is
+an orbit camera in the local-level frame at the craft — up is the radial,
+north the spin axis projected level — so the horizon stays level wherever
+the craft is. Session state only: nothing here is sim state.
 
-### 5.2 VFX: plume, plasma, dust (the §3.7 floor)
+- **Drawn pose (§2.5 interpolation).** Every vessel is drawn between its
+  previous and its current tick at the frame's fractional tick remainder
+  (`flight_interp`, `DrawnScene`; `View::set_tick_fraction` is `csp-app`'s
+  hand-off, `warp.rs` the source). The camera solves from the CoM as drawn,
+  so craft and camera travel the same step. Nothing extrapolates; the
+  planet's spin phase is interpolated too.
+- **Drag.** `yaw`/`pitch` take the event's radians exactly — nothing smooths
+  or delays a drag. Pitch stops at ±89°.
+- **Zoom.** The wheel multiplies a *target* distance; the distance eases
+  toward it by `1 − exp2(−dt / 80 ms)` of what is left per frame (`dt` is
+  the frame's wall time, clamped like the frame dt). The same wall time
+  closes the same share at any frame rate; nothing overshoots.
+- **Limits.** 3 m to 1e6 m, the near limit raised to 1.5 × the craft's
+  bounding radius — the farthest collider-AABB corner from the CoM
+  (`bounding_radius`, staged once per craft revision into `CraftRadii`).
+- **Framing.** The frame a vessel takes the focus, first focus or change,
+  the target becomes 4 × its bounding radius, clamped to the limits, and
+  the camera eases there. No snap (C19-F4). An open canopy counts as the
+  craft's: the radius framed is the farther of the craft's own and its
+  canopy's reach from the CoM once whole (`FlightCanopy::reach_m` — 25.6 m
+  for the s125 over the Stock Hopper, so a 102 m target). A canopy opening over the craft the camera **already holds** is
+  framed the same way once, on the frame it appears, and only outward — a
+  player already further out keeps their view, and after that frame the
+  wheel is theirs again (`frame_target`).
+- **Floor.** The eye stays 0.3 m above the heightfield's surface under it —
+  `ground_radius` sampled at the eye's own ground point, `eye_floor`. Over
+  an ocean that surface is the seabed: the surface of the water is no
+  floor, and the eye crosses it freely, down to 0.3 m over the bottom (the
+  view from there is §7.4's "under water"). The eye may sit level with or
+  below a landed or capsized craft's CoM.
+- **The floor lifts the point, never the angles.** The eye is the intent's
+  orbit point about the anchor; under the floor it is that same point
+  lifted along the local up onto the floor — radially out from the body
+  centre, sampled under the point itself (`solve_orbit`). Yaw, pitch and
+  distance are the player's and are never rewritten: no pitch is searched
+  for and none is written back. The eye is continuous in the intent: no
+  step as the orbit point crosses the floor, in either direction. What the
+  lift keeps of a drag is the orbit point's share along the floor,
+  `d·cos(pitch)`, whose slope in pitch is zero at the anchor's own level —
+  which the next two rules are for.
+- **Anchor.** The camera orbits the craft's *resting anchor*
+  (`resting_anchor`): its drawn CoM while the craft is at or above the
+  floor — afloat in an ocean no less than in flight, since that floor is
+  the seabed. A craft `depth` under the floor — buried in the ground —
+  has every orbit point lifted, so its anchor rises
+  along the local up to `depth + min(depth, eye distance)` over its CoM: a
+  craft at least an eye distance down is orbited from a whole eye distance
+  over the floor and a drag moves the eye as freely as in flight; a
+  shallower one keeps `depth` of clearance. The camera looks at the craft,
+  never at the lifted anchor.
+- **Least distance on the ground.** The lift could take the eye inside the
+  craft's least distance: dragged straight down, it ended 0.3 m over the
+  craft's own ground point. A lifted eye that is nearer than the least
+  distance goes round the craft instead (`skirt_eye`, `KeptOut::rule`).
+  From the floor point `n` under the craft, out along the yaw's side of
+  it, the orbit point sits `h` metres along the floor, signed. The zone is
+  the stretch of that line nearer than `rmin` from the CoM: from the turn
+  point `h*` on the yaw's side to the far edge on the other. Outside the
+  zone the eye is the orbit point itself. Inside it the eye rides the floor
+  at exactly the least distance — the circle around `n` where the floor is
+  `rmin` from the CoM — entering at the turn point, going round the yaw's
+  own side (the way an increasing yaw moves the eye) and leaving at the
+  far edge. Its place on the circle is `skirt_azimuth` of its place in the
+  zone, a monotonic function of the intent: dragging down or zooming in
+  carries the eye forward round the craft, dragging up or zooming out
+  brings it back, a reversed drag retraces the path, and the eye never
+  turns back on a drag that goes on the same way. On flat ground `h*` is
+  `sqrt(rmin² − H²)`, `H` the CoM's signed height over `n`; both edges and
+  the circle itself are measured on the real floor (`clear_from`), so the
+  rule holds on a slope too — there the zone is not a circle about `n`:
+  uphill the floor rises toward the CoM and the zone reaches further out.
+  The eye sets off at the drag's own pace along the ground — the frame
+  that enters moves no more than the drag's step — and settles over the
+  first quarter of the way onto `skirt_plateau` (1.65) times the orbit
+  point's slide, the pace that carries it round by the far edge: the half
+  circumference is `π·h*` against `2·h*` of slide straight across. At rest
+  the pitch limit keeps the orbit point on the yaw's side, so a drag
+  enters at the turn and ends about 80° round the circle; the far edge is
+  met only by a focus travel. A floor whose point under the craft already
+  clears it (a craft high over rising ground) has no zone about the craft:
+  the eye is put past that band of ground's far edge instead.
+- **Focus change.** The camera's anchor starts where the previous frame's
+  eye orbited — the previous craft's resting anchor — and eases to the new
+  craft's resting anchor, so the frame of the change carries no jump:
+  before any frame time is put in, the eye and the view are exactly what
+  they were, and with frame time they move one step of the travel. What
+  the previous focus was looking at, and its eye's offset from its orbit
+  point, is carried along and handed over by `travel_blend` over the last
+  of the travel — the shorter of the eye distance and the travel's own
+  length. The travel takes its own half-life
+  (`travel_half_life`): the zoom's for a short change, shortened so that
+  every travel — 20 m or 850 km — is under 1 mm within 0.5 s at any frame
+  rate; a change that is already under 1 mm (or from an anchor that is not
+  a number) is no travel at all. The travel is a straight line, so a long
+  one crosses the planet: while the anchor would be under the floor it is
+  lifted radially to the floor plus a margin of its depth up to one eye
+  distance (`travel_anchor`), fading out over the last eye distance of
+  travel — so the floor never has to touch the orbit angles on a focus
+  change. A loaded world is a first focus (`FlightInput::forget_anchor`
+  beside the `PoseHistory` reset), never a travel in from the replaced
+  session. Under 1 mm of travel the anchor is the resting anchor exactly.
+- **Keep-out on a travel.** A focus's keep-out is a ball of its least
+  distance about its CoM; at rest only the floor lift can take the orbit
+  point into it (the rule above). On a travel the new craft's keep-out
+  acts at once on the travelling orbit point — with whatever is still
+  carried of the previous craft's skirt, which is kept out of the new
+  craft as well — whether the point rides the floor or is in the air.
+  Carried into the ball, the eye rides the ball from where its way
+  enters to where the orbit point's own way leaves it (`KeptOut::ride`,
+  `KeptOut::round_way`): the sphere wherever that is above the floor, the
+  floor's least-distance circle wherever it is under it, by the nearer
+  way round and along a diameter by the yaw's own side, so it passes over
+  or round the craft — never through it. The way is the nearer one,
+  always; for a travel that comes to rest inside the ball it is the short
+  arc from the entry to the at-rest eye, and the eye is there before the
+  travel settles, so the travel ends on the at-rest keep-out exactly.
+- **Pace.** No frame moves the eye more than a tenth beyond the one
+  before, over the frames moving more than a millimetre, in every
+  placement (`Pace::cap_m`, read as the eye itself moves; the first frame
+  of a travel is paced by the travel's own step). Toward the camera's
+  side and on the yaw's own side the way round is 1.6 to 2.9 times the
+  orbit point's remaining run; the ride used to take the orbit point's
+  progress as its own and moved 1.78 times the frame before from the
+  frame it entered. Its pace is its own now: it keeps its share of the
+  orbit point's remaining run where its pace allows and, held back,
+  makes up what it owes as its pace allows — it is at the way out about
+  when the orbit point is — and what it has left of a ride to a place it
+  must be at falls off by `ride_taper` of a frame, so it is there within
+  a tenth of a millimetre by the time the travel settles.
+- **The eye began inside the ball.** Where the eye itself begins the
+  travel inside the new craft's least distance (`FocusTravel::began_inside`)
+  the orbit point's own way may run on through the craft, so the eye does
+  not follow it (it used to be handed over along that way: 0.62 m from
+  the CoM, under the craft, before it came out). It leaves the ball by the
+  nearest way out (`KeptOut::outward`: straight out from the CoM, or
+  along the floor to the least-distance circle where the ball is under
+  it) and goes round the craft to where the orbit point's way leads, or
+  makes for the orbit point round the craft once its way has left the
+  ball (`KeptOut::chase`). Its distance to the craft's centre never
+  falls on any frame; the frame of the change still moves nothing.
+- **Direct placement.** `FlightInput::set_distance` sets the current and the
+  target distance together, and a harness that supplies no frame time
+  (`update_session`) steps nothing. The render gates place the camera that
+  way.
 
-All emitted into the flight packet's **unlit stream** (zero normal = fragment
-passthrough, `flight.rs:2386-2418`):
+`flight_present` derives the HUD mirrors: attitude (`stage_attitude` —
+heading/pitch/roll, navball body-frame up/north/east/prograde,
+surface-relative speed = v − ω×r) and the propulsion walk
+(`stage_propulsion`/`delta_v_walk_from` → per-stage Δv, TWR, burn time — the
+Kerbal Engineer-equivalent readouts).
+
+### 5.2 VFX: plume, plasma, dust, canopy
+
+All but the canopy emitted into the flight packet's **unlit stream** (zero normal = fragment
+passthrough, `flight.rs:2386-2418`). Every unlit vertex carries its place
+relative to the eye: with water in front of it the fragment shader thins
+its colour by the water's transmittance over that way and hands the share
+it took to the water body (§7.4), so a plume or a dust ring under the
+surface fades with the water before it like a hull does.
 
 - **Engine plume** (`emit_plumes`, `flight.rs:2446`) — cone per live Thrust
   site, keyed to **delivered** thrust (rated_n rewritten each tick by the
@@ -496,8 +685,44 @@ passthrough, `flight.rs:2386-2418`):
   5e3…8e4 W/m² convective flux (`PLASMA_ONSET_W_M2`/`PLASMA_FULL_W_M2`,
   `flight.rs:46-48`) from the same `flow_sample` the thermal tick consumes.
   Display normalization only — lethality is the sim's temperature record.
-- **Ground-contact dust** (`flight.rs:2893-2958`) — translucent tan ring at
-  the contact point when the last step recorded contact.
+- **Ground-contact dust** (`flight.rs:2893-2958`) — translucent tan ring
+  0.3 m above the local terrain surface under the craft's lowest hull
+  vertex when the last step recorded contact. Under an ocean that surface
+  is the seabed the craft rests on: the ring stays on the bottom, seen
+  through the water, not on the surface above it.
+- **Parachute canopy** (`emit_canopies`/`emit_canopy`, `flight.rs:5839`) —
+  unlike the three above it goes into the **lit stream** (per-corner world
+  normals, a material row), so it takes the scene's sun, hemisphere ambient
+  and cascade shadow like the hull, and the water in front of it absorbs it
+  the same way. What is drawn is the simulation's own reading, never a
+  view-side guess: `World::canopies` (`csp-sim/src/lib.rs:3268`) yields one
+  `Canopy` per deployed chute of an InBubble vessel, read at the state's
+  tick through `CanopyFlow::ramp` (`csp-phys/src/simple.rs:3615`) — the
+  force model's own catch test and inflation ramp, with none of the reef or
+  the budgets. `capture_sync_input` folds those into `FlightCanopy` rows in
+  `CanopiesStaged`; a row exists exactly while the simulation holds the
+  canopy open, so a chute waiting out its gates, one back past them (over
+  16 km or 1 200 m/s), or a craft out of the bubble stages none, and
+  nothing is drawn for it.
+  - **Where.** Where the step takes the pull (§3.1 rule A): the dome over
+    the canister's place on the craft's longitudinal axis, up that axis; the
+    suspension lines run from the rim down to the canister itself.
+  - **How big.** The open canopy's drag area read as the disc that catches
+    it, `d = 2·√(A/π)` — 29.9 m across for the s125's 700 m² — times the
+    simulation's inflation fraction: nothing before the canopy starts
+    opening, the whole canopy a `deploy_time_s` later. The lines and the
+    dome's height scale with the same radius (rim one radius over the axis
+    point, apex half a radius higher).
+  - **The mesh.** Generated once at run time (`CanopyMesh::unit`, kept in
+    `FlightGeomCache`) — the art packs carry the packed canister alone. A
+    half-ellipse dome of 32 gores × 6 rings (352 triangles) in alternating
+    safety-orange and undyed cloth, and 16 suspension lines as eye-facing
+    ribbons two triangles each (32): **384 triangles, 1 152 vertices per open
+    canopy** (`CANOPY_TRIANGLES`), appended to the craft's own stream.
+  - **Cost.** A steady canopy allocates nothing per frame: the mesh is made
+    once, the row buffer is handed back from `CanopiesStaged` and refilled
+    each `end_frame`, and the vertex stream is pre-sized from the last
+    frame's count.
 
 ### 5.3 Part picking (right-click menu)
 
@@ -672,20 +897,23 @@ Far-pass draw order (`csp-app/src/lib.rs:1767-1824`): terrain far
 phase (sky backdrop + far instances + far ocean) → flight far stream
 (the fallback sky). Near-pass order: map packet (Map mode) → VAB
 packet (Vab mode) → Flight mode: **near terrain → flight craft stream
-→ near ocean** (the ocean is a third, alpha-blended draw after the
-craft so water resolves over an already-rasterized hull, C11-F3).
+→ near ocean** (the ocean is a third draw after the craft, blended
+premultiplied over what is already there — the seabed, a hull — so water
+resolves over an already-rasterized hull, C11-F3; §7.4 has the rule).
 
 | Renderer | Pipelines | Notes |
 |---|---|---|
 | `MapRenderer` (`map.rs:80`) | one unlit pipeline, three meshes (bg stars / lines / markers) | no depth state — the scene pass attaches depth only in Flight/VAB |
-| `TerrainRenderer` (`terrain.rs:670`) | `terrain_pipe`, `ocean_pipe` (depth-test-only variant), `sky_pipe` (fullscreen, always-pass depth), + two depth-only shadow pipelines `vs_shadow0/1` (`shadow.rs`, 3a — see §7.4) | bind groups: group(0) = 0 uniforms, 1 heightfield R32Float, 2 transmittance LUT RGBA32Float, 3 biome slots R8Uint, 4–6 art albedo/normal arrays + water normal, 7 sampler, 8 cascade `SU` uniform; group(1) = shadow depth D2Array + comparison sampler (visible pass only — see §7.4). Since §7.2.1 there are TWO group(0) sets over the same textures — near and far uniform rows — swapped per phase; the pipelines themselves are shared |
+| `TerrainRenderer` (`terrain.rs:670`) | `terrain_pipe`, `ocean_pipe` (depth-test-only variant, premultiplied blend), `sky_pipe` (fullscreen, always-pass depth), + two depth-only shadow pipelines `vs_shadow0/1` (`shadow.rs`, 3a — see §7.4) | bind groups: group(0) = 0 uniforms, 1 heightfield R32Float, 2 transmittance LUT RGBA32Float, 3 biome slots R8Uint, 4–6 art albedo/normal arrays + water normal, 7 sampler, 8 cascade `SU` uniform; group(1) = shadow depth D2Array + comparison sampler (visible pass only — see §7.4). Since §7.2.1 there are TWO group(0) sets over the same textures — near and far uniform rows — swapped per phase; the pipelines themselves are shared |
 | `FlightRenderer` (`flight.rs:75`) | one pipeline; owns the surface-sized reverse-Z depth target | depth compare `GreaterEqual` because the fallback sky sits ON the far plane; since §7.2.1 a second vertex buffer (`far_vertices`) draws the far stream through the same pipeline in the far pass |
 | `VabRenderer` (`vab.rs:123`) | color pipeline + offscreen pick pipeline (R32Uint object-id) | `encode_pick` rasterizes + copies one pixel |
 
 Shared lighting: `PartLight` (`lib.rs:33`) — one directional sun + two-stop
 hemisphere ambient; the VAB uses the neutral studio default, flight uses the
-staged sun. Reverse-Z throughout (clear 0.0 = far, `Greater`/`GreaterEqual`
-wins).
+staged sun. Its `water` row carries the eye from the body centre and the
+ocean's surface radius (0 without an ocean): `flight.wgsl` measures the
+water in front of each fragment by it (§7.4). Reverse-Z throughout (clear
+0.0 = far, `Greater`/`GreaterEqual` wins).
 
 ### 7.2.1 The two-pass depth partition (PLAN §2.3's far-field pass)
 
@@ -851,9 +1079,9 @@ attach beside it.
 |---|---|---|
 | `map.wgsl` (48 lines) | `vs_main`/`fs_main` | Unlit map primitives; vertices pre-projected on CPU; fragment shapes quad kind 0 line / 1 disc / 2 ring / 3 glow |
 | `vab.wgsl` (111) | `vs_main`/`fs_main` + pick fragment | Per-pixel-lit editor parts (hemisphere ambient × baked occlusion, key light, Blinn specular, fresnel rim); pick writes the 1-based object id |
-| `flight.wgsl` (208) | `vs_main`/`fs_main` | Same per-pixel lighting as VAB minus pick, plus the unlit passthrough (`nrm ≈ 0`); ACES (Narkowicz) tone-map shared with terrain so lit hulls match the ground. Since 3b: the direct-sun terms multiply the cascade `sun_visibility` (a C16-F3 duplication of terrain.wgsl's receive half — no WGSL include mechanism) |
-| `flight_shadow.wgsl` (69) | `vs_shadow0`/`vs_shadow1` (3b craft cast, depth-only) | Drops the flight stream into §7.4's cascade map. A dedicated module on purpose: the cast pipelines ride a minimal group(0) (`SU` alone at binding 8), and sharing flight.wgsl left its `light`/group(1) declarations dangling against that layout, which de-registered the uniform binding on-device (the cast silently discarded — see the file header) |
-| `terrain.wgsl` (1391) | `vs_terrain`/`fs_terrain` (`:414`/`:893`), `vs_sky`/`fs_sky` (`:1132`/`:1263`), `vs_shadow0`/`vs_shadow1` (`:440`/`:448`, depth-only cascade pass; the shared displacement is `terrain_displace`, `:385`) | Quadtree terrain, ocean, and the sky/atmosphere/starfield — see §8; the shadow entry points feed §7.4's cascade map |
+| `flight.wgsl` (308) | `vs_main`/`fs_main` | Same per-pixel lighting as VAB minus pick, plus the unlit passthrough (`nrm ≈ 0`); ACES (Narkowicz) tone-map shared with terrain so lit hulls match the ground. Since 3b: the direct-sun terms multiply the cascade `sun_visibility` (a C16-F3 duplication of terrain.wgsl's receive half — no WGSL include mechanism). The water block (`water_sun`/`water_fog`/`water_path`, one text with terrain.wgsl's) absorbs every fragment behind water, the unlit ones too |
+| `flight_shadow.wgsl` (70) | `vs_shadow0`/`vs_shadow1` (3b craft cast, depth-only) | Drops the flight stream into §7.4's cascade map. A dedicated module on purpose: the cast pipelines ride a minimal group(0) (`SU` alone at binding 8), and sharing flight.wgsl left its `light`/group(1) declarations dangling against that layout, which de-registered the uniform binding on-device (the cast silently discarded — see the file header) |
+| `terrain.wgsl` (1891) | `vs_terrain`/`fs_terrain` (`:414`/`:893`), `vs_sky`/`fs_sky` (`:1132`/`:1263`), `vs_shadow0`/`vs_shadow1` (`:440`/`:448`, depth-only cascade pass; the shared displacement is `terrain_displace`, `:385`) | Quadtree terrain, ocean, and the sky/atmosphere/starfield — see §8; the shadow entry points feed §7.4's cascade map |
 | `blit.wgsl` (P1) | `vs`/`fs` | §7.2.2's render-scale upscale — one fullscreen triangle sampling the scaled resolved scene (linear) into the swapchain |
 
 All six are parse+validate gated by a unit test
@@ -884,32 +1112,77 @@ to the drawn surface). Since M5 §5.2-R2 the bake is per authored
 R4/native hook.
 
 **Bake scheduling / the arrival contract (M5 §5.2-R2 arrival polish).**
-The bake runs on a background thread (native; C12-F5 — the frame a body
-becomes dominant no longer stalls on it) and `TerrainCache::field`
-serves `None` until the real field lands. There is **no stand-in**: the
-packet for those frames is *sky-only* — `heightfield: None`, zero
-terrain/ocean instances, disarmed vessel blob — so the player sees the
-scattering sky (haze below the horizon on atmospheric bodies), the
-craft and the launch complex, never a flat datum sphere standing in
-for mountains. CPU-side takers of the field (chase-camera floor,
-structure anchors) fall back to the bare datum radius for exactly
-those frames; the first packet with a field swaps the full displaced
-surface in (the field's content key forces the height-texture
-re-upload). The wait frames also DISARM the shadow cascades — both in
-the view (`extract_flight` hands `draw_shadow` the zeroed row while
-pending) and structurally in the renderer (`draw_shadow` disarms any
-armed row handed with an instance-less packet: the cascade passes
-would early-return without clearing the depth array, and receivers
-would sample its never-cleared contents — zeros on a fresh session,
-the previous body's stale map after an SOI switch — through live
-matrices, silently killing the craft's sun term). The flight HUD
-mirrors the wait as a one-line
-"GENERATING SURFACE …" chip row (`FlightHudInput::terrain_pending`,
-written by `extract_flight`). Map view draws no terrain anywhere (its
-packet is lines/markers only) and VAB is scene-less, so the wait state
-is flight-only. wasm has no threads: the bake runs inline at the first
-`field` poll, so the `None` wait state is unreachable there by
-construction (the demo already pays the one-time startup hitch).
+The simulation bakes the dominant body's field when its backend is
+built (`SimpleBackend::new` → `TerrainSurface::prewarm`). The view
+bakes no second one: `View::adopt_terrain` hands that allocation to
+`TerrainCache::adopt` at construction and after a snapshot restore
+(Load, Revert), so startup, New Game, Load and Revert carry the
+displaced surface from their first frame — no sky-only wait, on native
+and on wasm alike. The view's own bake is left to a body the simulation
+has not baked: it runs on a background thread (native; C12-F5 — the
+frame a body becomes dominant no longer stalls on it) and
+`TerrainCache::field` serves `None` until the real field lands. There
+is **no stand-in**: the packet for those frames is *sky-only* —
+`heightfield: None`, zero terrain/ocean instances, disarmed vessel blob
+— so the player is never shown a flat datum sphere standing in for
+mountains. CPU-side takers of the field (chase-camera floor, structure
+anchors) fall back to the bare datum radius for exactly those frames;
+the first packet with a field swaps the full displaced surface in (the
+field's content key forces the height-texture re-upload). The wait
+frames also DISARM the shadow cascades — both in the view
+(`extract_flight` hands `draw_shadow` the zeroed row while pending) and
+structurally in the renderer (`draw_shadow` disarms any armed row
+handed with an instance-less packet: the cascade passes would
+early-return without clearing the depth array, and receivers would
+sample its never-cleared contents — zeros on a fresh session, the
+previous body's stale map after an SOI switch — through live matrices,
+silently killing the craft's sun term). The player never sees those
+frames: the **loading screen** covers them (below). Map view draws no
+terrain anywhere (its packet is lines/markers only) and VAB is
+scene-less, so the terrain wait is flight-only. wasm has no threads:
+the bake runs inline at the first `field` poll, so the `None` wait
+state is unreachable there by construction.
+
+**Loading screen.** `csp_view`'s `build_ui` paints
+`csp_ui::loading_screen` — an opaque backdrop and one centred line, on
+the layer above every panel — on every frame that is not the finished
+game. It is up while:
+
+- the flight scene's terrain is pending (above) — the line reads
+  `GENERATING SURFACE …`. `FlightUiData::terrain_pending` is written in
+  Presentation (`flight_terrain_pending`), ahead of `UiBuild`, so the
+  very first sky-only frame is already covered;
+- the host holds a world-replacing session op (`View::set_loading`) —
+  the line reads `LOADING …`. New Game, Load and Revert stall the frame
+  they run in, so `csp-app` raises the screen one presented frame
+  *before* the op runs and keeps it through the rebuilt world's own
+  first frame;
+- the panels have not finished arriving (`UiArrival`, on `EguiPass`) —
+  same line. egui lays every `Area` out invisibly for one pass and then
+  fades it in over `Style::animation_time`; the panels are built under
+  the screen and the screen stays until that entrance is over, so what
+  it lifts onto is the whole frame at once: surface, ocean, shadows,
+  pad, craft and HUD, with no panel joining afterwards. The entrance is
+  counted in egui's frame time (`InputState::time`) from the first
+  pass built on the context: only the steps between passes count, never
+  the first stamp. `csp-app` creates its `egui_winit::State` once and
+  stamps every frame with the session time, while a fresh context — at
+  startup, and at every New Game, which replaces the `View` — reads
+  0.0, so that first stamp is an offset, not an elapsed time (the
+  whole session after New Game). Summed as an age, it ended the
+  entrance on the second pass and the third showed the HUD, the top
+  bar and the tutorial card still fading in over the scene.
+
+The screen's backdrop is the topmost clickable widget, so a press
+during a wait reaches neither the panels under it nor the scene, and
+its rect leads the VAB's click-through masks. The window itself opens
+hidden (`with_visible(false)`) and is shown on the first presented
+frame, so the clear colour is never what the player sees first. That is
+the whole mechanism on X11. Wayland maps a surface at its first commit
+and winit cannot hide a window there, so the first presented frame —
+the loading screen — is the first visible one by protocol; on wasm the
+page's loading screen stays over the canvas until the first frame has
+been presented (`cspGpuReady` fires there, not at GPU init).
 
 Scattering: `bake_transmittance` (`terrain.rs:577`) CPU-ray-marches the
 Bruneton-style T(altitude, μ) LUT (96 steps) for the §3.0 exponential
@@ -920,6 +1193,41 @@ Ocean: a second instanced batch of the same grid at the body's ocean datum
 radius, emitted only for leaf patches whose sampled heights reach the datum
 (`patch_might_hold_sea`, `csp-view/src/terrain.rs:337`); airless/oceanless
 bodies emit nothing.
+
+**Water in the view.** The ocean never turns opaque with depth: what lies
+behind its surface fades by absorption instead. `terrain.wgsl` and
+`flight.wgsl` carry one water block verbatim (kept so by
+`water_block_is_one_text_in_both_shaders`). The ocean absorbs
+`(0.30, 0.05, 0.02)` per metre of path, red, green, blue — the path that
+leaves a hundredth of each is 15 m, 92 m and 230 m — and an endless path
+converges on the water body `(0.006, 0.042, 0.115)`. A seabed or a hull
+fragment under the surface is shaded as in air, then dimmed by the sun's
+way down to it and the eye's way to it, the share each takes going to the
+water body (`water_fog`). The surface drawn over it is layers whose alpha
+is only what they keep of the pixel: the sun's glint, the shoreline foam,
+and the Fresnel reflectance of bare water — 2 % looking straight down, all
+of it toward the horizon. The ocean pipeline blends premultiplied and
+tone-maps the light the layers carry, so a thin sky reflection stays as
+dark as the same light inside a hull's own sum. Seen from 15 m up, a hull
+whose top is 3 m under over 200 m of water reads cyan: over its silhouette
+its pixels differ from the open water beside them by 95 levels on average
+(device gate `a_hull_under_water_is_seen_from_above`,
+`csp-view/tests/render_gate.rs`; the rule this replaced — alpha 0.62 to 1.0
+with the sea's depth, 1.0 from 25 m — leaves 0.0).
+
+**Under water.** The eye can be below the surface (the camera floor is the
+seabed's, §5.1). From there the surface is a mirror: within 48.8° of the
+vertical the eye sees the sky through it, the ray bent away from the
+vertical on leaving (Snell's window — `fs_sky` shades the refracted
+direction), with 2 % of the pixel reflected; past that angle nothing above
+the surface reaches the eye and the surface shows the water body alone.
+Terrain and craft take the same absorption over the eye's way to them, and
+no aerial perspective — there is no air between; the sky takes it over the
+eye's way up to the surface. The unlit streams (plumes, dust, contact
+shadows) are thinned by the transmittance of that way and give the share it
+takes to the tone-mapped water body. No march was added to the ocean shader:
+its GPU time is taken by the ignored `time_ocean` gate on the driver named
+in `CSP_GPU`.
 
 Biome tint: the authored index map only **tints** — it never moves a vertex
 (§3.0.1 decoupling). `BiomeField` slots (≤16) map through
@@ -966,9 +1274,13 @@ finer filtered normal retilings above. `uniforms.art.z = 1` (render-gate
 pre-4b plain periodic tiling verbatim for before/after evidence pairs.
 
 The vessel blob shadow (`uniforms.shadow`, `vessel_shadow`,
-`csp-view/src/terrain.rs:497`) anchors the focused craft's shadow to the
-surface; `csp-view/terrain.rs::build_packet` (`:560`) assembles the whole
-`TerrainPacket` per frame from the staged `FlightEnv` + chase camera.
+`csp-view/src/terrain.rs:778`) anchors the focused craft's shadow to the
+surface — from the craft's drawn CoM, which `extract_flight` resolves and
+hands in; never from the camera, whose anchor is still travelling to the
+craft for the first frames after a focus change;
+`csp-view/terrain.rs::build_packet` (`:837`) assembles the whole
+`TerrainPacket` per frame from the staged `FlightEnv`, the chase camera
+and that CoM.
 
 **Shadow cascades (R1 core, landed 3a — ARMED since 3b; the R1 debt is
 closed).** `csp-render/src/shadow.rs` owns the whole cascade core: the
@@ -1004,13 +1316,20 @@ forward-Z-along-travel, lit ⇔ ref ≤ stored), pinned by the
 
 1. *View solve* (`csp-view/src/flight.rs`, RenderExtract — §2.5:
    presentation-only, never the sim): inside `extract_flight`'s terrain
-   gate, `cascade_uniforms` recovers the chase basis from the solved
+   gate, `cascade_uniforms` recovers the camera's forward from the solved
    `view_proj` (row 3 is `−z_out` under reverse-Z, the same recovery
-   `sky_view_rot` uses) and hands `solve_cascades` the forward/up/
-   `FLIGHT_FOV_Y`/viewport aspect/near 0.1 + the staged `FlightEnv` sun.
+   `sky_view_rot` uses) and takes the local up from the FOCUSED craft —
+   the direction of its drawn CoM from the body centre, the blob shadow's
+   anchor, handed in by name — never from the camera, which for the
+   first frames after a focus change is still travelling toward the
+   craft: the shadows stay with the craft through the travel. With
+   nothing focused the point the camera looks at (`eye − z_out·distance_m`)
+   supplies the up. It hands
+   `solve_cascades` that forward and up, `FLIGHT_FOV_Y`, the viewport
+   aspect, near 0.1 and the staged `FlightEnv` sun.
    The product rides the flight packet (`FlightPacket::shadow`,
    consumed via `View::take_flight_packet` like every other packet
-   row). **Arm predicate**: solve only while sun·up at the chase focus
+   row). **Arm predicate**: solve only while sun·up at the focused craft
    exceeds `SHADOW_ARM_SUN_UP = 0.06` (≈3.4° elevation — just above
    `sun_occlusion`'s 0.035 full-occlude and the blob's 0.04 disable, so
    no band exists where the cascade replaces a dimmer fallback; below
@@ -1038,8 +1357,8 @@ forward-Z-along-travel, lit ⇔ ref ≤ stored), pinned by the
    records one additional whole-stream draw after the terrain batch —
    hulls, debris and the launch-complex structures land in the map;
    unlit vertices (sky quads, plumes, dust, contact quads — zero
-   normal, placeholder `world`) are degenerated outside the clip
-   volume so emissive geometry never casts. The vessel **blob shadow
+   normal) are degenerated outside the clip volume by that normal, so
+   emissive geometry never casts. The vessel **blob shadow
    stays** this phase (harmless overlap under the sharper craft
    shadow; removal is later polish).
 4. *Receiving*: terrain/ocean as above, and `flight.wgsl`'s own
@@ -1236,7 +1555,7 @@ PLAN §3.7's M4c exit rows and where each lives:
 | Engine plume VFX | `flight::emit_plumes` (`flight.rs:2423`), delivered-thrust keyed |
 | Reentry plasma | `flight::emit_sheath` (`flight.rs:2520`), convective-flux driven |
 | Ground-contact dust | flight.rs:2870-2940 ring, §2.9 geometric predicate wired |
-| Basic SFX | M4c shipped the **cue channel** only: `FlightSfx`/`sfx_edges` (`flight.rs:575`/`:1887`) edge-detect ignition/cut, staging, breakup, contact, latch/liftoff, vessel-left — HUD flashes via `notice_overlay`. PLAN §3.7's as-shipped note documents the deferral to M10. |
+| Basic SFX | M4c shipped the **cue channel** only: `FlightSfx`/`sfx_edges` (`flight.rs:575`/`:1887`) edge-detect ignition/cut, staging, canopy-open (the frame a canopy first stands open over the focused craft — `sfx_edges`, `flight.rs:4889`), breakup, contact, latch/liftoff, vessel-left — HUD flashes via `notice_overlay`. PLAN §3.7's as-shipped note documents the deferral to M10. |
 | Audio (M10 exit row, the deferred half) | `csp-app/src/{audio,synth}.rs` — real backend: pure-function synth bank (`synth.rs`, fixed-seed xorshift — zero asset files, zero license rows) + a PCM mixer streaming to a **subprocess** player (`pw-play`/`paplay`/`aplay`, low-latency flags, bounded pipe lead); graceful silence when nothing can be spawned. Consumes `FlightSfx` + `FlightSnapshot` read-only after `end_frame` (`csp-app/src/lib.rs:1018-1027`). |
 
 Note: PLAN §3.7's as-shipped note says "no audio stack exists in the tree" —
@@ -1428,7 +1747,17 @@ budget-limited previews, `csp-app/src/lib.rs:1398-1447`).
   pixels at 10, 30 and 40 km in daylight, stars at 55 and 60 km and at dusk
   from the ground), each metric with GPU-free tests of its own (the grain
   metric on a quantised gradient, on one dithered by ±half a code value,
-  and on one plus white noise); `--ignored` PPM dumps.
+  and on one plus white noise); the canopy gate
+  `an_open_canopy_is_drawn_over_the_stock_craft` (the Stock Hopper staged
+  through `fire_stage` and flown down under its whole canopy 1.8 km up; the
+  frame beside the same frame with the canopy's 1 152 vertices taken out —
+  exactly one canopy's worth stands above the canister, and the two must
+  differ on ≥ 1 000 of 76 800 pixels; measured 3 394, with the canopy emit
+  disabled 0. The same test takes the camera's own framing first — its
+  opening stepped a tick a frame, as the game shows it — and requires the
+  eye at least 75 m out: 14.2 m with the reach read at the staged inflation.
+  `DUMP_CANOPY_DIR=1` writes the frames to `target/canopy/`);
+  `--ignored` PPM dumps.
 - `csp-view/tests/render_dump_extra.rs` (449) — additional dump scenes.
 - `csp-view/tests/vab_latency.rs` (165) — the §5.4 kill criterion.
 - `csp-ui/tests/hud_dump.rs` (393) — HUD contrast rasterizer.

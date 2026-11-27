@@ -1,7 +1,7 @@
 // Global balance constants. ALL tuning lives here (PLAN §8.3).
 // Named fields only — positional tuples drift silently under reordering.
 (
-    schema_version: 15,
+    schema_version: 17,
     // Physics bubble radius (PLAN §2.3): 20 km. Vessels go on rails at the
     // radius and rejoin at 90% (18 km) — the hysteresis is csp-sim logic,
     // not a second constant.
@@ -144,4 +144,40 @@
     // 5 000 funds = the authored hire cost, a fifth of founding.
     // Mirror: `csp_sim::economy::DEFAULT_COLONY_MODULE_REPAIR_FUNDS`.
     colony_module_repair_cost_funds: 5_000.0,
+    // Water physics: the density of every ocean in kg/m³ — a part
+    // displaces this much mass per submerged cubic metre of its
+    // collider, so a part floats iff its own density is lower. 1025 is
+    // standard seawater: a full fuel tank (≈823 kg/m³) floats with
+    // four fifths of it under, a pod or an engine floats higher, and an
+    // ore carrier loaded with metal (≈1530 kg/m³) sinks.
+    // Mirror: `csp_phys::DEFAULT_WATER_DENSITY_KG_M3`.
+    water_density_kg_m3: 1025.0,
+    // Water physics: the quadratic drag coefficient on every part in
+    // water — `½·ρ·Cd·A·v²` over the submerged share of the part's
+    // projected area. 1.0 is bluff-body order — a flat face meeting the
+    // water; the same coefficient serves every part.
+    // Mirror: `csp_phys::DEFAULT_WATER_DRAG_CD`.
+    water_drag_cd: 1.0,
+    // M4c landing: the touchdown absorption's crush distance (m) —
+    // the §2.4 joint-load evaluation reads a landing's ground-contact
+    // stop as if spread over this far (`F = m·Δv²/(2·s)`), so a
+    // chute-speed touchdown is a load the shipped inline joints
+    // survive while a hot impact still breaks the stack. The solver's
+    // motion is unchanged.
+    // Mirror: `csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M`.
+    touchdown_crush_m: 0.5,
+    // §3.1 rule A: a deployed canopy steadies the craft that hangs from
+    // it with a couple proportional to its own pull — the restoring arm
+    // (m) turns the craft's axis onto the airflow, the damping (m·s)
+    // opposes its spin. Measured on the dry Stock Hopper (csp-sim's
+    // landing tests): 1.0 / 0.15 hang it within half a degree of the
+    // flow from every apogee from 20 km to 70 km and leave no spin at
+    // touchdown. A 2 m arm with 0.3 damping turns the stack so hard at
+    // the catch that the lower stack breaks off; with neither the stack
+    // swings under its canopy and tumbles in; and under a 0.3 m arm a
+    // pod alone hangs 10.5° off the flow where under 1 m it hangs 3.2°.
+    // Mirror: `csp_phys::DEFAULT_CANOPY_STEADY_ARM_M`,
+    // `DEFAULT_CANOPY_STEADY_DAMP_M_S`.
+    canopy_steady_arm_m: 1.0,
+    canopy_steady_damp_m_s: 0.15,
 )

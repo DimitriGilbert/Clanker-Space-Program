@@ -37,25 +37,31 @@ pub const DEMO_ROOT: &str = "data";
 /// `crate::lib`).
 pub(crate) const DEMO_SAVE_SEED: u64 = 0xC5A3_5EED_0000_0001;
 
-/// The starter craft — `(catalog id, parent row)` pairs: `None` sets
-/// the root, `Some(i)` `AttachAuto`s under the part placed at index
-/// `i`. The pod/tank/engine propulsion chain is unchanged
-/// (liftoff TWR ≈ 5); the canister + battery are the science leg out
-/// of the box (W1.5-b): the canister runs `exp.materials_study`
-/// landed and in space, the battery's 1 kU of `electric_charge` pays
-/// for a transmit; both are `tech.start` parts so no research is
-/// required. They fly INLINE between the pod and the tank — both
-/// now carry 1.25-class stack interfaces — so the science leg rides
-/// mid-stack where a 0.625 nose mount would tumble the ascent and
-/// a radial bolt-on has no welded joint shape. Shared by the §6.3
+/// The starter craft — `(catalog id, parent row, stage)` triples:
+/// `None` sets the root, `Some(i)` `AttachAuto`s under the part placed
+/// at index `i`, and the stage is the firing the part belongs to.
+/// The pod/tank/engine propulsion chain is unchanged (liftoff TWR ≈ 5);
+/// the canister + battery are the science leg out of the box (W1.5-b):
+/// the canister runs `exp.materials_study` landed and in space, the
+/// battery's 1 kU of `electric_charge` pays for a transmit; both are
+/// `tech.start` parts so no research is required. They fly INLINE
+/// between the pod and the tank — both now carry 1.25-class stack
+/// interfaces — so the science leg rides mid-stack where a 0.625 nose
+/// mount would tumble the ascent and a radial bolt-on has no welded
+/// joint shape. The chute (M4c landing) rides the pod's free 0.625
+/// top node — `AttachAuto`'s only size-matched pair, along the stack
+/// where its pull is pure axial — in stage 1: its own firing above the
+/// stage-0 floor the rest of the craft sits in, so SPACE after liftoff
+/// deploys it and the hopper comes home under it. Shared by the §6.3
 /// demo's fixed scenario and the shipping build's first-run seed
 /// ([`View::seed_starter_craft`](crate::View::seed_starter_craft)).
-const STARTER_CRAFT: [(&str, Option<usize>); 5] = [
-    ("csp.pod.mk1", None),
-    ("csp.science.canister", Some(0)),
-    ("csp.battery.z1k", Some(1)),
-    ("csp.tank.s160", Some(2)),
-    ("csp.engine.sparc", Some(3)),
+const STARTER_CRAFT: [(&str, Option<usize>, u32); 6] = [
+    ("csp.pod.mk1", None, 0),
+    ("csp.science.canister", Some(0), 0),
+    ("csp.battery.z1k", Some(1), 0),
+    ("csp.tank.s160", Some(2), 0),
+    ("csp.engine.sparc", Some(3), 0),
+    ("csp.chute.s125", Some(0), 1),
 ];
 
 /// The shipping build's display name for the seeded starter craft —
@@ -230,7 +236,7 @@ pub(crate) fn seed_pad_craft(view: &mut View, name: &str) -> Result<(), String> 
         // `selected()` reports the freshly placed node after every
         // attach.
         let mut placed: Vec<csp_phys::PartNodeId> = Vec::with_capacity(STARTER_CRAFT.len());
-        for (part, parent) in STARTER_CRAFT {
+        for (part, parent, stage) in STARTER_CRAFT {
             let id = csp_data::PartId::from(part);
             match parent {
                 None => v.apply(VabAction::SetRoot(id)).map_err(|e| e.to_string())?,
@@ -241,7 +247,15 @@ pub(crate) fn seed_pad_craft(view: &mut View, name: &str) -> Result<(), String> 
                     })
                     .map_err(|e| e.to_string())?,
             }
-            placed.push(v.selected().ok_or("starter craft: no node placed")?);
+            let placed_node = v.selected().ok_or("starter craft: no node placed")?;
+            if stage != 0 {
+                v.apply(VabAction::SetStage {
+                    node: placed_node,
+                    stage,
+                })
+                .map_err(|e| e.to_string())?;
+            }
+            placed.push(placed_node);
         }
         // The launch path resolves the craft from the session's cached
         // analysis — recompute now (the VAB's own frames would do it,

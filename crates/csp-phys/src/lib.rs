@@ -80,6 +80,8 @@
 //!   (`Ray`/`Hit`/`Contact`/`BodyHandle`/`JointDef`).
 //! - [`simple`] — `SimpleBackend`, the §2.9 default backend, and the
 //!   §3.0 closed-form atmosphere evaluators.
+//! - [`water`] — `Ocean` and the per-part buoyancy and drag the backend
+//!   sums from it: what each collider displaces below the free surface.
 
 pub mod aero;
 pub mod backend;
@@ -95,6 +97,7 @@ pub mod simple;
 pub mod structural;
 pub mod tensor;
 pub mod thermal;
+pub mod water;
 pub mod weld;
 
 pub use aero::{
@@ -127,14 +130,15 @@ pub use session::{
     snap_transform,
 };
 pub use simple::{
-    BAUMGARTE_BETA, DEFAULT_DRAG_CD, DEFAULT_FRICTION_MU, DEFAULT_SETTLE_TICKS, DEFAULT_SETTLE_V,
-    DEFAULT_SETTLE_W, Environment, PHYSICS_DT, SOLVER_ITERATIONS, SimpleBackend, TerrainSurface,
-    atmosphere_density_kg_m3, atmosphere_pressure_pa, atmosphere_sound_speed_mps,
-    atmosphere_temperature_k,
+    BAUMGARTE_BETA, CanopyFlow, CanopySteering, DEFAULT_CANOPY_STEADY_ARM_M,
+    DEFAULT_CANOPY_STEADY_DAMP_M_S, DEFAULT_DRAG_CD, DEFAULT_FRICTION_MU, DEFAULT_SETTLE_TICKS,
+    DEFAULT_SETTLE_V, DEFAULT_SETTLE_W, DecelDrag, Environment, PHYSICS_DT, SOLVER_ITERATIONS,
+    SimpleBackend, TerrainSurface, atmosphere_density_kg_m3, atmosphere_pressure_pa,
+    atmosphere_sound_speed_mps, atmosphere_temperature_k,
 };
 pub use structural::{
-    JointLoad, PartForce, failed_joints, fragment_graph, fragment_graph_of, fragment_velocity,
-    joint_loads, subtree_set,
+    DEFAULT_TOUCHDOWN_CRUSH_M, JointLoad, JointModel, PartForce, PullSite, TickMotion, Touchdown,
+    failed_joints, fragment_graph, fragment_graph_of, fragment_velocity, joint_loads, subtree_set,
 };
 pub use tensor::{Axis, SymMat3};
 pub use thermal::step as thermal_step;
@@ -142,6 +146,10 @@ pub use thermal::{
     DEFAULT_CONVECTIVE_HEAT_FRACTION, SPACE_SINK_K, STEFAN_BOLTZMANN_W_M2_K4, ThermalEdge,
     ThermalFlow, ThermalNet, ThermalNode, ambient_k, flow_sample, joint_conductance,
     steady_state_temp_k,
+};
+pub use water::{
+    DEFAULT_WATER_DENSITY_KG_M3, DEFAULT_WATER_DRAG_CD, DEFAULT_WATER_LINEAR_DAMPING_PER_S, Ocean,
+    WaterPart,
 };
 pub use weld::{
     CompoundCollider, ConvexHull, DecelSite, PartWeld, SettleState, WeldError, WeldedBody, weld,

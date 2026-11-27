@@ -15,9 +15,10 @@
 // the camera-relative body-frame position — the exact `wrel` the
 // terrain cast writes (the bubble frame differs by translation
 // only). Unlit vertices (zero normal: sky quads, plumes, dust,
-// sheath, contact quads carry placeholder `world`) are degenerated
-// outside the clip volume — a triangle whose every corner sits there
-// rasterizes nothing, so emissive geometry never casts.
+// sheath, contact quads — their `world` is real, the visible pass
+// measures the water in front of them by it) are degenerated outside
+// the clip volume by that normal — a triangle whose every corner sits
+// there rasterizes nothing, so emissive geometry never casts.
 
 struct SU {
     // Cascade 0/1 light-view-proj: (world − eye) → cascade clip.

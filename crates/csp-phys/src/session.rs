@@ -67,7 +67,12 @@
 //! order is strictly descending (`stage_order`). New parts default to
 //! stage `0`, the last-fired floor, and indices are capped at
 //! [`MAX_STAGE_INDEX`] (`set_stage`/`insert_stage` refuse more — a
-//! saturating add may never merge two stages). A
+//! saturating add may never merge two stages). A stage is part of the
+//! staging list ([`CraftSession::listed_stages`]) while a part sits in
+//! it or [`CraftSession::insert_stage`] opened it: an opened stage
+//! stays listed while empty, so there is always a row to move a part
+//! into. The craft file stores each part's stage and nothing else, so
+//! an empty stage does not survive a save. A
 //! [`ModuleDef::Decoupler`] part
 //! severs *all its child edges* when its stage fires ("the attach node
 //! below this part severs" — the decoupler stays with the parent side;
@@ -265,6 +270,12 @@ pub struct CraftSession {
     /// Monotonic allocator — serialized, never decreases, ids never
     /// reused (M3's stable-`PartId` requirement).
     next_id: u64,
+    /// Stages opened by [`CraftSession::insert_stage`] that no part sits
+    /// in yet. [`CraftSession::listed_stages`] shows them until they are
+    /// removed, so an empty stage is a place a part can be moved into.
+    /// Not part of the craft file (a file stores each part's stage and
+    /// nothing else): a loaded craft lists its populated stages only.
+    open_stages: BTreeSet<u32>,
 }
 
 /// Why a session op was refused — typed, never a panic (§2.13). These
@@ -1941,17 +1952,34 @@ impl CraftSession {
         s
     }
 
+    /// The stages the staging list shows, highest first: every populated
+    /// one plus every opened empty one ([`Self::insert_stage`]). The
+    /// firing order ([`Self::stage_order`]) is unaffected — an empty
+    /// stage has nothing to fire.
+    pub fn listed_stages(&self) -> Vec<u32> {
+        self.nodes
+            .values()
+            .map(|n| n.stage)
+            .chain(self.open_stages.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+
     /// The stage `spacebar` would fire next — the highest populated.
     pub fn next_stage(&self) -> Option<u32> {
         self.populated_stages().last().copied()
     }
 
-    /// Open a gap at `at`: every part with `stage ≥ at` moves up one.
-    /// `at` is capped by [`MAX_STAGE_INDEX`], and an insert that
-    /// would push a part already at the cap is **refused**, not
-    /// saturated — two stages can never silently merge (the
-    /// `u32::MAX` `saturating_add` behaviour this replaced). Atomic:
-    /// both checks run before any mutation. Nodes carrying an
+    /// Open a gap at `at`: every part with `stage ≥ at` moves up one,
+    /// and `at` itself becomes a listed empty stage until it is removed
+    /// or a part is moved into it — whether or not anything sat at or
+    /// above `at`. `at` is capped by [`MAX_STAGE_INDEX`], and an insert
+    /// that would push a part or an opened stage already at the cap is
+    /// **refused**, not saturated — two stages can never silently merge
+    /// (the `u32::MAX` `saturating_add` behaviour this replaced).
+    /// Atomic: every check runs before any mutation. Nodes carrying an
     /// out-of-cap stage (only reachable via a crafted file —
     /// `validate` flags them) are left where they are.
     pub fn insert_stage(&mut self, at: u32) -> Result<(), SessionError> {
@@ -1966,6 +1994,7 @@ impl CraftSession {
             .nodes
             .values()
             .any(|n| n.stage >= at && n.stage == MAX_STAGE_INDEX)
+            || self.open_stages.range(at..).next() == Some(&MAX_STAGE_INDEX)
         {
             return Err(SessionError::InvalidStage {
                 node: None,
@@ -1978,11 +2007,14 @@ impl CraftSession {
                 n.stage += 1;
             }
         }
+        self.remap_open_stages(at, |s| s + 1);
+        self.open_stages.insert(at);
         Ok(())
     }
 
     /// Delete stage `at`: parts in it fold to `at − 1` (stage 0 is the
-    /// floor — its parts stay), stages above it shift down one.
+    /// floor — its parts stay), stages above it shift down one. An
+    /// opened empty stage leaves the list the same way.
     pub fn remove_stage(&mut self, at: u32) {
         for n in self.nodes.values_mut() {
             if n.stage > at {
@@ -1991,14 +2023,30 @@ impl CraftSession {
                 n.stage = at - 1;
             }
         }
+        self.open_stages.remove(&at);
+        self.remap_open_stages(at, |s| s - 1);
+    }
+
+    /// Re-key every opened stage at or above `at` through `map`; the
+    /// ones below `at` stay. `insert_stage`'s refusal above is what
+    /// keeps `s + 1` under the cap; `remove_stage` has already dropped
+    /// `at`, so every stage it moves is `> at` and `s − 1` cannot
+    /// underflow.
+    fn remap_open_stages(&mut self, at: u32, map: impl Fn(u32) -> u32) {
+        self.open_stages = self
+            .open_stages
+            .iter()
+            .copied()
+            .map(|s| if s >= at { map(s) } else { s })
+            .collect();
     }
 
     /// Reindex populated stages to `0..k` preserving order — the
-    /// staging panel's "tidy" op; empty gaps disappear. An out-of-cap
-    /// stage index (crafted file only — `validate` flags it and the
-    /// ops gate it) is **refused**, not remapped into a legal-looking
-    /// dense index: silently rewriting it would launder the defect
-    /// `validate` is meant to report (C15-F4).
+    /// staging panel's "tidy" op; empty gaps and opened empty stages
+    /// disappear. An out-of-cap stage index (crafted file only —
+    /// `validate` flags it and the ops gate it) is **refused**, not
+    /// remapped into a legal-looking dense index: silently rewriting it
+    /// would launder the defect `validate` is meant to report (C15-F4).
     pub fn compact_stages(&mut self) -> Result<(), SessionError> {
         if let Some((id, stage)) = self
             .nodes
@@ -2023,6 +2071,7 @@ impl CraftSession {
                 n.stage = *new;
             }
         }
+        self.open_stages.clear();
         Ok(())
     }
 
@@ -2477,6 +2526,7 @@ impl CraftSession {
                 root: None,
                 nodes,
                 next_id: file.next_id,
+                open_stages: BTreeSet::new(),
             });
         }
         let root = PartNodeId(file.root.ok_or(CraftFileError::MissingRoot)?);
@@ -2536,6 +2586,7 @@ impl CraftSession {
             root: Some(root),
             nodes,
             next_id: file.next_id,
+            open_stages: BTreeSet::new(),
         })
     }
 }
@@ -3009,6 +3060,69 @@ mod tests {
         s.compact_stages().unwrap();
         assert_eq!(s.stage_order(), vec![2, 1, 0]);
         assert_eq!(s.stage_of(eng), Some(2));
+    }
+
+    /// An inserted stage is listed while empty — the row "+ stage"
+    /// offers — whether or not a part ever moves into it, and only
+    /// `remove_stage`/`compact_stages` (or the craft file) drop it.
+    #[test]
+    fn inserted_stage_is_listed_while_empty() {
+        let (mut s, _, pod, tank, eng) = stack();
+        assert_eq!(s.listed_stages(), vec![0]);
+        // Above the top: no part moves, the new stage is simply listed.
+        s.insert_stage(1).unwrap();
+        assert_eq!(s.listed_stages(), vec![1, 0]);
+        assert_eq!(s.stage_order(), vec![0], "an empty stage is no firing");
+        // A part moved in populates it; moved out again, still listed.
+        s.set_stage(eng, 1).unwrap();
+        s.set_stage(eng, 0).unwrap();
+        assert_eq!(s.listed_stages(), vec![1, 0]);
+        // Removing it changes the list and nothing else.
+        s.remove_stage(1);
+        assert_eq!(s.listed_stages(), vec![0]);
+        assert_eq!(
+            [s.stage_of(pod), s.stage_of(tank), s.stage_of(eng)],
+            [Some(0); 3]
+        );
+        // A part moved in, then the stage removed: the part folds down.
+        s.insert_stage(1).unwrap();
+        s.set_stage(tank, 1).unwrap();
+        s.remove_stage(1);
+        assert_eq!(s.stage_of(tank), Some(0));
+        assert_eq!(s.listed_stages(), vec![0]);
+        // Inserting below an opened stage shifts it like a part's stage.
+        s.insert_stage(2).unwrap();
+        s.insert_stage(1).unwrap();
+        assert_eq!(s.listed_stages(), vec![3, 1, 0]);
+        s.remove_stage(1);
+        assert_eq!(s.listed_stages(), vec![2, 0]);
+        // The craft file stores parts' stages only: a reopened craft
+        // lists what its parts sit in.
+        let bytes = s.to_bytes().unwrap();
+        assert_eq!(
+            CraftSession::from_bytes(&bytes).unwrap().listed_stages(),
+            vec![0]
+        );
+        // `compact` tidies the empties away with the gaps.
+        s.compact_stages().unwrap();
+        assert_eq!(s.listed_stages(), vec![0]);
+    }
+
+    /// An opened stage at the cap refuses an insert below it for the
+    /// same reason a part there does — the shift would merge two stages.
+    #[test]
+    fn insert_stage_refuses_to_push_an_opened_stage_past_the_cap() {
+        let (mut s, _, _, _, _) = stack();
+        s.insert_stage(MAX_STAGE_INDEX).unwrap();
+        assert!(matches!(
+            s.insert_stage(0),
+            Err(SessionError::InvalidStage { .. })
+        ));
+        assert_eq!(
+            s.listed_stages(),
+            vec![MAX_STAGE_INDEX, 0],
+            "the refusal is atomic"
+        );
     }
 
     /// C15-F4: a crafted out-of-cap stage index refuses `compact_stages`

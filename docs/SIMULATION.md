@@ -374,6 +374,45 @@ contact (M6) runs the same PGS machinery over pair manifolds; latched bodies act
 static colliders. Terminal state is the §2.6.4 settle latch (`settle_v = 0.05` m/s,
 plus per-tick pose-delta limits).
 
+**Water** (`water.rs`) — buoyancy and drag for any body with an `ocean`
+(`csp_phys::Ocean` on `Environment`, `#[serde(default)]`: artifacts recorded before it decode
+dry). Water fills the seabed up to the datum sphere; each part is cut by the tangent plane
+at the craft's centre of mass (half a millimetre off the sphere at the ends of a 50 m craft).
+
+- **Displacement**: the collider's volume below the surface and that volume's centroid,
+  classified from the welded vertices each tick. The resolver's 16-point `Cylinder` prism is
+  recognised and cut as the **true cylinder** by a closed form — the primitive its inertia is
+  computed from, agreeing with its own section integral to 3.2e-10 over a sweep of
+  leans and drafts; an oriented **box** is clipped face by face; anything else is cut
+  as its own convex polytope.
+- **Buoyancy** `ρ·g·V_sub` along local up **at the submerged centroid** — the weight of the
+  displaced water through the same `gravity_force_world` channel as gravity. Where the weight
+  sits decides stability: a top-heavy stack capsizes, a bottom-heavy one rights itself.
+- **Drag** `½·ρ·Cd·A·f·|v|·v` against the co-rotating water (`A` the collider's silhouette
+  along the flow, `f` the submerged fraction), plus **linear damping** `k·ρ·V_sub·v` and
+  `k·ρ·V_sub·κ²·ω` (`k = 1.5 /s`, the wave-radiation stand-in) that ends the bob — quadratic
+  drag alone never brings a floater inside the settle thresholds. Each part's `v` is that
+  part's own velocity through the water, `v + ω×r`, so drag always takes energy: a stack that
+  tips over in the water comes to rest on its side.
+- **Stiff ticks**: water is about 840 times denser than air, so at entry speed a tick's drag
+  is more than the motion it acts on (a 1 m² face at 200 m/s reads 2 000 g). The load is never
+  scaled to fit the step: a tick whose drag is stiff integrates the velocity by fourth-order
+  Runge–Kutta sub-steps at the frozen pose, sized by a bound on the drag's stiffness — within
+  1e-4 of the drag law's own solution, measured 8e-6 at 200 m/s. A tick that is not stiff is
+  the backend's own step, bit for bit.
+- The tick's loads are a record (`SimpleBackend::water_loads`) the §2.4 joint-load evaluation
+  reads beside the contact impulses, so splashdown loads break stacks: a three-cube stack on
+  the shipped mount limits peaks at 9 g under a parachute's 17 m/s and holds; at 200 m/s it
+  peaks at 904 g and breaks on tick 15.
+- **Cull**: a centre of mass above the datum by more than the body's reach skips the whole
+  channel, and such a craft is bit-identical to the same craft in a world with no ocean
+  (state-hash test, on a pad and through the last dry metre of a fall onto water).
+- **Latch**: a hull the water holds up — in water, lighter than its own volume of water —
+  counts as in contact for the settle latch; a sinker never latches in mid-water.
+  `transition_latched` records the verdict in `SurfacePose::afloat` (hashed only when set),
+  `SimWorld::splashed` answers `Splashed` versus `Landed`, and the parked-support recheck
+  leaves a floater alone.
+
 - **PLAN-vs-code divergence #3 (documented in code):** PLAN §2.9 specifies a
   `RapierBackend` (`rapier3d-f64`) for jointed islands. **No RapierBackend exists**;
   `rapier3d-f64`/`parry3d-f64` are workspace-declared but unused by any crate
@@ -391,6 +430,104 @@ vessel; held fixed on rails/latched (documented v1 approximation).
 joint reaction `F_J = M_S·a(c_S) − ΣF_ext` per non-root node decomposed against the
 attach axis; overload splits the graph, children inherit momentum (conservation
 test with the plan's defined denominators) and the parent's aero tables.
+
+- **Torque arm** (`PartNode::attach_point`): the reaction's torque is measured about
+  the edge's recorded attach point — the snapped `AttachNode` position carried into the
+  parent's pose (`CraftSession::to_part_graph` stamps it; a hand-built graph falls back
+  to the node origin).
+- **Touchdown absorption** (M4c landing; `csp_phys::Touchdown`, `balance.ron`'s
+  `touchdown_crush_m`): the solver stops a landing inside one tick, so a touchdown's
+  measured `Δv/dt` is the whole impact speed over 1/64 s. The evaluation reads the stop
+  as spread over the crush distance `s` instead — each component, along the contact
+  normals and the friction across them, keeps `|Δv_c|·dt/(2·s)` of its share of the
+  acceleration and of the solved impulses (their resultant on each touched part, acting
+  through the body's CoM — `joint_loads` takes the moment `com × f`, so a joint carries
+  the inertia of what hangs off it, never the whole craft's stop about the CoM's height) —
+  so an inline joint carries `m·Δv²/(2·s)` and the spin the one-tick
+  sequential solve imparted is not read. A component that would outrun the crush
+  distance (`|Δv_c|·dt ≥ 2·s`: 64 m/s at 0.5 m) is not absorbed; the tick's own load is.
+  The record counts every ground row of the tick, speculative near-misses included (a
+  speculative row brakes the body without a public `Contact`); water is not this channel.
+  `SimpleBackend::touchdown` builds it, `structural_tick` (lib.rs) hands it to
+  `joint_loads`. The craft's motion is the solver's, unchanged. The CoM is load-bearing:
+  with the force read at the body origin instead, a lateral stop — the friction of a
+  touchdown on anything but level ground — turned every joint above the touched part
+  with five to six times the Stock Hopper battery joint's real torque: 114% of its rating
+  at a 7 m/s touchdown on a 1.5° slope, three nodes gone on the tick. Through the CoM that
+  touchdown reads 24% at its worst joint, and 6% of the torque rating on the pad.
+- **Decelerator sites** (§3.1 rule A; `refresh_decel_sites` lib.rs + `decel_areas_m2`
+  simple.rs) — a `Parachute` site's drag is two terms that do not act on the craft alike.
+  The **packed canister's** drag acts where the canister is. The **canopy's** pull acts on the
+  craft's axis: at the site's projection onto the line through the root part's centre along its
+  own +z — for the craft's rigid-body motion and for every joint but the chute's own mount
+  (`PartForce::canopy`). The mount reads none of it: its reef is what bounds the canopy, and
+  its load is everything else. The canopy ramps in over `deploy_time_s` from the first tick
+  both catch gates hold (C14-F1: a deploy-early command cannot pre-complete inflation) and is
+  reefed to 0.9 × the mount's weaker force channel — the s125's 54 kN — on any mount. Before
+  rule A the pull acted at the mount through its lever: a radial canopy was capped at the
+  torque rating over its 0.25 m arm (29 kN against the top mount's 54 kN), and with the craft
+  no longer pitching the lever out of the flow its reefed torque beside the canister's own
+  drag tore the mount off at the catch. A chute on any mount lands the craft the same way
+  now: the lone radial chute brings the Stock Hopper down from 1.5 km at 250 m/s at the top
+  chute's own 6.96 m/s, where the lever starved it to 9–16 kN and the stack arrived at
+  149 m/s. The mount never reefs the packed term: the canister's own drag is its honest
+  load on a hot entry.
+- **Canopy steering** (rule A; `CanopySteering`, `SimpleBackend::canopy_couple` simple.rs;
+  `balance.ron`'s `canopy_steady_arm_m` and `canopy_steady_damp_m_s`) — a deployed canopy
+  steadies the craft that hangs from it with a couple about the CoM proportional to its own
+  pull, `F·(arm·(axis × flow) − damp·ω)`. The arm is the hang: the torque the pull would
+  give a lever of that length along the axis above where the craft takes it. It is what
+  rights a craft whose canopy is taken through its own centre — a pod alone under a radial
+  chute has no pendulum of its own. The damping is what keeps a stack from swinging under
+  its canopy: with neither the Stock Hopper comes in from a 70 km apogee tumbling, 124° off
+  the vertical at 13 rad/s. The couple is read at the start of the tick and the step takes
+  it as it stands, so both shares are cut to what the craft's inertia can follow in one tick
+  (`CANOPY_STEER_RATE_LIMIT_PER_S`, half the tick rate about the craft's least moment) — an
+  uncut damping spins a small craft up instead of settling it. Too much breaks stacks: the
+  restoring adds to the pendulum's turn at a catch on a leaning craft, and the joints below
+  carry it. Measured on the dry Stock Hopper: a 1 m arm with 0.15 m·s of damping hangs it
+  within half a degree of the flow from every apogee from 20 km to 70 km and leaves no spin
+  at touchdown, and a pod alone under a radial chute within 3.2° (10.5° under a 0.3 m arm);
+  a 2 m arm with 0.3 loses the lower stack at the catch from 20 km.
+- **Decelerator budgets** (C14-F1's companion; `reef_pull_budgets` lib.rs +
+  `JointModel::pull_budgets` structural.rs): each term of a site's drag is capped, on its
+  own, at what every other joint of the craft takes of it where it acts
+  (`DecelSite::packed_budget_n`, `canopy_budget_n`).
+  - *The packed term*, off the craft's axis, is a pitch moment on every joint below the
+    mount. Measured on the dry Stock Hopper with the s125 on the pod's side at 250 m/s: the
+    canister alone (12 kN, 0.9 m off the axis) is 105% of the pod-to-canister joint's
+    10 kN·m and 113% of the canister-to-battery joint's 8 kN·m — the stack comes apart on
+    the spawn tick, before its canopy opens. Budgeted at 9 kN, every node holds.
+  - *The canopy's* pull levers nothing through its mount, but it levers the hang: catching
+    on a craft that leans, it turns the whole stack about the CoM at its first tick, and the
+    joints below carry the turn. Unbounded, the Stock Hopper broke at the 16 km gate from a
+    20 km apogee, its top chute catching 18° off the flow — a side canister's own drag had
+    leaned it there. Aligned, the canopy's budget is far past anything its mount's reef
+    lets through and never binds: what starved a radial canopy at rule A's reading was its
+    mount's lever, and the pull no longer acts there.
+  The budget is the joint-load model above read as a bound: the tick's other loads (aero,
+  thrust, gravity: `external_loads` on a probe of the body with its sites out) under the
+  rigid response the step gives them, plus each term's own share per newton (a unit drag
+  less its negative, which cancels everything the drag does not cause); per joint and
+  channel — axial, shear, torque on the joint's attach axis — the drag gets the room between
+  the rest and its derated limit. A canopy's share is read with its restoring arm, as one
+  pendulum with the pull; its damping is deliberately left out
+  (`JointModel::pull_budgets`'s doc says why). It is read twice, where the forces act and
+  one tick on (`SimpleBackend::coast_ahead`), because the evaluation reads its aero at the
+  pose the step lands in; the lesser is the term's. **All the terms are budgeted together**,
+  because they drag together: each one's own budget carries the one scale that keeps every
+  channel inside the derate with all of them pulling — the shares add, vector by vector,
+  each times its budget — and the scale never exceeds 1. Read one at a time, two radial
+  canisters on the Stock Hopper each took the full budget and their turns met on the
+  battery joint: 99.9% of its torque rating 3.5 s after their catch, the lower stack broken
+  off the pod. The model is an approximation of the evaluation and reads low under a
+  swinging stack, so the budget does not trust it for the last word: `pull_readback` flies a
+  copy of the craft under the budgets the step is about to use and reads it exactly as the
+  evaluation will (the couple included), and every finite budget takes the one scale that
+  brings that reading back inside the derate. Twice, because the reading is not linear in
+  the scale, and the cut lands on what each term actually drags. The top-mounted stock craft
+  aligned under its canopy never meets a binding budget, and a pod-alone chute has no joint
+  but its mount: unbounded.
 
 **Docking** (`merge.rs` + `joints.rs`): approach = live `LiveJoint` transient
 (cap 16; over-cap degrades to clean separation); latch = pure graph merge
