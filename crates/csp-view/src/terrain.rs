@@ -12,6 +12,10 @@
 //!
 //! Determinism: heights are a pure function of `noise_seed`
 //! (§3.0's `TerrainDef`); the bake is one-time per body and Arc-shared.
+//! The simulation bakes the field first, at construction
+//! (`SimpleBackend::new` → `TerrainSurface::prewarm`); the view adopts
+//! that allocation ([`TerrainCache::adopt`]) and bakes only for a body
+//! the simulation has not.
 //! Nothing here is sim state — it is the R2 "pre-baked tiles" path.
 
 use std::collections::BTreeMap;
@@ -199,6 +203,21 @@ fn biome_field(loaded: &csp_data::LoadedBiomeMap) -> Option<Arc<rt::BiomeField>>
 /// `(body, seed)` can never share a cache slot (M5 §5.2-R2).
 type CacheKey = (String, u64, u64);
 
+fn cache_key(body_id: &str, seed: u64, profile: ReliefProfile) -> CacheKey {
+    (body_id.to_owned(), seed, profile.key_seed_fold())
+}
+
+/// `env`'s body in the authored table, else the deterministic
+/// synthesized fallback — the one resolution behind the packet, the
+/// ground samplers and the pending poll.
+fn body_of(cfg: &TerrainConfig, env: &FlightEnv) -> TerrainBody {
+    let body_id = env.body.as_ref().map_or("", |b| b.as_str());
+    cfg.bodies
+        .get(body_id)
+        .cloned()
+        .unwrap_or_else(|| TerrainBody::synthesized(body_id, env.radius_m))
+}
+
 /// The baked heightfield cache — one per dominant body, rebuilt when
 /// the staged body id/seed/profile change (SOI transfer mid-flight).
 /// The bake (524k texels × 13 octaves legacy, 4× that under Mountain)
@@ -214,6 +233,13 @@ type CacheKey = (String, u64, u64);
 /// the zeros stand-in used to sample. wasm has no threads and keeps
 /// the synchronous path (a one-time hitch the demo already pays at
 /// startup — `None` is unreachable there by construction).
+///
+/// The simulation bakes the same field at construction
+/// (`SimpleBackend::new` → `TerrainSurface::prewarm`), so a body it
+/// holds is never baked here: [`Self::adopt`] installs that allocation
+/// under the cache's key before the first frame reads the cache, and
+/// the wait above is left to a body the simulation has not baked — the
+/// frames the loading screen covers.
 /// Presentation data only.
 #[derive(Resource, Default)]
 pub struct TerrainCache {
@@ -234,6 +260,22 @@ pub struct TerrainCache {
 }
 
 impl TerrainCache {
+    /// The simulation's baked field for `body_id` becomes the cache's
+    /// entry for that `(seed, profile)` key: [`Self::field`] serves it
+    /// at the key's first request and no bake is spawned. A surface the
+    /// simulation has not baked yet leaves the cache alone — the key
+    /// then takes the cache's own path. Called before the first frame
+    /// reads the cache: at construction and at a snapshot restore, once
+    /// the backend has prewarmed.
+    pub(crate) fn adopt(&mut self, body_id: &str, surface: &csp_phys::TerrainSurface) {
+        if let Some(baked) = surface.baked_field() {
+            self.done.insert(
+                cache_key(body_id, surface.seed, surface.profile),
+                Arc::clone(baked),
+            );
+        }
+    }
+
     /// The heightfield for `(body_id, seed, profile)` — the real field
     /// once baked, `None` while a native background bake is in flight
     /// (the caller contract: `None` means *draw/sample no displaced
@@ -247,7 +289,7 @@ impl TerrainCache {
         seed: u64,
         profile: ReliefProfile,
     ) -> Option<Arc<rt::HeightField>> {
-        let key: CacheKey = (body_id.to_owned(), seed, profile.key_seed_fold());
+        let key = cache_key(body_id, seed, profile);
         if self.key.as_ref() != Some(&key) {
             // A body visited before swaps back in for free.
             self.field = self.done.get(&key).cloned();
@@ -661,6 +703,20 @@ pub(crate) fn ocean_datum_m(cfg: &TerrainConfig, env: &FlightEnv) -> Option<f64>
     cfg.bodies.get(body_id).and_then(|b| b.ocean_datum_m)
 }
 
+/// Whether `env`'s body still has no heightfield this frame — the
+/// loading screen's terrain half. The body resolves and the cache is
+/// asked exactly as [`build_packet`] does, so a frame that sees `true`
+/// is a frame that draws no displaced surface.
+pub(crate) fn field_pending(
+    cfg: &TerrainConfig,
+    cache: &mut TerrainCache,
+    env: &FlightEnv,
+) -> bool {
+    let body_id = env.body.as_ref().map_or("", |b| b.as_str());
+    let body = body_of(cfg, env);
+    cache.field(body_id, body.seed, body.profile).is_none()
+}
+
 /// The rendered terrain surface radius along an inertial unit `dir`:
 /// `radius_m` plus the baked heightfield's bilinear sample scaled by
 /// the body's amplitude — the surface itself at `dir`. A positive
@@ -683,11 +739,7 @@ pub(crate) fn ground_radius(
     tap_rad: f64,
 ) -> f64 {
     let body_id = env.body.as_ref().map_or("", |b| b.as_str());
-    let body = cfg
-        .bodies
-        .get(body_id)
-        .cloned()
-        .unwrap_or_else(|| TerrainBody::synthesized(body_id, env.radius_m));
+    let body = body_of(cfg, env);
     // While the bake is in flight there is no surface to measure — the
     // datum radius IS the ground, exactly the number the removed zeros
     // stand-in used to sample (its every texel was 0). No displaced
@@ -825,12 +877,15 @@ fn vessel_shadow(
 ///
 /// **Arrival contract (M5 §5.2-R2 arrival polish):** while the real
 /// heightfield for the dominant body is still baking on the background
-/// thread, the packet carries `heightfield: None` and NO terrain or
-/// ocean instances — the renderer draws the sky pass, the craft and
-/// the launch complex over a haze/space backdrop, never a flat datum
-/// sphere standing in for mountains. The shadow blob is disarmed
-/// (`shadow.w = 0`; it has no displaced surface to land on) and the
-/// HUD mirrors the wait ("generating terrain"). The first packet with
+/// thread — only a body the simulation has not baked, since one it
+/// holds is adopted ([`TerrainCache::adopt`]) — the packet carries
+/// `heightfield: None` and NO terrain or ocean instances: the renderer
+/// draws the sky pass, the craft and the launch complex over a
+/// haze/space backdrop, never a flat datum sphere standing in for
+/// mountains. The shadow blob is disarmed
+/// (`shadow.w = 0`; it has no displaced surface to land on), and the
+/// loading screen (`csp_ui::loading_screen`) covers the wait
+/// ([`field_pending`]). The first packet with
 /// a field swaps the full displaced surface in (the field's content
 /// key forces the height-texture re-upload).
 #[allow(clippy::too_many_lines)] // quadtree select + uniform bake is one pass
@@ -844,11 +899,7 @@ pub(crate) fn build_packet(
     time_s: f64,
 ) -> rt::TerrainPacket {
     let body_id = env.body.as_ref().map_or("", |b| b.as_str());
-    let body = cfg
-        .bodies
-        .get(body_id)
-        .cloned()
-        .unwrap_or_else(|| TerrainBody::synthesized(body_id, env.radius_m));
+    let body = body_of(cfg, env);
     let field = cache.field(body_id, body.seed, body.profile);
 
     // The §2.6.4 spin phase — the same `R(axis, ω·t)` `bubble.rs`
@@ -1312,6 +1363,44 @@ mod tests {
         (cfg, env, cam)
     }
 
+    /// The startup path, end to end at the cache: the simulation bakes
+    /// the body's field at construction and the view adopts that
+    /// allocation — the key the packet, the ground samplers and the
+    /// pending poll all resolve is served at its FIRST request, and no
+    /// bake of the view's own is spawned (the pointer identity is the
+    /// proof: a second bake could not return the simulation's `Arc`).
+    /// A surface the simulation has not baked yet adopts nothing: the
+    /// key keeps the cache's own bake, and with it the loading-screen
+    /// wait.
+    #[test]
+    fn adopt_serves_the_simulations_field_without_a_bake() {
+        let (cfg, env, _cam) = arrival_scene();
+        let surface = csp_phys::TerrainSurface::new(601, 3_600.0, ReliefProfile::Mountain);
+        let mut cache = TerrainCache::default();
+        cache.adopt("terrin", &surface);
+        assert!(
+            cache.done.is_empty(),
+            "an unbaked surface adopts nothing — the key keeps the cache's own bake"
+        );
+        surface.prewarm();
+        let mut cache = TerrainCache::default();
+        cache.adopt("terrin", &surface);
+        assert!(
+            !field_pending(&cfg, &mut cache, &env),
+            "the adopted field answers the pending poll at once"
+        );
+        let Some(served) = cache.field("terrin", 601, ReliefProfile::Mountain) else {
+            panic!("the adopted field is served at its first request");
+        };
+        let Some(baked) = surface.baked_field() else {
+            panic!("prewarm bakes the field");
+        };
+        assert!(
+            Arc::ptr_eq(&served, baked),
+            "the cache serves the simulation's own allocation"
+        );
+    }
+
     /// M5 §5.2-R2 arrival contract, first half: the frames immediately
     /// after a body becomes dominant (fresh cache, bake in flight)
     /// must NEVER carry a flat-datum heightfield. The wait presents as
@@ -1320,6 +1409,12 @@ mod tests {
     /// ever carries is the real bake (its authored key, bit 0 clear,
     /// non-zero relief). The zeros stand-in this replaces drew a flat
     /// planet for exactly these first seconds.
+    ///
+    /// The bare `TerrainCache::default()` stands for a body the
+    /// simulation has not baked for: one it holds is adopted before the
+    /// first frame (`adopt_serves_the_simulations_field_without_a_bake`),
+    /// so the wait pinned here is not the startup path — it is the path
+    /// the loading screen exists for.
     #[test]
     fn first_frames_never_draw_the_flat_datum() {
         let (cfg, env, cam) = arrival_scene();

@@ -420,7 +420,7 @@ One codebase; differences are `cfg`-gated:
 | Audio | subprocess backend | absent (module is `cfg(not(wasm))`) |
 | Data set | `data/` via `FsDataSource` (`View::new`) | embedded reduced set via `csp_data::EmbeddedSource` (`View::new_demo`, `csp-view/src/demo.rs`) |
 | Saves/craft IO | `saves/*.cspsave`, `crafts/*.cspcraft` | refused (demo policy gates `UiOutbox` verbs) |
-| GPU init | synchronous (pollster) | deferred browser promises; page hooks `cspGpuReady`/`cspGpuInitFailed` |
+| GPU init | synchronous (pollster) | deferred browser promises; page hooks `cspGpuInitFailed` (at once) and `cspGpuReady` (on the first presented frame — the page's loading screen covers the canvas until then) |
 
 `bevy_ecs` features: `["std"]` baseline, `+ ["multi_threaded", "async_executor"]` on native.
 Rhai is pinned `=1.27.0` with `default-features = false, features = ["no_std"]` — the feature set

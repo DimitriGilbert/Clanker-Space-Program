@@ -356,6 +356,8 @@ pub struct SessionMirror {
 ///   `csp-app`; the pass itself is the [`build_ui`] system.
 /// - `output`: the completed `egui::FullOutput`, consumed by `csp-app`'s
 ///   painter (platform output, tessellation, textures delta).
+/// - `arrival`: the panels' entrance clock — the loading screen's
+///   arrival half (`UiArrival`).
 #[derive(Resource, Default)]
 pub struct EguiPass {
     /// The egui context — lives here so `UiBuild` can run the pass.
@@ -364,6 +366,58 @@ pub struct EguiPass {
     pub input: egui::RawInput,
     /// The completed pass — `Some` after `UiBuild` ran this frame.
     pub output: Option<egui::FullOutput>,
+    /// The panels' entrance on this context.
+    arrival: UiArrival,
+}
+
+/// The panels' entrance — the loading screen's arrival half. egui lays
+/// every `Area` out invisibly on its first pass (the sizing pass) and
+/// fades it in over `Style::animation_time`; a screen lifted before that
+/// uncovers a frame with no HUD, and the HUD then fades in after the
+/// scene. So the panels are built under the screen, and the screen stays
+/// until they have been built for that long. The clock is egui's frame
+/// time (`InputState::time`), and only the steps between passes count:
+/// the first pass on a context is where the entrance starts, never an
+/// age. A fresh context reads 0.0, so a host stamping the time from its
+/// own epoch hands that first pass the whole session so far (New Game
+/// replaces the `View` under the one `egui_winit::State`) or the time
+/// spent before the first frame — an offset, not an elapsed time. The
+/// time is the host's wall clock, presentation only (§2.5) — the
+/// predicted frame time when a headless host feeds no clock. Not sim
+/// state.
+#[derive(Default)]
+struct UiArrival {
+    /// The egui time of the last panel pass — `None` until one was built.
+    at: Option<f64>,
+    /// The egui time the passes after the first have spanned.
+    age: f32,
+}
+
+impl UiArrival {
+    /// A panel pass was built at egui time `time`. The first pass
+    /// starts the clock; each later one ages it by its step from the
+    /// pass before.
+    fn pass_built(&mut self, time: f64) {
+        if let Some(prev) = self.at.replace(time) {
+            self.age += (time - prev) as f32;
+        }
+    }
+
+    /// Whether the panels built so far are past their entrance: a pass
+    /// has been built — the first is every panel's sizing pass, covered
+    /// whatever the style's `animation_time` — and the passes after it
+    /// span `animation_time`.
+    fn settled(&self, animation_time: f32) -> bool {
+        self.at.is_some() && self.age >= animation_time
+    }
+}
+
+impl EguiPass {
+    /// Whether the panels are past their entrance — the loading
+    /// screen's arrival half.
+    fn arrived(&self) -> bool {
+        self.arrival.settled(self.ctx.global_style().animation_time)
+    }
 }
 
 impl Drop for EguiPass {
@@ -577,6 +631,19 @@ fn build_ui(
     } else {
         csp_ui::ModeSelect::Flight
     };
+    // The loading screen covers the frame while anything is still
+    // pending — the flight scene's terrain, a world-replacing session op
+    // the host holds, or the panels' own entrance — and what it lifts
+    // onto is the finished frame: a panel popping in over a half-built
+    // scene is what it replaces. Map and VAB draw no terrain, so the
+    // terrain half is flight-only.
+    let loading_line = if mode == csp_ui::ModeSelect::Flight && flight_ui.terrain_pending {
+        Some(csp_ui::LOADING_TERRAIN)
+    } else if flight_ui.session_loading || !egui.arrived() {
+        Some(csp_ui::LOADING_SESSION)
+    } else {
+        None
+    };
     let input = csp_ui::DebugPanelInput {
         adapter_name: &session.adapter,
         backend: &session.backend,
@@ -606,13 +673,18 @@ fn build_ui(
         prev.textures_delta.clear();
     }
     let files = craft_files.0.clone(); // Vec<String> — cheap, frees the Res borrow
-    egui.output = Some(ctx.run_ui(raw, |ctx| {
+    let output = ctx.run_ui(raw, |ctx| {
         // The VAB's click-through mask: every floating window drawn
         // over the 3D build area pushes its rect here, and the pointer
         // pass runs LAST so the set is complete before any gesture
         // resolves — a press on a UI card must never reach the craft
-        // behind it (C14-F2).
-        let mut ui_masks: Vec<egui::Rect> = Vec::with_capacity(8);
+        // behind it (C14-F2). The loading screen's rect leads it: the
+        // panels are still built under the screen, so their hotkey and
+        // pointer passes still run.
+        let mut ui_masks: Vec<egui::Rect> = Vec::with_capacity(9);
+        if let Some(line) = loading_line {
+            ui_masks.push(csp_ui::loading_screen(ctx, line));
+        }
         ui_masks.push(csp_ui::vab::top_bar(
             ctx,
             mode,
@@ -708,10 +780,6 @@ fn build_ui(
                     t_pe_s: flight_ui.t_pe_s,
                     period_s: flight_ui.period_s,
                     builds: &flight_ui.builds,
-                    // M5 §5.2-R2 arrival polish: the heightfield bake
-                    // wait — the chip shows a one-line "generating
-                    // surface" row while the terrain pass is sky-only.
-                    terrain_pending: flight_ui.terrain_pending,
                     // P1: the app's smoothed frame timing — fps + ms
                     // over its ~10-frame window; 0.0 hides the row.
                     fps: flight_ui.fps,
@@ -883,7 +951,9 @@ fn build_ui(
         if mode == csp_ui::ModeSelect::Vab {
             csp_ui::vab::vab_pointer_input(ctx, &mut vab.0, &ui_masks, palette_rect);
         }
-    }));
+        egui.arrival.pass_built(ctx.input(|i| i.time));
+    });
+    egui.output = Some(output);
     // The top bar's Tutorial button re-opens the checklist — session
     // state, folded back here rather than riding the app outbox.
     if vab_out.tutorial {
@@ -1825,6 +1895,9 @@ fn rebuild_from_snapshot(
         .map(|c| format!("restored world is missing config channel `{c}`"))
         .collect();
     view.sim = sim;
+    // The restored backend prewarmed the same field: hand it to the
+    // cache before the rebuilt world's first frame asks.
+    view.adopt_terrain();
     view.notice_cursor = None;
     // The revert point belongs to the world being replaced — a load
     // must never let F10/Game-menu revert resurrect the previous
@@ -2221,6 +2294,7 @@ impl View {
         let d = load_validated_dataset(src, root)?;
         let sim = build_sim_from_dataset(&d, save_seed)?;
         let mut view = Self::with_sim(sim);
+        view.adopt_terrain();
         // M3 VAB: the part catalog + resource registry are data-derived
         // constants for the session model (like BodyTable — §7.3's
         // re-derived-on-load class). The §3.1 aggregate rides along so
@@ -2247,6 +2321,22 @@ impl View {
         let defs: Vec<csp_data::BodyDef> = d.system.bodies.iter().map(|b| b.def.clone()).collect();
         install_program_resources(&mut view, &d.system.bodies, &defs, &d.loc);
         Ok(view)
+    }
+
+    /// The simulation bakes the dominant body's heightfield when its
+    /// backend is built; the view takes that allocation
+    /// ([`terrain::TerrainCache::adopt`]) instead of baking a second
+    /// identical field on its own thread. Called before the first frame
+    /// reads the cache — after [`Self::with_sim`], and after a snapshot
+    /// restore rebuilt the backend — so the first frame's request for
+    /// the field is answered at once.
+    fn adopt_terrain(&mut self) {
+        let surface = self.sim.environment().and_then(|e| e.terrain.as_ref());
+        if let (Some(body), Some(surface)) = (self.sim.dominant_body(), surface) {
+            self.world
+                .resource_mut::<terrain::TerrainCache>()
+                .adopt(body.as_str(), surface);
+        }
     }
 
     /// The §6.3 web demo — the fixed scenario over the embedded reduced
@@ -2440,6 +2530,7 @@ impl View {
             // against them (the chase camera, the extract).
             flight::flight_interp.before(flight::flight_camera),
             flight::flight_camera,
+            flight::flight_terrain_pending,
             flight::flight_present,
             // M10: the tutorial's progress observer — reads the
             // Sync-written snapshot directly, so it stays independent
@@ -3121,6 +3212,17 @@ impl View {
     pub fn toggle_debug_panel(&mut self) {
         let mut r = self.world.resource_mut::<PanelFlags>();
         r.debug = !r.debug;
+    }
+
+    /// Raise or lower the loading screen's session half
+    /// ([`flight::FlightUiData::session_loading`]) — raised, the frame
+    /// shows the screen over the panels, which keep being built under
+    /// it. The host sets it every frame around a world-replacing
+    /// session op: New Game replaces the whole `View`, mirror included.
+    pub fn set_loading(&mut self, loading: bool) {
+        self.world
+            .resource_mut::<flight::FlightUiData>()
+            .session_loading = loading;
     }
 
     /// Toggle the controls-help card (the `ToggleHelp` binding, the
@@ -6387,6 +6489,9 @@ mod tests {
             events,
             ..Default::default()
         };
+        // The windows are laid out under the loading screen a fresh
+        // view opens on; run it out before their rects are probed.
+        settle_ui(&mut view, input(vec![]));
         // Probe the overlay windows at their anchors — the host-side
         // half of C14-F2: `build_ui` must actually feed every drawn
         // window's rect into the pointer pass (the per-window contract
@@ -8337,4 +8442,58 @@ mod tests {
             "a real removal still cues: {cues:?}"
         );
     }
+
+    /// The entrance clock starts at its first pass and counts only the
+    /// steps after it. A host's time is an offset from the host's own
+    /// epoch: 100 s on the first pass is where the entrance starts, not
+    /// how long it has run. Read as an age (the `unstable_dt` the clock
+    /// used to sum — a fresh context's is the whole offset), it ended the
+    /// entrance on the second pass.
+    #[test]
+    fn ui_arrival_is_timed_from_its_first_pass() {
+        let step = 1.0 / 60.0;
+        let mut time = 100.0;
+        let mut arrival = UiArrival::default();
+        assert!(
+            !arrival.settled(0.0),
+            "no pass built yet: the sizing pass is drawn over, whatever the animation time"
+        );
+        arrival.pass_built(time);
+        assert!(
+            !arrival.settled(0.2),
+            "the first pass starts the clock: 100 s is where the entrance begins, not 100 s of it"
+        );
+        for steps in 1..12 {
+            time += step;
+            arrival.pass_built(time);
+            assert!(
+                !arrival.settled(0.2),
+                "{steps} steps in, the clock reads {} — settled early",
+                arrival.age
+            );
+        }
+        time += step;
+        arrival.pass_built(time);
+        assert_eq!(arrival.age, 0.2, "twelve steps of 1/60 s span 0.2 s");
+        assert!(arrival.settled(0.2), "the entrance is over at 0.2 s");
+    }
+}
+
+/// Test rig: run frames staged with `input` until the loading screen
+/// lifts. A fresh view opens under it and it takes every click, so
+/// input driven on the view's first frames reaches nothing. The panels
+/// are laid out under the screen, so `input` carries the screen rect
+/// the test means to run on, and no `time`: the entrance counts egui's
+/// own, which advances by the predicted frame time while none is fed.
+#[cfg(test)]
+pub(crate) fn settle_ui(view: &mut View, input: egui::RawInput) {
+    for _ in 0..64 {
+        if view.world.resource::<EguiPass>().arrived() {
+            return;
+        }
+        view.set_egui_input(input.clone());
+        view.begin_frame();
+        view.end_frame();
+    }
+    panic!("the loading screen never lifted");
 }

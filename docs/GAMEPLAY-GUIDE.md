@@ -520,6 +520,13 @@ Top-right **Game** strip (drag it anywhere) → **Game** menu (`csp-ui/src/game.
   (`game.rs`, PLAN §3.4's revert policy).
 - **New game**: confirm-gated; abandons the current session (save first).
 
+Load, Revert and New game rebuild the world inside the frame they run in, so each
+shows a **loading screen** (`LOADING …`) for the frames it takes and comes down on the
+finished scene — pad, craft and HUD together, nothing arriving after it. The game opens
+the same way: a loading screen, then the whole scene at once. (The one other time it
+appears is a surface still being generated — `GENERATING SURFACE …` — which a normal
+session never waits on: the terrain is ready before the first frame.)
+
 A fatal sim error shows a read-only crash dialog with the bug-report bundle path
 (`csp_ui::crash_dialog`) — the session cannot be saved or continued from that point.
 

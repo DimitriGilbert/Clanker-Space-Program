@@ -1112,32 +1112,77 @@ to the drawn surface). Since M5 §5.2-R2 the bake is per authored
 R4/native hook.
 
 **Bake scheduling / the arrival contract (M5 §5.2-R2 arrival polish).**
-The bake runs on a background thread (native; C12-F5 — the frame a body
-becomes dominant no longer stalls on it) and `TerrainCache::field`
-serves `None` until the real field lands. There is **no stand-in**: the
-packet for those frames is *sky-only* — `heightfield: None`, zero
-terrain/ocean instances, disarmed vessel blob — so the player sees the
-scattering sky (haze below the horizon on atmospheric bodies), the
-craft and the launch complex, never a flat datum sphere standing in
-for mountains. CPU-side takers of the field (chase-camera floor,
-structure anchors) fall back to the bare datum radius for exactly
-those frames; the first packet with a field swaps the full displaced
-surface in (the field's content key forces the height-texture
-re-upload). The wait frames also DISARM the shadow cascades — both in
-the view (`extract_flight` hands `draw_shadow` the zeroed row while
-pending) and structurally in the renderer (`draw_shadow` disarms any
-armed row handed with an instance-less packet: the cascade passes
-would early-return without clearing the depth array, and receivers
-would sample its never-cleared contents — zeros on a fresh session,
-the previous body's stale map after an SOI switch — through live
-matrices, silently killing the craft's sun term). The flight HUD
-mirrors the wait as a one-line
-"GENERATING SURFACE …" chip row (`FlightHudInput::terrain_pending`,
-written by `extract_flight`). Map view draws no terrain anywhere (its
-packet is lines/markers only) and VAB is scene-less, so the wait state
-is flight-only. wasm has no threads: the bake runs inline at the first
-`field` poll, so the `None` wait state is unreachable there by
-construction (the demo already pays the one-time startup hitch).
+The simulation bakes the dominant body's field when its backend is
+built (`SimpleBackend::new` → `TerrainSurface::prewarm`). The view
+bakes no second one: `View::adopt_terrain` hands that allocation to
+`TerrainCache::adopt` at construction and after a snapshot restore
+(Load, Revert), so startup, New Game, Load and Revert carry the
+displaced surface from their first frame — no sky-only wait, on native
+and on wasm alike. The view's own bake is left to a body the simulation
+has not baked: it runs on a background thread (native; C12-F5 — the
+frame a body becomes dominant no longer stalls on it) and
+`TerrainCache::field` serves `None` until the real field lands. There
+is **no stand-in**: the packet for those frames is *sky-only* —
+`heightfield: None`, zero terrain/ocean instances, disarmed vessel blob
+— so the player is never shown a flat datum sphere standing in for
+mountains. CPU-side takers of the field (chase-camera floor, structure
+anchors) fall back to the bare datum radius for exactly those frames;
+the first packet with a field swaps the full displaced surface in (the
+field's content key forces the height-texture re-upload). The wait
+frames also DISARM the shadow cascades — both in the view
+(`extract_flight` hands `draw_shadow` the zeroed row while pending) and
+structurally in the renderer (`draw_shadow` disarms any armed row
+handed with an instance-less packet: the cascade passes would
+early-return without clearing the depth array, and receivers would
+sample its never-cleared contents — zeros on a fresh session, the
+previous body's stale map after an SOI switch — through live matrices,
+silently killing the craft's sun term). The player never sees those
+frames: the **loading screen** covers them (below). Map view draws no
+terrain anywhere (its packet is lines/markers only) and VAB is
+scene-less, so the terrain wait is flight-only. wasm has no threads:
+the bake runs inline at the first `field` poll, so the `None` wait
+state is unreachable there by construction.
+
+**Loading screen.** `csp_view`'s `build_ui` paints
+`csp_ui::loading_screen` — an opaque backdrop and one centred line, on
+the layer above every panel — on every frame that is not the finished
+game. It is up while:
+
+- the flight scene's terrain is pending (above) — the line reads
+  `GENERATING SURFACE …`. `FlightUiData::terrain_pending` is written in
+  Presentation (`flight_terrain_pending`), ahead of `UiBuild`, so the
+  very first sky-only frame is already covered;
+- the host holds a world-replacing session op (`View::set_loading`) —
+  the line reads `LOADING …`. New Game, Load and Revert stall the frame
+  they run in, so `csp-app` raises the screen one presented frame
+  *before* the op runs and keeps it through the rebuilt world's own
+  first frame;
+- the panels have not finished arriving (`UiArrival`, on `EguiPass`) —
+  same line. egui lays every `Area` out invisibly for one pass and then
+  fades it in over `Style::animation_time`; the panels are built under
+  the screen and the screen stays until that entrance is over, so what
+  it lifts onto is the whole frame at once: surface, ocean, shadows,
+  pad, craft and HUD, with no panel joining afterwards. The entrance is
+  counted in egui's frame time (`InputState::time`) from the first
+  pass built on the context: only the steps between passes count, never
+  the first stamp. `csp-app` creates its `egui_winit::State` once and
+  stamps every frame with the session time, while a fresh context — at
+  startup, and at every New Game, which replaces the `View` — reads
+  0.0, so that first stamp is an offset, not an elapsed time (the
+  whole session after New Game). Summed as an age, it ended the
+  entrance on the second pass and the third showed the HUD, the top
+  bar and the tutorial card still fading in over the scene.
+
+The screen's backdrop is the topmost clickable widget, so a press
+during a wait reaches neither the panels under it nor the scene, and
+its rect leads the VAB's click-through masks. The window itself opens
+hidden (`with_visible(false)`) and is shown on the first presented
+frame, so the clear colour is never what the player sees first. That is
+the whole mechanism on X11. Wayland maps a surface at its first commit
+and winit cannot hide a window there, so the first presented frame —
+the loading screen — is the first visible one by protocol; on wasm the
+page's loading screen stays over the canvas until the first frame has
+been presented (`cspGpuReady` fires there, not at GPU init).
 
 Scattering: `bake_transmittance` (`terrain.rs:577`) CPU-ray-marches the
 Bruneton-style T(altitude, μ) LUT (96 steps) for the §3.0 exponential

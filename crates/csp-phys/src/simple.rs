@@ -486,6 +486,14 @@ impl TerrainSurface {
             .get_or_init(|| Arc::new(HeightField::bake_profiled(self.seed, self.profile)))
     }
 
+    /// The baked field when the simulation already holds it — `None`
+    /// until a sample or [`Self::prewarm`] has baked it. Read-only: the
+    /// presentation adopts this very allocation instead of baking a
+    /// second field from the same `(seed, profile)`.
+    pub fn baked_field(&self) -> Option<&Arc<HeightField>> {
+        self.field.get()
+    }
+
     /// Terrain height above the datum radius at `dir_fixed` — a
     /// BODY-FIXED unit direction (the inertial→fixed conjugate is the
     /// caller's; see [`Environment::surface_radius`]). Same value the

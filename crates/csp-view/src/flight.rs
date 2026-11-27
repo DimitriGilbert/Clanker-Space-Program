@@ -1057,7 +1057,8 @@ impl DrawnScene {
 }
 
 /// HUD mirrors — written by `flight_present`, drawn by
-/// `csp_ui::flight_hud`.
+/// `csp_ui::flight_hud`; the loading screen's two halves ride beside
+/// them.
 #[derive(Resource, Default)]
 pub struct FlightUiData {
     /// P1's FPS readout — the app's smoothed wall-clock frame timing
@@ -1142,12 +1143,19 @@ pub struct FlightUiData {
     /// written from [`FlightSfx`], drawn as event flashes by
     /// `csp_ui::flight_hud`.
     pub sfx: Vec<String>,
-    /// The dominant body's heightfield bake is still in flight — the
-    /// frame's terrain packet is sky-only (no displaced surface drawn,
-    /// M5 §5.2-R2 arrival polish). Written by `extract_flight` (the
-    /// extract is where the cache is polled); the HUD reads it one
-    /// frame later because UiBuild runs before RenderExtract (§2.5).
+    /// The dominant body's heightfield is not in the cache this frame —
+    /// the frame's terrain packet is sky-only (no displaced surface
+    /// drawn, M5 §5.2-R2 arrival polish) and the loading screen covers
+    /// the frame. A body the simulation holds is adopted before the
+    /// first frame (`terrain::TerrainCache::adopt`), so `true` means a
+    /// bake of the view's own is in flight.
     pub terrain_pending: bool,
+    /// The loading screen's session half (§2.2-C session data): set
+    /// while the host holds a world-replacing session op
+    /// (`View::set_loading`). With this or [`Self::terrain_pending`]
+    /// set, `build_ui` covers the frame with the screen — the panels
+    /// are still built under it.
+    pub session_loading: bool,
     /// Osculating apoapsis altitude (m) — `None` open/latched/no vessel.
     pub apo_alt_m: Option<f64>,
     /// Osculating periapsis altitude (m).
@@ -4702,6 +4710,24 @@ pub(crate) fn flight_camera(inputs: ChaseInputs, mut cam: ResMut<FlightCameraF64
     );
 }
 
+/// `Presentation` — whether the dominant body's heightfield is still
+/// to land this frame ([`FlightUiData::terrain_pending`]). Polled here,
+/// not in the extract: UiBuild runs before RenderExtract (§2.5), and
+/// the loading screen must cover the FIRST sky-only frame, not the one
+/// after it.
+pub(crate) fn flight_terrain_pending(
+    terrain_cfg: Res<TerrainConfig>,
+    mut terrain_cache: ResMut<TerrainCache>,
+    snap: Res<FlightSnapshot>,
+    scene: Res<DrawnScene>,
+    mut ui: ResMut<FlightUiData>,
+) {
+    ui.terrain_pending =
+        scene.env.as_ref().or(snap.env.as_ref()).is_some_and(|env| {
+            crate::terrain::field_pending(&terrain_cfg, &mut terrain_cache, env)
+        });
+}
+
 /// `Presentation` schedule — the HUD mirrors + the §3.7 SFX cue edges
 /// (the schedule's "VFX, audio cues" slot). The chase camera is
 /// [`flight_camera`]'s.
@@ -6178,7 +6204,6 @@ pub(crate) fn extract_flight(
     cam: Res<FlightCameraF64>,
     terrain_cfg: Res<TerrainConfig>,
     mut terrain_cache: ResMut<TerrainCache>,
-    mut flight_ui: ResMut<FlightUiData>,
     sites: Res<crate::structures::SiteTable>,
     clock: Res<crate::Clock>,
     mut geom: ResMut<FlightGeomCache>,
@@ -6216,8 +6241,7 @@ pub(crate) fn extract_flight(
     //
     // While the body's heightfield bakes on the background thread the
     // packet comes back sky-only (M5 §5.2-R2 arrival polish) — the
-    // HUD mirrors that wait below.
-    let mut terrain_pending = false;
+    // loading screen covers those frames (`flight_terrain_pending`).
     if map_input.mode == MapMode::Flight
         && cam.0.valid
         && let Some(env) = env
@@ -6231,7 +6255,7 @@ pub(crate) fn extract_flight(
             input.viewport_px,
             time_s,
         );
-        terrain_pending = tp.heightfield.is_none();
+        let terrain_pending = tp.heightfield.is_none();
         packet.terrain = Some(tp);
         // R1/3b: solve the cascade uniforms beside the packet they
         // shadow — the app feeds this row to `draw_shadow` before the
@@ -6255,7 +6279,6 @@ pub(crate) fn extract_flight(
             cascade_uniforms(&cam.0, focus_com, env, input.viewport_px)
         };
     }
-    flight_ui.terrain_pending = terrain_pending;
     let v = &mut packet.vertices;
     if packet.terrain.is_none() {
         // Sky fallback: a far-depth fullscreen space backdrop (two
@@ -6585,8 +6608,6 @@ mod tests {
         world.insert_resource(TerrainCache::default());
         // The extract resolves the focus for the blob shadow.
         world.insert_resource(FlightFocusOverride::default());
-        // The HUD mirror the extract writes the terrain-bake wait to.
-        world.insert_resource(FlightUiData::default());
         world.insert_resource(crate::structures::SiteTable::default());
         world.insert_resource(crate::Clock::default());
         world.insert_resource(FlightFrame::default());
@@ -12086,9 +12107,24 @@ mod tests {
             view.end_frame();
         }
         wait_for_real_heightfield(&mut view);
-        for _ in 0..150 {
+        // The framing eases to a rest: pump until the eye holds still.
+        // The view used to bake its own field here, and those idle
+        // frames finished the settling; it now draws the simulation's
+        // field from the first frame, so the rest is this loop's job.
+        let mut still = 0;
+        for _ in 0..12_000 {
+            let before = solved(&view).0;
             session_frame(&mut view);
+            still = if solved(&view).0 == before {
+                still + 1
+            } else {
+                0
+            };
+            if still == 8 {
+                break;
+            }
         }
+        assert_eq!(still, 8, "the framing never came to rest");
         let focus = view.flight_focus().expect("the starter craft is focused");
         (view, focus.0)
     }
