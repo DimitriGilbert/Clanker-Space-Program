@@ -187,6 +187,14 @@ fn flight_initial(dir: &Path) -> Result<World, ReplayError> {
     world.set_docking_config(csp_sim::DockingConfig::from_balance(&balance))?;
     // §3.5's transfer tunables — same wiring (M6-D).
     world.set_transfer_config(csp_sim::TransferConfig::from_balance(&balance));
+    // §3.1 rule A: how a deployed canopy steadies the craft that hangs
+    // from it — same wiring, on the backend's own channel. The frozen
+    // fixture's file predates the two fields and loads the shipped
+    // values; a replay rebuilt from the artifact runs the build's.
+    world.set_canopy_steering(csp_phys::CanopySteering {
+        steady_arm_m: balance.canopy_steady_arm_m,
+        steady_damp_m_s: balance.canopy_steady_damp_m_s,
+    });
     // M9a §2.10: the script host + ascent autopilot and the per-save
     // op budget — same wiring `csp-view` startup does, so a recorded
     // run that loads scripts replays them.

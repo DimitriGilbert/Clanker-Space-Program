@@ -182,10 +182,9 @@ impl PartNode {
     }
 
     /// The attachment's body-frame attach point — the `p_J` the §2.4
-    /// joint-load torque arm measures about and the decelerator reef's
-    /// lever starts from: the recorded [`Self::joint`] carried into the
-    /// parent's pose, the node's own origin when it is unrecorded (the
-    /// pre-field approximation the field doc names). `id` is this
+    /// joint-load torque arm measures about: the recorded [`Self::joint`]
+    /// carried into the parent's pose, the node's own origin when it is
+    /// unrecorded (the pre-field approximation the field doc names). `id` is this
     /// node's key in `transforms`; the root has no attachment and
     /// answers its origin.
     pub fn attach_point(

@@ -82,16 +82,25 @@
 //!
 //! # Decelerator pull path
 //!
-//! A `Parachute` site's drag is one more `F_ext` — applied at the site,
-//! off the stack's axis for a side-mounted canister — and it reaches
-//! every joint of the craft, not only the chute's own mount: the joints
-//! above the chute transmit it outright (`Σ F_ext` of their subtree),
-//! and the rest carry the turn it induces (`I_J·α`).
+//! A `Parachute` site acts on the craft in two terms, and they do not
+//! reach its joints alike ([`PartForce::canopy`]). The **packed**
+//! canister's drag is one more `F_ext`, applied at the canister — off
+//! the stack's axis for a side-mounted mount — and it reaches every
+//! joint of the craft, not only the chute's own mount: the joints above
+//! the canister transmit it outright (`Σ F_ext` of their subtree), and
+//! the rest carry the turn it induces (`I_J·α`).
 //! [`JointModel::pull_budgets`] reads the model above as a bound on it —
-//! every joint's load is the rest of the tick plus `F` times the pull's
+//! every joint's load is the rest of the tick plus `F` times the drag's
 //! own share, so `F` is what the tightest channel has room for. With
-//! several sites pulling, the shares add, vector by vector: one scale
+//! several sites dragging, the shares add, vector by vector: one scale
 //! over their own budgets keeps every channel inside its derate.
+//!
+//! The **canopy's** pull levers nothing (§3.1 rule A): every joint but
+//! the chute's own mount reads it where the step applied it — on the
+//! craft's axis — with the couple that steadies the hang beside it. The
+//! mount reads none of it: its reef bounds the canopy, and its load is
+//! everything else — the canister's own drag, which a reefed pull added
+//! to it would push past its rating on a radial mount.
 //!
 //! # Fragmentation (§2.4)
 //!
@@ -138,6 +147,14 @@ pub struct PartForce {
     /// yields to the spread stop's forces; every other channel is read
     /// as recorded.
     pub ground: bool,
+    /// A deployed canopy's pull on the craft (§3.1 rule A), applied at
+    /// `at` — a point on the craft's axis — with the `torque` that
+    /// steadies the hang ([`crate::CanopySteering`]) beside it. Every
+    /// joint but the chute's own mount reads it there; the mount reads
+    /// none of it: the reef bounds its canopy, and its load is
+    /// everything else. `false` for every other force, which every joint
+    /// reads at `at`.
+    pub canopy: bool,
 }
 
 /// The no-data touchdown crush distance, metres — half a metre of
@@ -268,6 +285,11 @@ struct Agg {
     inertia_origin: SymMat3,
     force: DVec3,
     moment: DVec3,
+    /// This node's own canopy action, for every joint but its own:
+    /// the pull's force, and its moment about the origin with the
+    /// steadying couple. The mount's own joint reads neither.
+    canopy_force: DVec3,
+    canopy_moment: DVec3,
 }
 
 /// Evaluate every non-root attachment's load — see the module doc
@@ -398,7 +420,9 @@ fn joint_load_vecs(
 /// `order`, then the bottom-up sums over its reverse — children before
 /// parents, so a parent reads its subtree whole when its turn comes.
 /// `order` is [`preorder`]'s output; `ext` the per-node external
-/// forces, the touchdown absorption already applied to them; `com` the
+/// forces, the touchdown absorption already applied to them — a
+/// [`PartForce::canopy`] entry left out of its own node's joint and
+/// handed on to its parent; `com` the
 /// body's CoM, body frame — the point every [`Touchdown`] force acts
 /// through, so its moment about the origin is `com × f` and about a
 /// joint `(com − p_J) × f`: the same arm the inertia term beside it
@@ -425,12 +449,19 @@ fn subtree_aggs(
             inertia_origin: ep.inertia.rotate(t.rotation).shift(ep.mass_kg, c_i),
             force: DVec3::ZERO,
             moment: DVec3::ZERO,
+            canopy_force: DVec3::ZERO,
+            canopy_moment: DVec3::ZERO,
         };
         if let Some(forces) = ext.get(id) {
             for f in forces {
                 // Under absorption the solved ground impulses yield to
                 // the spread stop's forces.
                 if f.ground && touchdown.is_some() {
+                    continue;
+                }
+                if f.canopy {
+                    agg.canopy_force = agg.canopy_force + f.force;
+                    agg.canopy_moment = agg.canopy_moment + f.at.cross(f.force) + f.torque;
                     continue;
                 }
                 agg.force = agg.force + f.force;
@@ -454,8 +485,10 @@ fn subtree_aggs(
         p.mass += a.mass;
         p.com_m = p.com_m + a.com_m;
         p.inertia_origin = p.inertia_origin + a.inertia_origin;
-        p.force = p.force + a.force;
-        p.moment = p.moment + a.moment;
+        // A child's canopy is the craft's to read: its mount was the one
+        // joint to leave it out.
+        p.force = p.force + a.force + a.canopy_force;
+        p.moment = p.moment + a.moment + a.canopy_moment;
     }
     Ok(aggs)
 }
@@ -473,7 +506,7 @@ fn node_aabbs(body: &WeldedBody) -> BTreeMap<PartNodeId, (DVec3, DVec3)> {
 /// The graph's depth-first preorder from the root — a node's
 /// descendants follow it, so the reversed order is
 /// children-before-parent (bottom-up): the traversal [`joint_loads`]
-/// evaluates in and [`pull_path`] sums subtrees in.
+/// and [`JointModel::pull_readings`] both sum subtrees in.
 fn preorder(graph: &PartGraph) -> Vec<PartNodeId> {
     let mut children: BTreeMap<PartNodeId, Vec<PartNodeId>> = BTreeMap::new();
     for (id, node) in &graph.nodes {
@@ -493,7 +526,8 @@ fn preorder(graph: &PartGraph) -> Vec<PartNodeId> {
 }
 
 /// The attach axis of a joint — the convention [`joint_loads`] splits
-/// its load on and [`pull_path`] hands the reef: the dominant axis of
+/// its load on and [`JointModel::pull_budgets`] hands the budget: the
+/// dominant axis of
 /// the AABB-centre separation between the child and its parent, signed
 /// toward the child (the thermal net's convention). `child`/`parent`
 /// are the two nodes' hull bounds ([`node_aabbs`]); `joint_to_com` the
@@ -537,15 +571,19 @@ fn attach_axis(
     }
 }
 
-/// The decelerator site the pull-path reef reads a budget for: the
-/// node that carries it, where in the body its drag applies, and which
-/// way that drag pushes.
+/// One term of a decelerator site's drag, as the budgets read it: the
+/// node that carries it, where in the body it acts, and which way that
+/// drag pushes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PullSite {
     /// The node carrying the decelerator — its own mount is the one
-    /// joint the reef leaves out.
+    /// joint the budget leaves out.
     pub node: PartNodeId,
-    /// Application point of the drag, body frame.
+    /// Where the term acts, body frame: the canister for its own packed
+    /// drag; for its canopy's pull, the point on the craft's axis it is
+    /// taken at, carried up the axis by the arm its steadying restores
+    /// with — the same turn as the pull's own pendulum, and read as one
+    /// with it.
     pub pos: DVec3,
     /// Unit direction the drag pushes, body frame.
     pub drag: DVec3,
@@ -555,7 +593,7 @@ pub struct PullSite {
 /// effective parts and its body-frame skeleton — the four inputs every
 /// evaluation in this module reads. [`joint_loads`] and
 /// [`failed_joints`] take them one by one; this is the same bundle,
-/// held, for the reef that reads it three times over.
+/// held, for the budget that reads it three times over.
 #[derive(Clone, Copy)]
 pub struct JointModel<'a> {
     body: &'a WeldedBody,
@@ -581,53 +619,56 @@ impl<'a> JointModel<'a> {
         }
     }
 
-    /// The decelerator reef's **pull path** (C14-F1's companion): for
-    /// every site of `sites`, in its order, the greatest drag (N) it may
-    /// apply this tick, along its `drag`, without loading any joint of
-    /// the craft past `margin` times its authored limits — with every
-    /// site pulling at once. A site's drag reaches every joint,
-    /// whichever way the graph is rooted: the joints from the chute up
-    /// to the root have the site in their subtrees and transmit its pull
-    /// outright, and every other joint has to bring its own part of the
-    /// mass along under it — an off-axis pull turns the whole craft, and
-    /// the Stock Hopper's pod-to-canister joint is one it broke. Each
-    /// chute's own mount is left to its canopy's reef
-    /// ([`crate::weld::DecelSite`]'s `reef_n` and co): a joint is read
-    /// under every pull but the sites mounted on it.
+    /// The decelerator **budgets** (C14-F1's companion): for every term
+    /// of `terms`, in its order, the greatest drag (N) it may apply this
+    /// tick, along its `drag` and with its couple, without loading any
+    /// joint of the craft past `margin` times its authored limits — with
+    /// every term dragging at once. A canister's own drag acts where the
+    /// canister is and its canopy's pull on the craft's axis; either
+    /// reaches every joint, whichever way the graph is rooted: the joints
+    /// from the chute up to the root have it in their subtrees and
+    /// transmit it outright, and every other joint has to bring its own
+    /// part of the mass along under the turn it gives the craft — the
+    /// Stock Hopper's pod-to-canister joint is one an off-axis canister
+    /// broke. Each chute's own mount is left out: its canopy is its
+    /// reef's to hold ([`crate::weld::DecelSite`]'s `reef_n`), and its
+    /// canister's drag it takes as it comes.
     ///
     /// The answer is the joint-load model read as a bound, with nothing
     /// but its own readings: `loads` — the rest of the tick's external
-    /// forces (aero, thrust, gravity) as the §2.4 evaluation reads them
-    /// — under the rigid response the weld gives `response`, the forces
-    /// the step integrates (`ΣF/m`, `I⁻¹(Στ − ω×Iω)`); then, per site,
-    /// the same with a unit pull and with its negative, whose difference
-    /// is the pull's own share per newton and cancels every term the
-    /// pull does not cause. A drag of `F` loads a joint with exactly the
-    /// rest plus `F` times that share, so each channel leaves `F` the
-    /// room between the rest and its derated limit ([`pull_room`]); the
-    /// least over every joint and channel is what the site may pull
-    /// alone. `loads` and `response` are one map when the evaluation
-    /// reads the forces where they act.
+    /// forces (aero, thrust, gravity) as the §2.4 evaluation reads them —
+    /// under the rigid response the weld gives `response`, the forces the
+    /// step integrates (`ΣF/m`, `I⁻¹(Στ − ω×Iω)`); then, per term, the
+    /// same with a unit drag and with its negative, whose difference is
+    /// the drag's own share per newton and cancels every term the drag
+    /// does not cause. A drag of `F` loads a joint with exactly the rest
+    /// plus `F` times that share, so each channel leaves `F` the room
+    /// between the rest and its derated limit ([`pull_room`]); the least
+    /// over every joint and channel is what the term may drag alone.
+    /// `loads` and `response` are one map when the evaluation reads the
+    /// forces where they act. What the model does not read is a canopy's
+    /// damping: credited against the restoring share it gives, it lets a
+    /// canopy push every swing toward upright and withdraw on the way
+    /// back — a pump, and the Stock Hopper came in from a 20 km apogee
+    /// spinning at 8 rad/s. The world's read-back of a flown copy sees
+    /// the couple as it falls.
     ///
-    /// One site, that is its budget. Several pull together, and what
-    /// each may pull alone is not what they may pull together: two
-    /// off-axis canopies, each at its own budget, load the one joint
-    /// both turn with the sum of both (two Stock Hopper side chutes met
-    /// the battery joint's torque rating 3.5 s after their catch). So
-    /// every site's budget is its own times the one scale that leaves
-    /// every channel inside its derate with all of them pulling it: the
-    /// pulls' shares add, vector by vector, each times its budget. The
-    /// scale never exceeds 1 — beside another chute a site pulls no more
-    /// than alone: two canopies whose turns cancel are level only while
-    /// the stack stands exactly between them, and the derate's working
-    /// point was measured for one.
+    /// One term, that is its budget. Several drag together, and what
+    /// each may drag alone is not what they may drag together: two
+    /// off-axis canisters, each at its own budget, load the one joint
+    /// both turn with the sum of both. So every term's budget is its own
+    /// times the one scale that leaves every channel inside its derate
+    /// with all of them dragging it: the shares add, vector by vector,
+    /// each times its budget. The scale never exceeds 1 — beside another
+    /// term a site drags no more than alone: two canisters whose turns
+    /// cancel are level only while the stack stands exactly between them,
+    /// and the derate's working point was measured for one.
     ///
-    /// `0` when the rest alone already overloads a channel the pull
-    /// loads; `f64::INFINITY` for a site nothing beside its mount feels
-    /// the pull of (a pod-alone chute) — then the mount's reef alone
-    /// caps the site.
+    /// `0` when the rest alone already overloads a channel the drag
+    /// loads; `f64::INFINITY` for a term nothing beside its mount feels
+    /// (a pod-alone chute) — then nothing caps it.
     ///
-    /// Errors `InternalInvariant` rather than panicking when a site's
+    /// Errors `InternalInvariant` rather than panicking when a term's
     /// node is not a node of the graph or a node's `effective_index`
     /// falls outside the parts — contract violations like the other
     /// typed paths here.
@@ -762,6 +803,7 @@ impl<'a> JointModel<'a> {
                         force: f,
                         torque: DVec3::ZERO,
                         ground: false,
+                        canopy: false,
                     }],
                 )])
             };
@@ -783,7 +825,8 @@ impl<'a> JointModel<'a> {
     }
 }
 
-/// One pull's own share per newton at a joint: its `(force, torque)`.
+/// One packed drag's own share per newton at a joint: its
+/// `(force, torque)`.
 type PullShare = (DVec3, DVec3);
 
 /// [`JointModel::pull_budgets`]' readings: every joint's rest under the
@@ -1244,6 +1287,7 @@ mod tests {
                 force: DVec3::new(0.0, 0.0, body.mass_kg * dv / dt),
                 torque: DVec3::ZERO,
                 ground: true,
+                canopy: false,
             }],
         )]);
         let mut accel = DVec3::new(0.0, 0.0, dv / dt);
@@ -1257,6 +1301,7 @@ mod tests {
                     force: DVec3::new(0.0, 0.0, -9.81 * parts[i].mass_kg),
                     torque: DVec3::ZERO,
                     ground: false,
+                    canopy: false,
                 });
             }
             accel.z -= 9.81;
@@ -1396,6 +1441,7 @@ mod tests {
                     force: impulse / dt,
                     torque: DVec3::ZERO,
                     ground: true,
+                    canopy: false,
                 }],
             )]);
             let touchdown = absorbed
@@ -1506,6 +1552,7 @@ mod tests {
                     force: impulse / dt,
                     torque: DVec3::ZERO,
                     ground: true,
+                    canopy: false,
                 }],
             )]);
             let mut accel = impulse / body.mass_kg / dt;
@@ -1516,6 +1563,7 @@ mod tests {
                         force: DVec3::Z * (-9.81 * parts[i].mass_kg),
                         torque: DVec3::ZERO,
                         ground: false,
+                        canopy: false,
                     });
                 }
                 accel.z -= 9.81;
@@ -1559,8 +1607,8 @@ mod tests {
         }
     }
 
-    /// M4c pull-path reef, the arithmetic: how far a pull may go before
-    /// its channel's rest load is at its derated limit again.
+    /// The decelerator budgets, the arithmetic: how far a drag may go
+    /// before its channel's rest load is at its derated limit again.
     #[test]
     fn pull_room_stops_where_the_channel_meets_its_limit() {
         let v = |x: f64, y: f64, z: f64| DVec3::new(x, y, z);
@@ -1593,8 +1641,8 @@ mod tests {
         );
     }
 
-    /// M4c pull-path reef: the budget is the joint-load model read as a
-    /// bound, over every joint but the site's own. A 3-part stack along
+    /// The decelerator budgets: the budget is the joint-load model read
+    /// as a bound, over every joint but the site's own. A 3-part stack along
     /// +z — engine root, adapter, pod — with the decelerator site on the
     /// pod, pulled along the stack so nothing turns: the adapter's joint
     /// transmits the pull outright, less its own subtree's share of the
@@ -1628,6 +1676,7 @@ mod tests {
                     force,
                     torque: DVec3::ZERO,
                     ground: false,
+                    canopy: false,
                 }],
             )])
         };
@@ -1668,7 +1717,7 @@ mod tests {
         assert!((budget(&thrust, &thrust, DVec3::Z) - 1_920.0).abs() < 1e-9);
         // The model itself, at the budget: the adapter's channel sits
         // exactly on its derate, and the site's own mount is far past
-        // its 1 N — not the pull path's to bound.
+        // its 1 N — not the budgets' to bound.
         let mut all = thrust.clone();
         all.insert(
             pod,
@@ -1677,6 +1726,7 @@ mod tests {
                 force: DVec3::Z * -960.0,
                 torque: DVec3::ZERO,
                 ground: false,
+                canopy: false,
             }],
         );
         let loads = joint_loads(
@@ -1717,9 +1767,9 @@ mod tests {
         );
     }
 
-    /// M4c pull-path reef with several chutes: one site's budget is what
-    /// it may pull ALONE, and sites pulling together share one scale
-    /// over their own budgets. On the `stack()` craft, sites on the pod:
+    /// The decelerator budgets with several terms: one term's budget is
+    /// what it may drag ALONE, and terms dragging together share one
+    /// scale over their own budgets. On the `stack()` craft, sites on the pod:
     ///
     /// - two pulls along the stack load the adapter's axial channel with
     ///   the sum of both — 1.25 N per newton against 0.625 for one — so
@@ -1764,6 +1814,7 @@ mod tests {
                     force: *drag * *n,
                     torque: DVec3::ZERO,
                     ground: false,
+                    canopy: false,
                 });
                 force = force + *drag * *n;
                 torque = torque + (*pos - body.com_local).cross(*drag * *n);
@@ -1835,5 +1886,64 @@ mod tests {
             );
         }
         assert!(loads_at(&[(port, both[0]), (starboard, both[1])]).1 < 1e-9);
+    }
+
+    /// §3.1 rule A, the evaluation's side: a canopy's pull reaches every
+    /// joint on the craft's axis and its own mount not at all. The
+    /// `stack()` with a canister on the pod's side, its canopy pulling
+    /// 1 kN up on the axis through the root's centre with a 10 N·m
+    /// couple: the two joints below carry the couple alone, 10 N·m
+    /// each, and the mount nothing of the pull. Read at the canister,
+    /// as every force but a canopy's is, the same two entries would
+    /// lever the mount with 240 N·m and those joints with 640 N·m.
+    #[test]
+    fn a_canopys_pull_reaches_every_joint_but_its_own_mount_on_the_axis() {
+        let (mut graph, mut parts) = stack();
+        let pod = PartNodeId(3);
+        let chute = PartNodeId(4);
+        graph.insert(
+            chute,
+            PartNode::new(
+                Some(pod),
+                PartTransform::new(DVec3::new(0.65, 0.0, 2.0), DQuat::IDENTITY),
+                3,
+            )
+            .with_joint(Some(DVec3::new(0.4, 0.0, 0.0))),
+        );
+        parts.push(part(55.0, 0.25));
+        let body = crate::weld(&graph, &parts).unwrap();
+        let transforms = crate::weld::body_transforms(&graph, &parts).unwrap();
+        let (pull, couple) = (DVec3::Z * 1_000.0, DVec3::Y * 10.0);
+        let read = |canopy: bool, at: DVec3| {
+            let ext = BTreeMap::from([(
+                chute,
+                vec![PartForce {
+                    at,
+                    force: pull,
+                    torque: couple,
+                    ground: false,
+                    canopy,
+                }],
+            )]);
+            let loads = joint_loads(
+                &body,
+                &graph,
+                &parts,
+                &ext,
+                &transforms,
+                TickMotion {
+                    accel_body: DVec3::ZERO,
+                    alpha_body: DVec3::ZERO,
+                    touchdown: None,
+                },
+            )
+            .unwrap();
+            [loads[0].torque_nm, loads[1].torque_nm, loads[2].torque_nm]
+        };
+        assert_eq!(read(true, DVec3::Z * 2.0), [10.0, 10.0, 0.0]);
+        assert_eq!(
+            read(false, DVec3::new(0.65, 0.0, 2.0)),
+            [640.0, 640.0, 240.0]
+        );
     }
 }

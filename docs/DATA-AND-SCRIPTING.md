@@ -227,7 +227,7 @@ still costs its own science. `data/techtree/home.ron` ships 4 nodes (`tech.start
 
 #### balance.ron — `BalanceDef` (`balance.rs`, v17)
 
-55 named tunables, each a mirror of a sim-side default: bubble radius 20 km,
+57 named tunables, each a mirror of a sim-side default: bubble radius 20 km,
 `advance_to_max_events_per_frame` 2000, object caps, docking capture thresholds,
 transfer radius/rate, science soft-cap `k` and `lab_science_per_data`,
 `transmit_ec_per_data_unit`, `starting_funds_micros`, salary cadence, hire cost,
@@ -240,12 +240,26 @@ coefficient on every part in water, over the submerged share of its projected ar
 M4c landing adds (v17) **`touchdown_crush_m` (0.5)** — the crush distance the §2.4
 joint-load evaluation spreads a touchdown's ground stop over: an inline joint carries
 `m·Δv²/(2·s)` instead of the solver's one-tick `m·Δv/dt` (mirror:
-`csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M`; `SIMULATION.md` §5, "Structural breakup"). All
+`csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M`; `SIMULATION.md` §5, "Structural breakup"). The
 three are strictly positive in the validator (zero or negative reports `PartNonPositive`,
 NaN `PartNonFinite`), and `touchdown_crush_m` is capped at 5 m (above it `BadBalance`: a
 longer crush would spread any impact short of 640 m/s); all must be mirrored in every
 `balance.ron` — `data/`, the `flight-launch` fixture and `apps/demo/data/` — along with the
 schema pin in `xtask/src/lint_deps.rs`. ALL tuning lives here (PLAN §8.3).
+
+§3.1 rule A's **canopy steering** rides the same v17: **`canopy_steady_arm_m` (1.0)** and
+**`canopy_steady_damp_m_s` (0.15)** — how a deployed canopy steadies the craft hanging from
+it, as a couple proportional to its own pull: the arm (m) turns the craft's axis onto the
+airflow, the damping (m·s) opposes its spin (`csp_phys::CanopySteering`;
+`SIMULATION.md` §5, "Canopy steering"). Mirrors: `csp_phys::DEFAULT_CANOPY_STEADY_ARM_M`,
+`DEFAULT_CANOPY_STEADY_DAMP_M_S`. Both are finite and non-negative in the validator —
+zero is legal, it authors a share off — and neither has a ceiling to gate, since `csp-phys`
+cuts the couple to what the craft's inertia can follow in a tick. They are the one block a
+`balance.ron` may omit: additive under the same `schema_version` with serde defaults
+(`csp_data::balance::DEFAULT_CANOPY_STEADY_*`, pinned to the `csp-phys` mirrors by a
+`csp-bench` test), because the frozen `flight-launch` fixture is pinned byte for byte by
+its golden and predates them — a file that carries neither field loads the shipped values,
+and a world restored from a §7.6 artifact runs the build's.
 
 ### 1.4 Loading pipeline — loaders → validator → game wiring
 

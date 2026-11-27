@@ -18,9 +18,8 @@
 // harder than the stack's inline joints survive. Reefed to 54 kN the
 // canopy needs ~6 km to bring a dry Hopper down from 600 m/s (1.5 km
 // from 250 m/s), so the gates let it catch at 16 km: a 70 km return
-// passes it at 886 m/s, the catch loads the mount to 43% of its axial
-// rating, and the 7 m/s touchdown leaves every inline joint under a
-// fifth of its limit (worst: the battery joint's axial at 18%).
+// passes it at 886 m/s, and the catch and the 7 m/s touchdown each
+// leave every joint of the stack under a fifth of its limit.
 //
 // The REAL survival envelope: deploy-early is safe — the canopy
 // waits out the ceilings packed — and any catch with ~6 km beneath
@@ -31,16 +30,16 @@
 // ever passes. Note for stack design: at orbital entry speeds the
 // editor-default top-mounted science.canister + battery.z1k strip
 // at ~15–25 km under aero load REGARDLESS of the chute — plan
-// recovery legs accordingly (accepted behavior, M4c loads). Mount
-// it on the stack's TOP node to land. A radial mount holds only in
-// gentle flow: on a lone pod nothing caps the canister's own packed
-// drag and aero load across its 0.25 m lever — it holds to 270 m/s
-// at 1.5 km and tears off at 280, and at 4 km it holds at 300 m/s
-// (92.1% of the mount's rating) and tears off at 350 — past the
-// mount's 8 kN·m. On a stack the pull-path reef caps the canister's
-// whole drag at what the joints below take (9 kN on the Stock Hopper
-// at 250 m/s, its own packed drag 12 kN) — so it holds, and reefed
-// that low it cannot land the stack (149 m/s).
+// recovery legs accordingly (accepted behavior, M4c loads).
+// Mount it anywhere — a chute on any mount lands the craft (§3.1
+// rule A): the canopy's pull is taken on the craft's axis, never at
+// the mount, so a radial canister slows and rights the Stock Hopper
+// exactly as the top one does (6.96 m/s from 1.5 km at 250 m/s, and
+// from a 70 km apogee), and two or three chutes land it faster. What
+// the mount still limits is the canister: on a stack its own packed
+// drag is held to what the joints below take (9 kN on the Stock
+// Hopper at 250 m/s, its own drag 12 kN), and on a lone pod nothing
+// caps it — it holds to 420 m/s at 1.5 km and tears off by 440.
 // Its authored dominant failure mode is §3.4's `PanelJam` —
 // the deploy hardware is the part.
 // Category Utility: a decelerator is a browser bucket, not a

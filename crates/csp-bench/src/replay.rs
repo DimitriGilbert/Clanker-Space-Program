@@ -1856,6 +1856,26 @@ mod tests {
         // for_body`'s no-data stamp is what data-less worlds land
         // under, so it must agree with the authored file.
         assert_eq!(b.touchdown_crush_m, csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M);
+        // §3.1 rule A: the canopy steering — `SimpleBackend`'s no-data
+        // stamp is what data-less worlds and every world restored from a
+        // §7.6 artifact hang under, so it must agree with the authored
+        // file; and the loader's own fallback, what a v17 file without
+        // the two fields loads, with both.
+        assert_eq!(
+            csp_phys::CanopySteering::DEFAULT,
+            csp_phys::CanopySteering {
+                steady_arm_m: b.canopy_steady_arm_m,
+                steady_damp_m_s: b.canopy_steady_damp_m_s,
+            }
+        );
+        assert_eq!(
+            csp_data::balance::DEFAULT_CANOPY_STEADY_ARM_M,
+            csp_phys::DEFAULT_CANOPY_STEADY_ARM_M
+        );
+        assert_eq!(
+            csp_data::balance::DEFAULT_CANOPY_STEADY_DAMP_M_S,
+            csp_phys::DEFAULT_CANOPY_STEADY_DAMP_M_S
+        );
         // And the literal `DEFAULT_*` mirrors the file names.
         assert_eq!(b.dock_capture_range_m, csp_sim::DEFAULT_CAPTURE_RANGE_M);
         assert_eq!(

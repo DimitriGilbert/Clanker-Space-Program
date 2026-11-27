@@ -434,7 +434,7 @@ test with the plan's defined denominators) and the parent's aero tables.
 - **Torque arm** (`PartNode::attach_point`): the reaction's torque is measured about
   the edge's recorded attach point — the snapped `AttachNode` position carried into the
   parent's pose (`CraftSession::to_part_graph` stamps it; a hand-built graph falls back
-  to the node origin). The decelerator reef reads the same point.
+  to the node origin).
 - **Touchdown absorption** (M4c landing; `csp_phys::Touchdown`, `balance.ron`'s
   `touchdown_crush_m`): the solver stops a landing inside one tick, so a touchdown's
   measured `Δv/dt` is the whole impact speed over 1/64 s. The evaluation reads the stop
@@ -455,49 +455,79 @@ test with the plan's defined denominators) and the parent's aero tables.
   with five to six times the Stock Hopper battery joint's real torque: 114% of its rating
   at a 7 m/s touchdown on a 1.5° slope, three nodes gone on the tick. Through the CoM that
   touchdown reads 24% at its worst joint, and 6% of the torque rating on the pad.
-- **Decelerator reef** (M4c landing; `refresh_decel_sites` lib.rs + `reef_bound_n`
-  simple.rs) — the mount's own: a `Parachute` site carries its mount's derated bounds — 0.9 ×
-  the weaker of axial/shear as a force, 0.9 × the torque rating — over the lever from the
-  joint's attach point to the site. The canopy's area is capped at the force bound over the
-  dynamic pressure, tightened to the torque bound over the arm the pull sees across the lever
-  (`|(site − attach) × F|`, the joint evaluation's own torque): a top-mounted canopy on an
-  axial descent pulls along its lever and keeps the force bound (the s125: 54 kN), a radial
-  one on the same descent is capped at the rating over its 0.25 m arm (29 kN). The lever
-  used to run to the node ORIGIN — the part's centre for every box and cylinder, zero — so
-  the torque channel never entered the reef and a radial mount's canopy tore its joint off
-  (10.8× the s125's 8 kN·m rating at 250 m/s). It bounds the canopy term alone: the packed
-  canister's drag is the mount's honest load, which is what tears a chute off a hot entry.
-- **Pull-path reef** (M4c landing; `reef_pull_budgets` lib.rs + `JointModel::pull_budgets`
-  structural.rs): the site's drag reaches every joint of the craft, not only its mount — a
-  side-mounted canister is a pitch moment on everything below it — so before each step the
-  world gives every site a budget (`DecelSite::pull_budget_n`): the greatest drag that
-  leaves every joint but the chute's own mount within 0.9 × each of its limits. The backend
-  caps the site's **whole** drag — packed term included — at that over the dynamic pressure
-  (`decel_area_m2`). The budget is the joint-load model above read as a bound: the tick's
-  other loads (aero, thrust, gravity: `external_loads` on a probe of the body with its
-  sites out) under the rigid response the step gives them, plus the pull's own share per
-  newton (a unit pull less its negative, which cancels everything the pull does not cause);
-  per joint and channel — axial, shear, torque on the joint's attach axis — the pull gets
-  the room between the rest and its derated limit. It is read twice, where the forces act
-  and one tick on (`SimpleBackend::coast_ahead`), because the evaluation reads its aero at
-  the pose the step lands in; the lesser is the site's. **Several sites are budgeted
-  together**, because they pull together: each one's own budget carries the one scale that
-  keeps every channel inside the derate with all of them pulling — the pulls' shares add,
-  vector by vector, each times its budget — and the scale never exceeds 1 (beside another
-  chute a site pulls no more than alone; the derate's working point was measured for one).
-  Read one site at a time, two radial chutes on the Stock Hopper each took the full budget
-  and their turns met on the battery joint: 99.9% of its torque rating 3.5 s after the
-  catch, the lower stack broken off the pod; on one scale every node holds through the
-  catch, the battery joint still at the reef's working point (94%). A geometric lever
-  `|(site − attach) × F|` stands in for the pull's torque only at the mount — further down
-  a swinging stack puts twice that on a joint. Measured on the Stock Hopper with the s125 on
-  the pod's side, dry, 250 m/s: the packed canister alone (12 kN, 0.9 m off the axis) is
-  105% of the pod-to-canister joint's 10 kN·m and 113% of the canister-to-battery joint's
-  8 kN·m — the stack came apart on the spawn tick, before its canopy opened. Budgeted from
-  9 kN, every node holds through a 50° swing to touchdown, the worst joint at 93% of its
-  limit (the reef aims at 90%; the step between the reading and the evaluation costs the
-  rest). The top-mounted stock craft never meets it — its budget is far past the mount's
-  reef and it lands as before — and a pod-alone chute has no joint but its mount: unbounded.
+- **Decelerator sites** (§3.1 rule A; `refresh_decel_sites` lib.rs + `decel_areas_m2`
+  simple.rs) — a `Parachute` site's drag is two terms that do not act on the craft alike.
+  The **packed canister's** drag acts where the canister is. The **canopy's** pull acts on the
+  craft's axis: at the site's projection onto the line through the root part's centre along its
+  own +z — for the craft's rigid-body motion and for every joint but the chute's own mount
+  (`PartForce::canopy`). The mount reads none of it: its reef is what bounds the canopy, and
+  its load is everything else. The canopy ramps in over `deploy_time_s` from the first tick
+  both catch gates hold (C14-F1: a deploy-early command cannot pre-complete inflation) and is
+  reefed to 0.9 × the mount's weaker force channel — the s125's 54 kN — on any mount. Before
+  rule A the pull acted at the mount through its lever: a radial canopy was capped at the
+  torque rating over its 0.25 m arm (29 kN against the top mount's 54 kN), and with the craft
+  no longer pitching the lever out of the flow its reefed torque beside the canister's own
+  drag tore the mount off at the catch. A chute on any mount lands the craft the same way
+  now: the lone radial chute brings the Stock Hopper down from 1.5 km at 250 m/s at the top
+  chute's own 6.96 m/s, where the lever starved it to 9–16 kN and the stack arrived at
+  149 m/s. The mount never reefs the packed term: the canister's own drag is its honest
+  load on a hot entry.
+- **Canopy steering** (rule A; `CanopySteering`, `SimpleBackend::canopy_couple` simple.rs;
+  `balance.ron`'s `canopy_steady_arm_m` and `canopy_steady_damp_m_s`) — a deployed canopy
+  steadies the craft that hangs from it with a couple about the CoM proportional to its own
+  pull, `F·(arm·(axis × flow) − damp·ω)`. The arm is the hang: the torque the pull would
+  give a lever of that length along the axis above where the craft takes it. It is what
+  rights a craft whose canopy is taken through its own centre — a pod alone under a radial
+  chute has no pendulum of its own. The damping is what keeps a stack from swinging under
+  its canopy: with neither the Stock Hopper comes in from a 70 km apogee tumbling, 124° off
+  the vertical at 13 rad/s. The couple is read at the start of the tick and the step takes
+  it as it stands, so both shares are cut to what the craft's inertia can follow in one tick
+  (`CANOPY_STEER_RATE_LIMIT_PER_S`, half the tick rate about the craft's least moment) — an
+  uncut damping spins a small craft up instead of settling it. Too much breaks stacks: the
+  restoring adds to the pendulum's turn at a catch on a leaning craft, and the joints below
+  carry it. Measured on the dry Stock Hopper: a 1 m arm with 0.15 m·s of damping hangs it
+  within half a degree of the flow from every apogee from 20 km to 70 km and leaves no spin
+  at touchdown, and a pod alone under a radial chute within 3.2° (10.5° under a 0.3 m arm);
+  a 2 m arm with 0.3 loses the lower stack at the catch from 20 km.
+- **Decelerator budgets** (C14-F1's companion; `reef_pull_budgets` lib.rs +
+  `JointModel::pull_budgets` structural.rs): each term of a site's drag is capped, on its
+  own, at what every other joint of the craft takes of it where it acts
+  (`DecelSite::packed_budget_n`, `canopy_budget_n`).
+  - *The packed term*, off the craft's axis, is a pitch moment on every joint below the
+    mount. Measured on the dry Stock Hopper with the s125 on the pod's side at 250 m/s: the
+    canister alone (12 kN, 0.9 m off the axis) is 105% of the pod-to-canister joint's
+    10 kN·m and 113% of the canister-to-battery joint's 8 kN·m — the stack comes apart on
+    the spawn tick, before its canopy opens. Budgeted at 9 kN, every node holds.
+  - *The canopy's* pull levers nothing through its mount, but it levers the hang: catching
+    on a craft that leans, it turns the whole stack about the CoM at its first tick, and the
+    joints below carry the turn. Unbounded, the Stock Hopper broke at the 16 km gate from a
+    20 km apogee, its top chute catching 18° off the flow — a side canister's own drag had
+    leaned it there. Aligned, the canopy's budget is far past anything its mount's reef
+    lets through and never binds: what starved a radial canopy at rule A's reading was its
+    mount's lever, and the pull no longer acts there.
+  The budget is the joint-load model above read as a bound: the tick's other loads (aero,
+  thrust, gravity: `external_loads` on a probe of the body with its sites out) under the
+  rigid response the step gives them, plus each term's own share per newton (a unit drag
+  less its negative, which cancels everything the drag does not cause); per joint and
+  channel — axial, shear, torque on the joint's attach axis — the drag gets the room between
+  the rest and its derated limit. A canopy's share is read with its restoring arm, as one
+  pendulum with the pull; its damping is deliberately left out
+  (`JointModel::pull_budgets`'s doc says why). It is read twice, where the forces act and
+  one tick on (`SimpleBackend::coast_ahead`), because the evaluation reads its aero at the
+  pose the step lands in; the lesser is the term's. **All the terms are budgeted together**,
+  because they drag together: each one's own budget carries the one scale that keeps every
+  channel inside the derate with all of them pulling — the shares add, vector by vector,
+  each times its budget — and the scale never exceeds 1. Read one at a time, two radial
+  canisters on the Stock Hopper each took the full budget and their turns met on the
+  battery joint: 99.9% of its torque rating 3.5 s after their catch, the lower stack broken
+  off the pod. The model is an approximation of the evaluation and reads low under a
+  swinging stack, so the budget does not trust it for the last word: `pull_readback` flies a
+  copy of the craft under the budgets the step is about to use and reads it exactly as the
+  evaluation will (the couple included), and every finite budget takes the one scale that
+  brings that reading back inside the derate. Twice, because the reading is not linear in
+  the scale, and the cut lands on what each term actually drags. The top-mounted stock craft
+  aligned under its canopy never meets a binding budget, and a pod-alone chute has no joint
+  but its mount: unbounded.
 
 **Docking** (`merge.rs` + `joints.rs`): approach = live `LiveJoint` transient
 (cap 16; over-cap degrades to clean separation); latch = pure graph merge

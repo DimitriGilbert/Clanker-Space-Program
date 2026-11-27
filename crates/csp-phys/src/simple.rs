@@ -338,6 +338,57 @@ fn default_touchdown_crush_m() -> f64 {
     DEFAULT_TOUCHDOWN_CRUSH_M
 }
 
+/// The no-data steadying arm of a deployed canopy, metres —
+/// `balance.ron`'s `canopy_steady_arm_m` is the authored value (see
+/// [`CanopySteering`]).
+pub const DEFAULT_CANOPY_STEADY_ARM_M: f64 = 1.0;
+/// The no-data steadying damping of a deployed canopy, metres·seconds
+/// — `balance.ron`'s `canopy_steady_damp_m_s` is the authored value.
+pub const DEFAULT_CANOPY_STEADY_DAMP_M_S: f64 = 0.15;
+
+/// The rate, per second, at which a deployed canopy's steadying may at
+/// most act on the craft that hangs from it: the couple is read at the
+/// start of the tick and the step takes it as it stands, so it is
+/// bounded by the craft's own inertia — the damping may take half of
+/// the craft's spin in a tick about its weakest axis, and the restoring
+/// torque keeps the hang's natural frequency within half the tick rate
+/// there. Past either, the explicit step would overshoot: a small craft
+/// under a big canopy spins up instead of settling.
+pub const CANOPY_STEER_RATE_LIMIT_PER_S: f64 = 0.5 / PHYSICS_DT;
+
+/// A deployed canopy's steadying action on the craft that hangs from it
+/// (§3.1 rule A): a couple about the CoM, proportional to the canopy's
+/// own pull `F`, that opposes the craft's rotation and brings its axis
+/// onto the airflow —
+/// `τ = F·(steady_arm_m·(axis × flow) − steady_damp_m_s·ω)`, with
+/// `axis` the craft's longitudinal axis and `flow` the direction the
+/// canopy pulls. The arm is the hang: the same torque the pull would
+/// give a lever of that length along the axis above where it acts. The
+/// craft's motion is the step's, and its joints read the couple beside
+/// the pull, so it loads no chute's own mount.
+///
+/// `balance.ron`'s `canopy_steady_arm_m` and `canopy_steady_damp_m_s`
+/// are the authored values, installed through
+/// [`SimpleBackend::set_canopy_steering`]. They are not `Environment`
+/// fields: the §7.6 replay artifacts embed the environment, and an
+/// additive field there stops the committed goldens decoding.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CanopySteering {
+    /// The restoring arm, metres.
+    pub steady_arm_m: f64,
+    /// The damping, metres·seconds.
+    pub steady_damp_m_s: f64,
+}
+
+impl CanopySteering {
+    /// The no-data steering — the shipped `balance.ron`'s values, which
+    /// a `csp-bench` test pins together.
+    pub const DEFAULT: Self = Self {
+        steady_arm_m: DEFAULT_CANOPY_STEADY_ARM_M,
+        steady_damp_m_s: DEFAULT_CANOPY_STEADY_DAMP_M_S,
+    };
+}
+
 /// Universal gas constant, J/(mol·K) — CODATA exact value; §3.0's
 /// ideal-gas density `ρ = pM/(RT)` needs it.
 const R_GAS: f64 = 8.314_462_618_153_24;
@@ -1807,6 +1858,10 @@ pub struct SimpleBackend {
     /// §2.4 evaluation. Rebuilt every tick, never serialized.
     ground_dv: Vec<GroundDv>,
     ground_rows: Vec<GroundRow>,
+    /// How a deployed canopy steadies the craft that hangs from it
+    /// ([`CanopySteering`]) — construction config, never serialized:
+    /// a world rebuilt from an artifact runs the build's own.
+    canopy: CanopySteering,
 }
 
 /// One solved ground row of the most recent `step`: the impulse the
@@ -1854,7 +1909,21 @@ impl SimpleBackend {
             water: Vec::new(),
             ground_dv: Vec::new(),
             ground_rows: Vec::new(),
+            canopy: CanopySteering::DEFAULT,
         }
+    }
+
+    /// How a deployed canopy steadies the craft that hangs from it —
+    /// the construction-config channel `balance.ron`'s
+    /// `canopy_steady_arm_m` and `canopy_steady_damp_m_s` install
+    /// ([`CanopySteering`]). The backend starts at the shipped values.
+    pub fn set_canopy_steering(&mut self, steering: CanopySteering) {
+        self.canopy = steering;
+    }
+
+    /// The canopy steering the backend steps under.
+    pub fn canopy_steering(&self) -> CanopySteering {
+        self.canopy
     }
 
     /// Stamp the sim time the backend's state is indexed at. On a
@@ -1879,11 +1948,15 @@ impl SimpleBackend {
     /// force the environment and the vessel's own sites apply to each
     /// graph node this tick — gravity at each part's CoM, per-part
     /// aero (table path, or the placeholder distributed by mass
-    /// share), thrust sites, the solved contact impulses (ground and
-    /// vessel-vessel pair) attributed by hull, and the tick's water
-    /// loads (buoyancy, drag, damping) attributed by hull — expressed
-    /// in **body frame** as [`PartForce`]s. The ground impulses are
-    /// the channel [`PartForce::ground`] marks.
+    /// share), thrust sites, the §3.1 decelerator sites' action (the
+    /// packed canister's drag at the canister, its canopy's pull on the
+    /// craft's axis and the couple that steadies the craft), the solved
+    /// contact impulses (ground and vessel-vessel pair) attributed by
+    /// hull, and the tick's water loads (buoyancy, drag, damping)
+    /// attributed by hull — expressed in **body frame** as
+    /// [`PartForce`]s. The ground impulses are the channel
+    /// [`PartForce::ground`] marks, the canopy's pull the one
+    /// [`PartForce::canopy`] marks.
     ///
     /// `contacts` and `water` are the records from the last `step` for
     /// this body (`self.contacts(handle)`, `self.water_loads(handle)`);
@@ -1905,17 +1978,25 @@ impl SimpleBackend {
         crate::weld::WeldError,
     > {
         use crate::structural::PartForce;
-        let mut out: std::collections::BTreeMap<crate::graph::PartNodeId, Vec<PartForce>> =
-            std::collections::BTreeMap::new();
-        let conj = body.rot.conjugate();
-        let mut push = |id: crate::graph::PartNodeId, at: DVec3, force: DVec3| {
+        type Loads = std::collections::BTreeMap<crate::graph::PartNodeId, Vec<PartForce>>;
+        fn push(
+            out: &mut Loads,
+            id: crate::graph::PartNodeId,
+            at: DVec3,
+            force: DVec3,
+            torque: DVec3,
+            canopy: bool,
+        ) {
             out.entry(id).or_default().push(PartForce {
                 at,
                 force,
-                torque: DVec3::ZERO,
+                torque,
                 ground: false,
+                canopy,
             });
-        };
+        }
+        let mut out: Loads = std::collections::BTreeMap::new();
+        let conj = body.rot.conjugate();
 
         // Gravity at each part's body-frame CoM — the same analytic
         // −μ·r̂/r² as `accumulate_forces` (`gravity_force_world`),
@@ -1927,7 +2008,7 @@ impl SimpleBackend {
             if ep.mass_kg > 0.0
                 && let Some(f_w) = gravity_force_world(&self.env, rel, ep.mass_kg)
             {
-                push(*id, c_b, conj.rotate(f_w));
+                push(&mut out, *id, c_b, conj.rotate(f_w), DVec3::ZERO, false);
             }
         }
 
@@ -1944,7 +2025,7 @@ impl SimpleBackend {
                     Some(tables) => {
                         let (w_body, q, mach, re_per_len) = flow.table_args(atm, body.rot);
                         for (node, f, cop) in tables.part_forces_body(w_body, q, mach, re_per_len) {
-                            push(node, cop, f);
+                            push(&mut out, node, cop, f, DVec3::ZERO, false);
                         }
                     }
                     None => {
@@ -1954,29 +2035,46 @@ impl SimpleBackend {
                                 let ep = &parts[node.effective_index as usize];
                                 if ep.mass_kg > 0.0 {
                                     push(
+                                        &mut out,
                                         *id,
                                         transforms[id].apply(ep.com),
                                         f_b * (ep.mass_kg / body.mass_kg),
+                                        DVec3::ZERO,
+                                        false,
                                     );
                                 }
                             }
                         }
                     }
                 }
-                // §3.1 decelerator sites — the same additive term
-                // `accumulate_forces` applies (`decel_drag_world`),
-                // attributed to the site-owning node (the canopy's
-                // pull loads its own attachment).
-                let pull_body = flow.pull_body(body.rot);
-                for site in &body.decel {
-                    let area =
-                        decel_area_m2(site, &flow, pull_body, self.time_s.get() + PHYSICS_DT);
-                    if area > 0.0 {
-                        push(
-                            site.node,
-                            site.local_pos,
-                            conj.rotate(decel_drag_world(&flow, area)),
-                        );
+                // §3.1 decelerator sites — the action `accumulate_forces`
+                // applies (`decel_action`), on the site-owning node: the
+                // canister's packed drag where the canister is, and its
+                // canopy's pull, on the craft's axis — read by every
+                // joint but the chute's own mount, whose reef bounds it.
+                if !body.decel.is_empty() {
+                    for site in &body.decel {
+                        let action = self.decel_action(body, site, &flow);
+                        if action.packed != DVec3::ZERO {
+                            push(
+                                &mut out,
+                                site.node,
+                                site.local_pos,
+                                conj.rotate(action.packed),
+                                DVec3::ZERO,
+                                false,
+                            );
+                        }
+                        if action.canopy != DVec3::ZERO {
+                            push(
+                                &mut out,
+                                site.node,
+                                site.axis_pos,
+                                conj.rotate(action.canopy),
+                                conj.rotate(action.couple),
+                                true,
+                            );
+                        }
                     }
                 }
             }
@@ -1992,9 +2090,12 @@ impl SimpleBackend {
                 for site in sites {
                     if site.kind == ForceSiteKind::Thrust {
                         push(
+                            &mut out,
                             *id,
                             site.local_pos,
                             site.local_dir * thrust_scalar_n(throttle, site),
+                            DVec3::ZERO,
+                            false,
                         );
                     }
                 }
@@ -2017,6 +2118,7 @@ impl SimpleBackend {
                     force: conj.rotate(c.impulse) * (1.0 / PHYSICS_DT),
                     torque: DVec3::ZERO,
                     ground: true,
+                    canopy: false,
                 });
             }
         }
@@ -2031,6 +2133,7 @@ impl SimpleBackend {
                     force: conj.rotate(p.force),
                     torque: p.torque,
                     ground: false,
+                    canopy: false,
                 });
             }
         }
@@ -2094,53 +2197,40 @@ impl SimpleBackend {
             .map_or(&[], |w| w.parts.as_slice())
     }
 
-    /// `body` one tick on, under every force but its decelerator sites'
-    /// drag — the backend's own step of a body whose `decel` is empty,
-    /// in place, with no water and no solve. The world's pull-path reef
-    /// ([`crate::structural::JointModel::pull_budgets`]) reads the loads at the pose
-    /// this lands in: the §2.4 evaluation reads its aero post-step, and
-    /// a stack swinging under an off-axis canopy turns a degree a tick.
-    pub fn coast_ahead(&self, body: &mut WeldedBody) {
-        let sites = core::mem::take(&mut body.decel);
-        self.integrate_free(body, None);
-        body.decel = sites;
-    }
-
-    /// `body` one tick on with its decelerator sites' drag kept —
-    /// [`Self::coast_ahead`] without the sites taken out: the backend's
+    /// `body` one tick on under every load it carries — the backend's
     /// own step of the body exactly as the tick about to run integrates
-    /// it (same forces, same stamp, in place, no water and no solve).
-    /// The world's reef flies a copy of the craft under its candidate
-    /// budgets this way and reads the joints with the §2.4 evaluation's
-    /// own arithmetic, instead of trusting what its model says they
-    /// will read.
-    pub fn coast_ahead_with_sites(&self, body: &mut WeldedBody) {
+    /// it (same forces, same stamp, in place, no water and no solve),
+    /// the decelerator sites' action included. The world's decelerator
+    /// budgets ([`crate::structural::JointModel::pull_budgets`]) read
+    /// the loads at the pose this lands in: the §2.4 evaluation reads
+    /// its aero post-step, and a stack that is turning moves that
+    /// reading. Their read-back flies a copy of the craft under its
+    /// candidate budgets this way and reads the joints with the
+    /// evaluation's own arithmetic, instead of trusting what the model
+    /// says they will read.
+    pub fn coast_ahead(&self, body: &mut WeldedBody) {
         self.integrate_free(body, None);
     }
 
     /// The unit flow direction in body frame — the direction the §3.1
-    /// decelerator sites' pull is measured along this tick, the same
+    /// decelerator sites' drag is measured along this tick, the same
     /// reading `accumulate_forces` and `external_loads` take (the
-    /// sites' drag pushes the other way). What the world's pull-path
-    /// reef ([`crate::structural::JointModel::pull_budgets`]) budgets against before
-    /// the step. `None` without atmospheric flow — the same gate the
-    /// force model applies, when no site drags at all.
-    pub fn decel_pull(&self, body: &WeldedBody) -> Option<DVec3> {
+    /// sites' drag pushes the other way). What the world's decelerator
+    /// budgets ([`crate::structural::JointModel::pull_budgets`]) bound
+    /// against before the step. `None` without atmospheric flow — the
+    /// same gate the force model applies, when no site drags at all.
+    pub fn decel_pull_dir(&self, body: &WeldedBody) -> Option<DVec3> {
         let atm = self.env.atmosphere.as_ref()?;
         let rel = body.com_world() - self.env.body_center;
         flow_state(&self.env, atm, body, rel).map(|flow| flow.pull_body(body.rot))
     }
 
-    /// The drag each of `body`'s decelerator sites applies to it as it
-    /// stands, in `body.decel` order (N): the force the step about to
-    /// run integrates for each site — its effective area under the flow
-    /// ([`decel_area_m2`], the deploy ramp, the mount's reef and the
-    /// pull budget already folded in) at the body's own altitude and
-    /// speed, the reading `accumulate_forces` takes. Empty without
-    /// sites or atmospheric flow. A site's drag is the lesser of its
-    /// budget and what it can pull, so it is what a cut of the budget
-    /// has to land on to cut anything at all.
-    pub fn decel_pulls(&self, body: &WeldedBody) -> Vec<f64> {
+    /// What each of `body`'s decelerator sites drags with this tick, as
+    /// it stands, in `body.decel` order ([`DecelDrag`]) — each term
+    /// under the flow at the body's own altitude and speed, its budget
+    /// already folded in: the reading `accumulate_forces` takes. Empty
+    /// without sites or atmospheric flow.
+    pub fn decel_drags(&self, body: &WeldedBody) -> Vec<DecelDrag> {
         let Some(atm) = self.env.atmosphere.as_ref() else {
             return Vec::new();
         };
@@ -2148,12 +2238,24 @@ impl SimpleBackend {
         let Some(flow) = flow_state(&self.env, atm, body, rel) else {
             return Vec::new();
         };
-        let pull_body = flow.pull_body(body.rot);
+        let limit = CANOPY_STEER_RATE_LIMIT_PER_S * least_inertia_bound(body);
         body.decel
             .iter()
             .map(|site| {
-                let area = decel_area_m2(site, &flow, pull_body, self.time_s.get() + PHYSICS_DT);
-                decel_drag_world(&flow, area).norm()
+                let (packed_m2, canopy_m2) =
+                    decel_areas_m2(site, &flow, self.time_s.get() + PHYSICS_DT);
+                let canopy_n = decel_drag_world(&flow, canopy_m2).norm();
+                let arm = if canopy_n > 0.0 {
+                    (self.canopy.steady_arm_m * canopy_n).min(limit * CANOPY_STEER_RATE_LIMIT_PER_S)
+                        / canopy_n
+                } else {
+                    0.0
+                };
+                DecelDrag {
+                    packed_n: decel_drag_world(&flow, packed_m2).norm(),
+                    canopy_n,
+                    steer_arm_m: arm,
+                }
             })
             .collect()
     }
@@ -2284,21 +2386,24 @@ impl SimpleBackend {
                 }
             }
             // §3.1 decelerator sites — the additive analytic
-            // drag term (no table recompute): packed Cd·A
-            // always, the deployed Cd·A once the canopy can
-            // catch (below the authored altitude/speed
-            // ceilings), ramping in over `deploy_time_s` from
-            // the gate-pass stamp and reefed to the mount's
-            // load rating. Applied at the site point —
-            // a canopy above the CoM weathervanes correctly.
-            let pull_body = flow.pull_body(b.rot);
-            for site in &b.decel {
-                let area = decel_area_m2(site, &flow, pull_body, self.time_s.get() + PHYSICS_DT);
-                if area > 0.0 {
-                    let f_world = decel_drag_world(&flow, area);
-                    let r_world = b.rot.rotate(site.local_pos - b.com_local);
-                    force = force + f_world;
-                    torque = torque + r_world.cross(f_world);
+            // drag term (no table recompute: `decel_action`): packed
+            // Cd·A always, where the canister is; the deployed Cd·A
+            // once the canopy can catch (below the authored
+            // altitude/speed ceilings), ramping in over `deploy_time_s`
+            // from the gate-pass stamp and reefed to the mount's load
+            // rating, applied on the craft's axis — a canopy above the
+            // CoM weathervanes correctly from any mount — with the
+            // couple that steadies the hang.
+            if !b.decel.is_empty() {
+                for site in &b.decel {
+                    let action = self.decel_action(b, site, &flow);
+                    let r_packed = b.rot.rotate(site.local_pos - b.com_local);
+                    let r_canopy = b.rot.rotate(site.axis_pos - b.com_local);
+                    force = force + action.packed + action.canopy;
+                    torque = torque
+                        + r_packed.cross(action.packed)
+                        + r_canopy.cross(action.canopy)
+                        + action.couple;
                 }
             }
         }
@@ -3423,67 +3528,145 @@ impl PhysicsBackend for SimpleBackend {
     }
 }
 
-/// §3.1 decelerator catch: the site's effective Cd·A this tick —
-/// packed always, the deployed area ramping in over `deploy_time_s`
-/// once the flow can hold the canopy (below the authored
-/// altitude/speed ceilings). The ramp anchors at `open_at_s` — the
-/// first gate-passing tick, stamped by the world post-step — not at
-/// the deploy command's stamp: a deploy-early command waits out the
-/// ceilings packed instead of arriving fully inflated (C14-F1). The
-/// canopy term is then reefed to the mount's authored load rating —
-/// `area ≤ reef / q̄` for [`reef_bound_n`] — so a hard catch pulls at
-/// the mount limit rather than snapping it (the ~2 MN gate-pass load
-/// the unbounded ramp produced vs the s125's 150 kN/60 kN mount). The
-/// mount never reefs the packed term — the canister's own drag is its
-/// honest load on a hot entry. The pull path then caps the site's
-/// **whole** drag, packed term included, at its budget
-/// ([`DecelSite::pull_budget_n`] over `q̄`): an off-axis canister's
-/// drag is a pitch moment every joint below it carries, canopy or not.
-/// `pull_body` is the unit flow direction in body frame — the
-/// direction the canopy's pull takes. Shared by `accumulate_forces`
-/// and `external_loads` so the two channels can never disagree.
-fn decel_area_m2(site: &DecelSite, flow: &FlowState, pull_body: DVec3, at_s: f64) -> f64 {
-    let area = match site.open_at_s {
+/// §3.1 decelerator catch: the site's effective Cd·A this tick, in its
+/// two terms — `(packed, canopy)`, m².
+///
+/// The packed term is there always. It acts where the canister is, so
+/// off the craft's axis it is a pitch moment on every joint below the
+/// mount, and its budget ([`DecelSite::packed_budget_n`] over `q̄`) cuts
+/// it to what they take.
+///
+/// The canopy ramps in over `deploy_time_s` once the flow can hold it
+/// (below the authored altitude/speed ceilings). The ramp anchors at
+/// `open_at_s` — the first gate-passing tick, stamped by the world
+/// post-step — not at the deploy command's stamp: a deploy-early
+/// command waits out the ceilings packed instead of arriving fully
+/// inflated (C14-F1). The canopy term is then reefed to its mount's
+/// derated force rating — `area ≤ reef_n / q̄` — so a hard catch pulls
+/// at the mount limit rather than snapping it (the ~2 MN gate-pass load
+/// the unbounded ramp produced vs the s125's 150 kN / 60 kN mount). The
+/// mount never reefs the packed term: the canister's own drag is its
+/// honest load on a hot entry. The canopy's budget
+/// ([`DecelSite::canopy_budget_n`]) is read for its pull on the craft's
+/// axis: it binds only on a craft that leans into its catch, where the
+/// hang's own turn is more than the joints below can carry.
+///
+/// `at_s` is the stamp the ramp is read at. One reading for
+/// `accumulate_forces` and `external_loads`, so the two channels can
+/// never disagree.
+fn decel_areas_m2(site: &DecelSite, flow: &FlowState, at_s: f64) -> (f64, f64) {
+    let qbar = 0.5 * flow.rho * flow.speed * flow.speed;
+    let packed = capped(site.packed_drag_area_m2, site.packed_budget_n, qbar);
+    let canopy = match site.open_at_s {
         Some(t0) if flow.alt_m <= site.deploy_alt_m && flow.speed <= site.deploy_speed_mps => {
             let ramp = if site.deploy_time_s > 0.0 {
                 ((at_s - t0) / site.deploy_time_s).clamp(0.0, 1.0)
             } else {
                 1.0
             };
-            let mut canopy = (site.deployed_drag_area_m2 - site.packed_drag_area_m2) * ramp;
-            let qbar = 0.5 * flow.rho * flow.speed * flow.speed;
-            if qbar > 0.0 && site.reef_n.is_finite() {
-                canopy = canopy.min(reef_bound_n(site, pull_body) / qbar).max(0.0);
-            }
-            site.packed_drag_area_m2 + canopy
+            let canopy = (site.deployed_drag_area_m2 - site.packed_drag_area_m2) * ramp;
+            let reefed = if qbar > 0.0 && site.reef_n.is_finite() {
+                canopy.min(site.reef_n / qbar).max(0.0)
+            } else {
+                canopy
+            };
+            capped(reefed, site.canopy_budget_n, qbar)
         }
-        _ => site.packed_drag_area_m2,
+        _ => 0.0,
     };
-    if !site.pull_budget_n.is_finite() {
-        return area;
+    (packed, canopy)
+}
+
+/// One §3.1 decelerator site's action on the craft this tick, world
+/// frame: the forces the step integrates and the evaluation attributes.
+struct DecelAction {
+    /// The packed canister's drag — it acts at the canister.
+    packed: DVec3,
+    /// The canopy's pull — it acts on the craft's axis.
+    canopy: DVec3,
+    /// The canopy's steadying couple, about the CoM — a pure couple.
+    couple: DVec3,
+}
+
+impl SimpleBackend {
+    /// What `site` does to `b` under `flow` this tick — the one
+    /// reading the step (`accumulate_forces`) and the §2.4 budget
+    /// (`external_loads`) both take, so the force a joint is measured
+    /// under is the force the step applied.
+    fn decel_action(&self, b: &WeldedBody, site: &DecelSite, flow: &FlowState) -> DecelAction {
+        let (packed_m2, canopy_m2) = decel_areas_m2(site, flow, self.time_s.get() + PHYSICS_DT);
+        let canopy = decel_drag_world(flow, canopy_m2);
+        let couple = self.canopy_couple(b, site, flow, canopy.norm());
+        DecelAction {
+            packed: decel_drag_world(flow, packed_m2),
+            canopy,
+            couple,
+        }
     }
-    let qbar = 0.5 * flow.rho * flow.speed * flow.speed;
-    if qbar > 0.0 {
-        area.min(site.pull_budget_n / qbar)
-    } else {
-        area
+
+    /// The steadying couple of a canopy pulling `pull` newtons
+    /// ([`CanopySteering`]), world frame about the CoM: it turns the
+    /// craft's axis onto the direction the canopy pulls, and against
+    /// the craft's spin. Both are cut where the craft's own inertia
+    /// would turn them into an overshoot ([`CANOPY_STEER_RATE_LIMIT_PER_S`]).
+    fn canopy_couple(
+        &self,
+        b: &WeldedBody,
+        site: &DecelSite,
+        flow: &FlowState,
+        pull: f64,
+    ) -> DVec3 {
+        if pull <= 0.0 {
+            return DVec3::ZERO;
+        }
+        let limit = CANOPY_STEER_RATE_LIMIT_PER_S * least_inertia_bound(b);
+        let arm = (pull * self.canopy.steady_arm_m).min(limit * CANOPY_STEER_RATE_LIMIT_PER_S);
+        let damp = (pull * self.canopy.steady_damp_m_s).min(limit);
+        let toward = flow.v_rel * (-1.0 / flow.speed);
+        b.rot.rotate(site.axis_dir).cross(toward) * arm - b.rot.rotate(b.ang_vel) * damp
     }
 }
 
-/// The canopy's load bound for a pull along `pull_body` (body frame,
-/// unit): the mount's weaker force channel, tightened to the torque
-/// rating over the arm the pull sees across `reef_lever` —
-/// `|(site − attach) × F|`, the §2.4 joint-load evaluation's own
-/// torque for that force. A radial mount pulled across its lever is
-/// capped by torque; an axial mount pulled along its lever makes none
-/// and keeps the force channel's bound.
-fn reef_bound_n(site: &DecelSite, pull_body: DVec3) -> f64 {
-    let arm_m = site.reef_lever.cross(pull_body).norm();
-    if arm_m > 0.0 {
-        site.reef_n.min(site.reef_torque_nm / arm_m)
+/// What one §3.1 decelerator site drags with this tick — the world's
+/// budgets ([`crate::structural::JointModel::pull_budgets`]) read it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DecelDrag {
+    /// The packed term, newtons: the canister's own drag.
+    pub packed_n: f64,
+    /// The canopy's pull, newtons.
+    pub canopy_n: f64,
+    /// The arm its steadying restores with this tick, metres: the
+    /// canopy's couple against the lean, per newton of its pull — what
+    /// the budget reads as the pull acting that far up the axis beyond
+    /// the point the craft takes it at. The share against the craft's
+    /// spin is not in it ([`JointModel::pull_budgets`]).
+    pub steer_arm_m: f64,
+}
+
+/// An area (m²) with its term's budget (N) folded in: the lesser of the
+/// area and the budget over the dynamic pressure.
+fn capped(area_m2: f64, budget_n: f64, qbar: f64) -> f64 {
+    if budget_n.is_finite() && qbar > 0.0 {
+        area_m2.min(budget_n / qbar)
     } else {
-        site.reef_n
+        area_m2
     }
+}
+
+/// A lower bound on the body's least principal moment of inertia,
+/// kg·m²: the reciprocal of the greatest absolute row sum of `I⁻¹`
+/// (Gershgorin), which bounds its largest eigenvalue `1/λ_min` from
+/// above — exact for a diagonal inertia. Infinite for a body with no
+/// angular response (a singular inertia), whose spin nothing can move —
+/// and nothing needs bounding.
+fn least_inertia_bound(b: &WeldedBody) -> f64 {
+    b.inertia_local.inverse().map_or(f64::INFINITY, |inv| {
+        let (xy, xz, yz) = (inv.xy.abs(), inv.xz.abs(), inv.yz.abs());
+        let widest = (inv.xx.abs() + xy + xz)
+            .max(inv.yy.abs() + xy + yz)
+            .max(inv.zz.abs() + xz + yz);
+        1.0 / widest
+    })
 }
 
 /// The pre-voxel reference area: cross-section of the compound
@@ -3592,8 +3775,8 @@ fn flow_state(
 
 impl FlowState {
     /// The unit flow direction in body frame — the direction the §3.1
-    /// decelerator sites measure their pull along, here, in
-    /// `external_loads`, and in [`SimpleBackend::decel_pull`].
+    /// decelerator sites' drag is measured along, in
+    /// [`SimpleBackend::decel_pull_dir`].
     fn pull_body(&self, rot: csp_core::DQuat) -> DVec3 {
         rot.conjugate().rotate(self.v_rel) / self.speed
     }
@@ -3625,10 +3808,10 @@ fn placeholder_drag_world(env: &Environment, b: &WeldedBody, flow: &FlowState) -
     flow.v_rel * (-0.5 * flow.rho * env.drag_cd * area * flow.speed)
 }
 
-/// One §3.1 decelerator site's additive drag — the same analytic
-/// quadratic term as the placeholder but at the site's *effective*
-/// Cd·A from `decel_area_m2` (canopy Cd, the deploy ramp, and the
-/// reefed load cap are already folded into that area — no
+/// One §3.1 decelerator term's additive drag — the same analytic
+/// quadratic term as the placeholder but at the term's *effective*
+/// Cd·A from `decel_areas_m2` (canopy Cd, the deploy ramp, the reefed
+/// load cap and the term's budget already folded into that area — no
 /// `env.drag_cd` here).
 fn decel_drag_world(flow: &FlowState, area_m2: f64) -> DVec3 {
     flow.v_rel * (-0.5 * flow.rho * area_m2 * flow.speed)
@@ -3692,12 +3875,18 @@ mod tests {
 
     /// One-node graph welding to a box collider of half-extents `half`.
     fn box_body(mass_kg: f64, half: DVec3) -> WeldedBody {
+        let (g, parts) = box_graph(mass_kg, half);
+        weld(&g, &parts).unwrap()
+    }
+
+    /// A single box part, and the one-node graph that carries it.
+    fn box_graph(mass_kg: f64, half: DVec3) -> (PartGraph, Vec<WeldPart>) {
         let mut g = PartGraph::new(PartNodeId(1));
         g.insert(
             PartNodeId(1),
             PartNode::new(None, PartTransform::IDENTITY, 0),
         );
-        let parts = [WeldPart {
+        let parts = vec![WeldPart {
             experiments: Vec::new(),
             lab: None,
             engine: None,
@@ -3714,7 +3903,7 @@ mod tests {
             aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
             thermal: test_thermal(),
         }];
-        weld(&g, &parts).unwrap()
+        (g, parts)
     }
 
     fn step_n(backend: &mut SimpleBackend, bodies: &mut [WeldedBody], n: usize) {
@@ -6190,11 +6379,14 @@ mod tests {
     }
 
     /// An `csp.chute.s125` site on a 0.25 m lever along +z with the
-    /// shipped mount ratings (150 kN / 60 kN / 8 kN·m, derated 0.9).
+    /// shipped mount ratings (150 kN / 60 kN / 8 kN·m, derated 0.9) —
+    /// on the craft's axis, a top mount.
     fn umbrella_site() -> DecelSite {
         DecelSite {
             node: PartNodeId(1),
             local_pos: DVec3::new(0.0, 0.0, 0.25),
+            axis_pos: DVec3::new(0.0, 0.0, 0.25),
+            axis_dir: DVec3::Z,
             packed_drag_area_m2: 0.4,
             deployed_drag_area_m2: 700.0,
             deploy_alt_m: 16_000.0,
@@ -6203,79 +6395,57 @@ mod tests {
             deployed_at_s: Some(0.0),
             open_at_s: Some(0.0),
             reef_n: 54_000.0,
-            reef_torque_nm: 7_200.0,
-            reef_lever: DVec3::new(0.0, 0.0, 0.25),
-            pull_budget_n: f64::INFINITY,
+            packed_budget_n: f64::INFINITY,
+            canopy_budget_n: f64::INFINITY,
         }
     }
 
-    /// M4c: the reef's torque bound is the joint evaluation's own —
-    /// the canopy's pull across the lever from the joint's attach point
-    /// to the site. A top-mounted canopy on an axial descent pulls
-    /// along its lever and keeps the force channel's bound (54 kN); the
-    /// same mount pulled across it — a radial canopy on that descent —
-    /// is capped at the torque rating over the arm (29 kN), and a
-    /// diagonal pull sits between. The bound is the canopy's area under
-    /// the flow: the same 250 m/s descent carries 1.7 m² of canopy one
-    /// way and 0.9 m² the other.
-    #[test]
-    fn reef_bound_follows_the_pull_across_the_lever() {
-        let site = umbrella_site();
-        assert_eq!(reef_bound_n(&site, DVec3::Z), 54_000.0);
-        assert!((reef_bound_n(&site, DVec3::X) - 28_800.0).abs() < 1e-9);
-        let diagonal = DVec3::new(1.0, 0.0, 1.0) / libm::sqrt(2.0);
-        let expected = 7_200.0 / (0.25 / libm::sqrt(2.0));
-        assert!((reef_bound_n(&site, diagonal) - expected).abs() < 1e-6);
-
-        let flow = FlowState {
+    /// The flow of the decelerator fixtures: 250 m/s straight down at
+    /// 1.5 km, under ρ = 1 kg/m³.
+    fn hot_flow() -> FlowState {
+        FlowState {
             v_rel: DVec3::new(0.0, 0.0, -250.0),
             speed: 250.0,
             rho: 1.0,
             alt_m: 1_500.0,
-        };
-        let along = decel_area_m2(&site, &flow, DVec3::Z, 10.0);
-        let across = decel_area_m2(&site, &flow, DVec3::X, 10.0);
-        assert!(
-            (along - (0.4 + 54_000.0 / 31_250.0)).abs() < 1e-9,
-            "{along}"
-        );
-        assert!(
-            (across - (0.4 + 28_800.0 / 31_250.0)).abs() < 1e-9,
-            "{across}"
-        );
+        }
     }
 
-    /// M4c pull-path reef: the site's budget caps its **whole** drag —
-    /// canopy and packed term alike — and an unbounded budget leaves
-    /// the area bit for bit as it was.
+    /// Each term of a site's drag is capped by its own budget and by
+    /// nothing else's: the canister's own, deployed or not, and the
+    /// canopy's. An unbounded budget leaves the areas bit for bit as
+    /// they were, and a budget past a term's drag is no cap at all.
     #[test]
-    fn the_pull_budget_caps_the_sites_whole_drag() {
-        let flow = FlowState {
-            v_rel: DVec3::new(0.0, 0.0, -250.0),
-            speed: 250.0,
-            rho: 1.0,
-            alt_m: 1_500.0,
-        };
+    fn each_term_is_capped_by_its_own_budget_alone() {
+        let flow = hot_flow();
         let mut site = umbrella_site();
-        let open = decel_area_m2(&site, &flow, DVec3::Z, 10.0);
-        assert!((open - (0.4 + 54_000.0 / 31_250.0)).abs() < 1e-9, "{open}");
-        // A budget past the drag changes nothing, down to the bit.
-        site.pull_budget_n = 1.0e6;
-        assert_eq!(
-            decel_area_m2(&site, &flow, DVec3::Z, 10.0).to_bits(),
-            open.to_bits()
-        );
-        // The Stock Hopper's stack under a side canister at 250 m/s:
-        // 9 kN, under the packed term's own drag.
-        site.pull_budget_n = 9_000.0;
-        assert!((decel_area_m2(&site, &flow, DVec3::Z, 10.0) - 9_000.0 / 31_250.0).abs() < 1e-12);
-        site.pull_budget_n = 0.0;
-        assert_eq!(decel_area_m2(&site, &flow, DVec3::Z, 10.0), 0.0);
-        // Packed, undeployed: the same cap — the canister's own drag is
-        // what broke the stack before its canopy ever opened.
+        let open = decel_areas_m2(&site, &flow, 10.0);
+        assert!((open.1 - 54_000.0 / 31_250.0).abs() < 1e-9, "{open:?}");
+        // Budgets past the drags change nothing, down to the bit.
+        site.packed_budget_n = 1.0e6;
+        site.canopy_budget_n = 1.0e6;
+        assert_eq!(decel_areas_m2(&site, &flow, 10.0), open);
+        // The Stock Hopper's stack under a side canister at 250 m/s
+        // takes 9 kN of its packed drag, under the term's own.
+        site.packed_budget_n = 9_000.0;
+        let cut = decel_areas_m2(&site, &flow, 10.0);
+        assert!((cut.0 - 9_000.0 / 31_250.0).abs() < 1e-12, "{cut:?}");
+        assert_eq!(cut.1, open.1, "the canopy is not under the packed budget");
+        site.packed_budget_n = 0.0;
+        assert_eq!(decel_areas_m2(&site, &flow, 10.0).0, 0.0);
+        // ... and 9 kN of its canopy's pull on a craft that leans into
+        // the catch, under the term's own.
+        site.packed_budget_n = f64::INFINITY;
+        site.canopy_budget_n = 9_000.0;
+        let cut = decel_areas_m2(&site, &flow, 10.0);
+        assert_eq!(cut.0, 0.4, "the canister is not under the canopy's budget");
+        assert!((cut.1 - 9_000.0 / 31_250.0).abs() < 1e-12, "{cut:?}");
+        // Packed, undeployed: the canopy's budget is nothing to read.
         site.open_at_s = None;
-        site.pull_budget_n = 9_000.0;
-        assert!((decel_area_m2(&site, &flow, DVec3::Z, 10.0) - 9_000.0 / 31_250.0).abs() < 1e-12);
+        site.packed_budget_n = 9_000.0;
+        let cut = decel_areas_m2(&site, &flow, 10.0);
+        assert!((cut.0 - 9_000.0 / 31_250.0).abs() < 1e-12);
+        assert_eq!(cut.1, 0.0);
     }
 
     /// Terrin under a constant-density atmosphere (ρ ≈ 1.225 kg/m³ to
@@ -6312,67 +6482,75 @@ mod tests {
         b
     }
 
-    /// The reef's cut has to land on what a site really pulls, and
-    /// `decel_pulls` is that reading: the site's drag under the flow at
-    /// the body's own speed, the lesser of its budget and what it can
-    /// pull — the canopy reefed to its mount's 54 kN on an axial pull,
-    /// the budget when it is under that, and exactly the force
-    /// `accumulate_forces` gives the step with and without the site.
+    /// Each term's drag, the lesser of its budget and its own, and the
+    /// arm the canopy's steadying restores with: `decel_drags` is that
+    /// reading, and the force is exactly what `accumulate_forces` gives
+    /// the step — with the site, less without: the packed drag and the
+    /// canopy's reefed 54 kN.
     #[test]
-    fn decel_pulls_are_the_drag_the_step_integrates() {
+    fn decel_drags_are_the_drag_the_step_integrates() {
         let env = chuted_env();
         let backend = SimpleBackend::new(env.clone());
         backend.set_sim_time(SimTime::from_ticks(TICK_HZ * 4)); // past the 1.5 s ramp
         let rho = atmosphere_density_kg_m3(env.atmosphere.as_ref().unwrap(), 1_500.0);
-        let qbar = 0.5 * rho * 250.0 * 250.0;
+        let packed = 0.5 * rho * 0.4 * 250.0 * 250.0;
+        let canopy = 54_000.0; // reefed to the mount on an axial pull
 
         let body = chute_box_body();
-        let pulls = backend.decel_pulls(&body);
-        assert_eq!(pulls.len(), 1);
-        // Axial pull: the packed term plus the canopy reefed to 54 kN.
-        let reefed = qbar * 0.4 + 54_000.0;
-        assert!(
-            (pulls[0] - reefed).abs() < 1e-6,
-            "{} against {reefed}",
-            pulls[0]
-        );
+        let drags = backend.decel_drags(&body);
+        assert_eq!(drags.len(), 1);
+        let drag = drags[0];
+        assert!((drag.packed_n - packed).abs() < 1e-6, "{}", drag.packed_n);
+        assert!((drag.canopy_n - canopy).abs() < 1e-6, "{}", drag.canopy_n);
+        assert_eq!(drag.steer_arm_m, DEFAULT_CANOPY_STEADY_ARM_M);
 
-        // The same force the step integrates: with the site, less without.
+        // The same force the step integrates: with the site, less
+        // without, is the packed drag and the canopy's.
         let (with_site, with_torque) = backend.accumulate_forces(&body);
         let mut bare = body.clone();
         bare.decel.clear();
         let (without_site, without_torque) = backend.accumulate_forces(&bare);
-        assert!(((with_site - without_site).norm() - pulls[0]).abs() < 1e-9);
-        // Applied on the stack's axis, through the CoM: no torque either way.
+        assert!(
+            ((with_site - without_site).norm() - (packed + canopy)).abs() < 1e-6,
+            "{} against {}",
+            (with_site - without_site).norm(),
+            packed + canopy
+        );
+        // On the stack's axis, through the CoM, hanging square to the
+        // flow and not turning: no torque either way.
         assert_eq!(with_torque, without_torque);
 
-        // A budget under the pull caps it — the cut lands on the stamp.
+        // A budget under a term's drag caps that term alone.
         let mut budgeted = body.clone();
-        budgeted.decel[0].pull_budget_n = 9_000.0;
-        assert!((backend.decel_pulls(&budgeted)[0] - 9_000.0).abs() < 1e-9);
-        assert!(backend.decel_pulls(&bare).is_empty());
+        budgeted.decel[0].packed_budget_n = 9_000.0;
+        budgeted.decel[0].canopy_budget_n = 9_000.0;
+        let drag = &backend.decel_drags(&budgeted)[0];
+        assert!((drag.packed_n - 9_000.0).abs() < 1e-9);
+        assert!((drag.canopy_n - 9_000.0).abs() < 1e-9);
+        assert!(backend.decel_drags(&bare).is_empty());
         assert!(
             SimpleBackend::new(terrin_env())
-                .decel_pulls(&body)
+                .decel_drags(&body)
                 .is_empty()
         );
     }
 
-    /// The reef's read-back flies a copy of the craft one tick under its
-    /// budgets and reads it as the evaluation will: that is only worth
-    /// anything if the copy's tick IS the step's. `coast_ahead_with_sites`
+    /// The budget's read-back flies a copy of the craft one tick under
+    /// its budgets and reads it as the evaluation will: that is only
+    /// worth anything if the copy's tick IS the step's. `coast_ahead`
     /// moves a body exactly as `step` does — same forces, decelerator
-    /// drag included — where `coast_ahead`, the sites taken out, does not.
+    /// action included, the canopy on the axis.
     #[test]
-    fn coast_ahead_with_sites_is_the_step_itself() {
+    fn coast_ahead_is_the_step_itself() {
         let mut backend = SimpleBackend::new(chuted_env());
         backend.set_sim_time(SimTime::from_ticks(TICK_HZ * 4));
         let mut flown = chute_box_body();
         let mut stepped = vec![chute_box_body()];
-        let mut coasted = chute_box_body();
-        backend.coast_ahead_with_sites(&mut flown);
+        let mut bare = chute_box_body();
+        backend.coast_ahead(&mut flown);
         backend.step(&mut stepped, &[]);
-        backend.coast_ahead(&mut coasted);
+        bare.decel.clear();
+        backend.integrate_free(&mut bare, None);
         let stepped = &stepped[0];
         for (name, a, b) in [
             ("pos", flown.pos, stepped.pos),
@@ -6386,13 +6564,203 @@ mod tests {
             "rot: the copy must fly the step's own tick"
         );
         assert_eq!(flown.decel.len(), 1, "the copy keeps its sites");
-        // Without the canopy the same tick falls about half a metre per
+        // Without the site the same tick falls about half a metre per
         // second faster: 69 kN on 2.1 t for 1/64 s.
         assert!(
-            coasted.vel.z < flown.vel.z - 0.4 && coasted.vel.z > flown.vel.z - 0.6,
+            bare.vel.z < flown.vel.z - 0.4 && bare.vel.z > flown.vel.z - 0.6,
             "without the site {} against with {}",
-            coasted.vel.z,
+            bare.vel.z,
             flown.vel.z
+        );
+    }
+
+    /// §3.1 rule A: a side-mounted canopy's pull acts on the craft's
+    /// axis. The same s125 canister on the pod's `+x` hull — 0.875 m
+    /// off the axis, where its own packed drag acts — and its canopy
+    /// projected onto the axis through the CoM: the step takes the
+    /// canopy's 54 kN with no lever at all, and only the canister's own
+    /// 12 kN turns the craft. Read at the mount, the canopy's pull
+    /// would turn it with both.
+    #[test]
+    fn a_side_canopys_pull_acts_on_the_crafts_axis() {
+        let env = chuted_env();
+        let backend = SimpleBackend::new(env.clone());
+        backend.set_sim_time(SimTime::from_ticks(TICK_HZ * 4));
+        let rho = atmosphere_density_kg_m3(env.atmosphere.as_ref().unwrap(), 1_500.0);
+        let packed = 0.5 * rho * 0.4 * 250.0 * 250.0;
+
+        let mut body = chute_box_body();
+        body.decel[0].local_pos = DVec3::new(0.875, 0.0, 0.0);
+        body.decel[0].axis_pos = DVec3::ZERO;
+        let (_, torque) = backend.accumulate_forces(&body);
+        assert!(
+            (torque - DVec3::new(0.0, -0.875 * packed, 0.0)).norm() < 1e-6,
+            "{torque:?}"
+        );
+
+        // The §2.4 budget reads it the same way: the canister's drag at
+        // the canister, the canopy's pull marked as the canopy's and on
+        // the axis, with the couple that steadies the hang — nothing
+        // here: the craft hangs square to the flow and is not turning.
+        let (graph, parts) = box_graph(2_100.0, DVec3::new(0.5, 0.5, 0.5));
+        let transforms = crate::weld::body_transforms(&graph, &parts).unwrap();
+        let loads = backend
+            .external_loads(&body, &graph, &parts, &[], &[], &transforms)
+            .unwrap();
+        let canister = DVec3::new(0.875, 0.0, 0.0);
+        let site = &loads[&PartNodeId(1)];
+        let packed_drag = site.iter().find(|f| f.at == canister).unwrap();
+        let canopy = site.iter().find(|f| f.canopy).unwrap();
+        assert_eq!(site.iter().filter(|f| f.canopy).count(), 1);
+        assert!(!packed_drag.canopy);
+        assert!((packed_drag.force.norm() - packed).abs() < 1e-6);
+        assert_eq!(canopy.at, DVec3::ZERO);
+        assert!((canopy.force.norm() - 54_000.0).abs() < 1e-6);
+        assert_eq!(canopy.torque, DVec3::ZERO);
+    }
+
+    /// A box under its canopy alone — the canister's own drag taken
+    /// out — leaned `tilt` about +y from a flow 250 m/s straight down,
+    /// spinning at `spin`.
+    fn hanging_box(
+        mass_kg: f64,
+        half: DVec3,
+        steering: CanopySteering,
+        tilt: f64,
+        spin: DVec3,
+    ) -> (SimpleBackend, WeldedBody) {
+        let mut backend = SimpleBackend::new(chuted_env());
+        backend.set_canopy_steering(steering);
+        backend.set_sim_time(SimTime::from_ticks(TICK_HZ * 4));
+        let mut body = box_body(mass_kg, half);
+        body.pos = DVec3::new(0.0, 0.0, TERRIN_R + 1_500.0);
+        body.vel = DVec3::new(0.0, 0.0, -250.0);
+        body.decel = vec![umbrella_site()];
+        body.decel[0].packed_drag_area_m2 = 0.0;
+        body.rot = DQuat::from_axis_angle(DVec3::Y, tilt);
+        body.ang_vel = spin;
+        (backend, body)
+    }
+
+    /// What the canopy does to a hanging box's spin, world frame about
+    /// the CoM: the step's torque with the site, less without it.
+    fn canopy_torque(backend: &SimpleBackend, body: &WeldedBody) -> DVec3 {
+        let (_, with) = backend.accumulate_forces(body);
+        let mut bare = body.clone();
+        bare.decel.clear();
+        let (_, without) = backend.accumulate_forces(&bare);
+        with - without
+    }
+
+    /// The pendulum the canopy's pull is on its own: its 54 kN on the
+    /// top mount, a quarter metre above the CoM, on a box leaned `tilt`
+    /// toward +x.
+    fn pendulum(tilt: f64) -> DVec3 {
+        DVec3::new(0.0, -0.25 * 54_000.0 * libm::sin(tilt), 0.0)
+    }
+
+    /// §3.1 rule A: a deployed canopy steadies the craft that hangs
+    /// from it, in proportion to its own pull — the couple turns the
+    /// craft's axis onto the flow and against its spin. The 2.1 t cube
+    /// under the s125's reefed 54 kN, leaned 10° and spinning, with
+    /// coefficients its inertia can follow: beyond its own pendulum the
+    /// canopy's torque is exactly `F·(arm·(axis × flow) − damp·ω)`.
+    #[test]
+    fn a_canopy_steadies_the_hang_in_proportion_to_its_pull() {
+        let (tilt, spin) = (0.1745, DVec3::new(0.3, -0.2, 0.1));
+        let (arm, damp) = (0.1, 0.01);
+        let (backend, body) = hanging_box(
+            2_100.0,
+            DVec3::new(0.5, 0.5, 0.5),
+            CanopySteering {
+                steady_arm_m: arm,
+                steady_damp_m_s: damp,
+            },
+            tilt,
+            spin,
+        );
+        let pull = 54_000.0;
+        let axis = body.rot.rotate(DVec3::Z);
+        let restoring = axis.cross(DVec3::Z) * (pull * arm);
+        let braking = body.rot.rotate(spin) * (pull * damp);
+        let torque = canopy_torque(&backend, &body);
+        assert!(
+            (torque - pendulum(tilt) - restoring + braking).norm() < 1e-6,
+            "{torque:?} against {:?}",
+            pendulum(tilt) + restoring - braking
+        );
+        // The restoring share turns the axis onto the flow: about −y,
+        // the way a lean toward +x is undone; the damping share is the
+        // spin's own opposite.
+        assert!(restoring.y < 0.0 && restoring.x == 0.0 && restoring.z == 0.0);
+        assert!(braking.dot(body.rot.rotate(spin)) > 0.0);
+    }
+
+    /// The couple is read at the start of the tick and taken as it
+    /// stands, so it is cut to what the craft's inertia can follow in
+    /// one tick. A 100 kg cube 15 cm to a side — 1.5 kg·m² about each
+    /// axis — under the same reefed pull overruns the bound with both
+    /// default shares: its couple is the bound, not the coefficients.
+    /// Flown from 250 m/s, leaned 30° and spinning at 2.3 rad/s, it
+    /// settles under its canopy where the uncut damping — thousands of
+    /// times the tick rate — would overshoot into a spin-up: the spin is
+    /// gone and the axis hangs square to the flow.
+    #[test]
+    fn the_steadying_is_cut_to_what_the_crafts_inertia_can_follow() {
+        let (mass, half) = (100.0, DVec3::new(0.15, 0.15, 0.15));
+        let (tilt, spin) = (0.1745, DVec3::new(0.3, -0.2, 0.1));
+        let (backend, body) = hanging_box(mass, half, CanopySteering::DEFAULT, tilt, spin);
+        let rate = CANOPY_STEER_RATE_LIMIT_PER_S;
+        // The cube's own moment, `m·a²/6`, about every axis.
+        let least = mass * (2.0 * half.x) * (2.0 * half.x) / 6.0;
+        assert_eq!(least, 1.5);
+        assert!(
+            54_000.0 * DEFAULT_CANOPY_STEADY_ARM_M > rate * rate * least
+                && 54_000.0 * DEFAULT_CANOPY_STEADY_DAMP_M_S > rate * least,
+            "this cube must be one the default coefficients overrun"
+        );
+        let axis = body.rot.rotate(DVec3::Z);
+        let bounded =
+            axis.cross(DVec3::Z) * (rate * rate * least) - body.rot.rotate(spin) * (rate * least);
+        let torque = canopy_torque(&backend, &body);
+        assert!(
+            (torque - pendulum(tilt) - bounded).norm() < 1e-6,
+            "{torque:?} against {bounded:?}"
+        );
+
+        let mut backend = SimpleBackend::new(chuted_env());
+        let mut bodies = vec![box_body(mass, half)];
+        let b = &mut bodies[0];
+        b.pos = DVec3::new(0.0, 0.0, TERRIN_R + 3_000.0);
+        b.vel = DVec3::new(0.0, 0.0, -250.0);
+        b.rot = DQuat::from_axis_angle(DVec3::Y, 0.5);
+        b.ang_vel = DVec3::new(2.0, 1.0, 0.5);
+        b.decel = vec![umbrella_site()];
+        for tick in 1..=2_000_u64 {
+            backend.set_sim_time(SimTime::from_ticks(tick));
+            backend.step(&mut bodies, &[]);
+            let b = &bodies[0];
+            assert!(
+                [
+                    b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z, b.rot.w
+                ]
+                .into_iter()
+                .chain([b.ang_vel.x, b.ang_vel.y, b.ang_vel.z])
+                .all(f64::is_finite),
+                "tick {tick}: the step blew up"
+            );
+        }
+        let b = &bodies[0];
+        assert!(
+            b.ang_vel.norm() < 0.01,
+            "still turning at {}",
+            b.ang_vel.norm()
+        );
+        let axis = b.rot.rotate(DVec3::Z);
+        assert!(
+            axis.z > 0.999_96 && b.vel.z < 0.0,
+            "the axis hangs {:.2} deg off the flow",
+            libm::acos(axis.z.clamp(-1.0, 1.0)).to_degrees()
         );
     }
 

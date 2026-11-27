@@ -89,7 +89,32 @@ use crate::ids::ResourceId;
 /// absorption's crush distance, the distance a landing's ground
 /// contact is read as stopping the craft over.
 /// Mirror: `csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M`.
+/// The same version ships §3.1 rule A's canopy steering,
+/// `canopy_steady_arm_m` and `canopy_steady_damp_m_s`. They are additive
+/// with defaults, not a version of their own: the frozen
+/// `flight-launch` fixture is pinned byte for byte by its golden's data
+/// hash and carries a v17 file without them, and no golden flight meets
+/// a deployed canopy. A file that carries neither field loads at the
+/// shipped values.
 pub const BALANCE_SCHEMA_VERSION: u32 = 17;
+
+/// §3.1 rule A's default steadying arm of a deployed canopy, metres —
+/// what a `balance.ron` without `canopy_steady_arm_m` loads.
+/// Mirror: `csp_phys::DEFAULT_CANOPY_STEADY_ARM_M`.
+pub const DEFAULT_CANOPY_STEADY_ARM_M: f64 = 1.0;
+/// §3.1 rule A's default steadying damping of a deployed canopy,
+/// metres·seconds — what a `balance.ron` without
+/// `canopy_steady_damp_m_s` loads.
+/// Mirror: `csp_phys::DEFAULT_CANOPY_STEADY_DAMP_M_S`.
+pub const DEFAULT_CANOPY_STEADY_DAMP_M_S: f64 = 0.15;
+
+fn default_canopy_steady_arm_m() -> f64 {
+    DEFAULT_CANOPY_STEADY_ARM_M
+}
+
+fn default_canopy_steady_damp_m_s() -> f64 {
+    DEFAULT_CANOPY_STEADY_DAMP_M_S
+}
 
 /// `data/balance.ron` — the tunables every later milestone consumes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -354,4 +379,32 @@ pub struct BalanceDef {
     /// a longer crush would spread any impact short of 640 m/s.
     /// Mirror: `csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M`.
     pub touchdown_crush_m: f64,
+    /// §3.1 rule A: the restoring arm of a deployed canopy, metres. A
+    /// canopy steadies the craft that hangs from it with a couple
+    /// proportional to its own pull: this is the share that turns the
+    /// craft's axis onto the airflow — the torque the pull would give a
+    /// lever of this length along the axis above where the craft takes
+    /// it. `0` leaves the hang to the pull's own pendulum. Authored 1.0:
+    /// beside the pendulum of a canopy taken metres above the CoM it is
+    /// a small share of a stack's hang, and all of a pod's that hangs
+    /// from its own centre — a pod alone under a radial chute sits 3.2°
+    /// off the flow under it, 10.5° under a 0.3 m arm. A 2 m arm breaks
+    /// the lower stack off the Stock Hopper at the catch from a 20 km
+    /// apogee.
+    /// Mirror: `csp_phys::DEFAULT_CANOPY_STEADY_ARM_M`.
+    #[serde(default = "default_canopy_steady_arm_m")]
+    pub canopy_steady_arm_m: f64,
+    /// §3.1 rule A: the steadying damping of a deployed canopy,
+    /// metres·seconds — the share of the same couple that opposes the
+    /// craft's spin: this times the pull times the angular speed. `0`
+    /// leaves the spin to the air: with neither share the Stock Hopper
+    /// tumbles in from a 70 km apogee. Authored 0.15: under it the
+    /// craft arrives from there within half a degree of the flow and
+    /// with no spin to speak of; 0.3 beside a 1 m arm breaks the lower
+    /// stack off at the catch. No value is unstable: the backend cuts
+    /// the couple to what the craft's inertia can follow in a tick
+    /// (`csp_phys`'s `CANOPY_STEER_RATE_LIMIT_PER_S`).
+    /// Mirror: `csp_phys::DEFAULT_CANOPY_STEADY_DAMP_M_S`.
+    #[serde(default = "default_canopy_steady_damp_m_s")]
+    pub canopy_steady_damp_m_s: f64,
 }

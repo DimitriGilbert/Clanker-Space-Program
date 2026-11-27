@@ -1803,6 +1803,7 @@ fn rebuild_from_snapshot(
     // `restore` consumes the struct, then re-anchor the session on it
     // below instead of falling to `vessels.last()`'s newest-spawn rule.
     let restored_focus = snapshot.active_vessel;
+    let canopy_steering = view.sim.canopy_steering();
     let config = view.sim.config();
     let mut sim = SimWorld::restore(
         csp_sim::orbit::PatchedConics::new(config.orbits.clone()),
@@ -1810,6 +1811,12 @@ fn rebuild_from_snapshot(
         snapshot,
     )?;
     sim.install_config(&config);
+    // The canopy steering is construction config the snapshot and the
+    // config it restores under cannot carry (`SimpleBackend`'s, not the
+    // `Environment`'s): the world being replaced hands it on.
+    if let Some(steering) = canopy_steering {
+        sim.set_canopy_steering(steering);
+    }
     sim.set_script_engine(Box::new(csp_script::RhaiHost::new()));
     sim.set_autopilot_driver(Box::new(csp_ai::AscentAutopilot::new()));
     let warnings: Vec<String> = sim
@@ -2042,6 +2049,14 @@ fn build_sim_from_dataset(d: &LoadedDataset, save_seed: u64) -> Result<SimWorld,
     sim.set_docking_config(csp_sim::DockingConfig::from_balance(balance))
         .map_err(ViewError::Sim)?;
     sim.set_transfer_config(csp_sim::TransferConfig::from_balance(balance));
+    // §3.1 rule A: how a deployed canopy steadies the craft that hangs
+    // from it — authored the same way, on the backend's own channel (a
+    // world restored from a snapshot runs the build's values until
+    // `rebuild_from_snapshot` carries these over).
+    sim.set_canopy_steering(csp_phys::CanopySteering {
+        steady_arm_m: balance.canopy_steady_arm_m,
+        steady_damp_m_s: balance.canopy_steady_damp_m_s,
+    });
     // M9b §3.4: the reliability tunables — dormant scale,
     // ignition window, effect magnitudes, test-stand economics.
     sim.set_reliability_config(csp_sim::ReliabilityConfig::from_balance(balance));

@@ -3132,6 +3132,33 @@ impl World {
         self.physics.as_ref().map(|p| &p.dominant)
     }
 
+    /// §3.1 rule A: how a deployed canopy steadies the craft that hangs
+    /// from it — post-construction setter for worlds built from
+    /// `balance.ron` ([`View`](csp_view)-side startup, `csp-bench`
+    /// scenario setup). A construction-config write like
+    /// [`Self::set_vessel_caps`]: call before the first `step_frame`.
+    ///
+    /// Construction config, never hashed or serialized. The §7.6 replay
+    /// artifacts embed the [`csp_phys::Environment`], and a field added
+    /// there stops the committed goldens decoding — so the steering is
+    /// not an environment field, and a world restored from an artifact
+    /// runs the build's own [`csp_phys::CanopySteering::DEFAULT`] (the
+    /// shipped file's values) until a host installs the authored ones:
+    /// a host that builds from data reads them off its `balance.ron`, and
+    /// one that swaps in a snapshot (`csp-view`'s `rebuild_from_snapshot`)
+    /// carries them over from the world it replaces.
+    pub fn set_canopy_steering(&mut self, steering: csp_phys::CanopySteering) {
+        if let Some(physics) = self.physics.as_mut() {
+            physics.backend.set_canopy_steering(steering);
+        }
+    }
+
+    /// The canopy steering the bubble steps under — `None` without
+    /// physics.
+    pub fn canopy_steering(&self) -> Option<csp_phys::CanopySteering> {
+        self.physics.as_ref().map(|p| p.backend.canopy_steering())
+    }
+
     /// The §2.9 geometric ground-contact predicate applied on demand
     /// to `vessel`'s bubble body — `false` for non-`InBubble` vessels
     /// and worlds without physics. Pure geometry over already-hashed
@@ -4568,9 +4595,9 @@ impl World {
                 if drive_node_burn(&mut vessel.maneuver, body) {
                     burns_done.insert(*vid);
                 }
-                // §3.1 pull-path reef: bound the decelerator sites'
-                // drag by what this tick's other loads leave every
-                // joint, before physics reads them.
+                // §3.1: bound what the decelerator sites drag with by
+                // what this tick's other loads leave every joint, before
+                // physics reads them.
                 if let Some(craft) = &vessel.craft {
                     reef_pull_budgets(&physics.backend, body, craft)?;
                 }
@@ -9446,7 +9473,7 @@ fn structural_tick(
 /// vessel's own sites apply to each node (aero, thrust, gravity, the
 /// decelerator sites' drag, the contact impulses and water loads the
 /// records hand in), body frame. [`structural_tick`] passes the
-/// backend's records for the stepped body; the pull-path reef's
+/// backend's records for the stepped body; the decelerator budgets'
 /// read-back ([`pull_readback`]) passes none for a copy it stepped
 /// itself. `Fatal` on a contract violation — the in-range channel.
 fn external_budget(
@@ -9501,13 +9528,18 @@ fn measured_loads(
 /// deployed record — one site per parachute-carrying node, with the
 /// deploy/open ticks converted to sim seconds and the canopy reef
 /// bound derived from the node's authored `StructuralDef`.
+///
+/// Rule A — a chute on any mount lands the craft: a deployed canopy's
+/// pull acts on the craft's longitudinal axis and never at its mount,
+/// the line through the root part's centre along its own +z (the axis
+/// its stack nodes are authored on), every site projected onto it.
 /// Recomputed wholesale every
 /// tick (a pure function of `(craft, deployed)`), so every body
 /// mutation path — spawn, restore, `to_bubble`, unlatch, jettison,
 /// breakup, undock, latch merge, and the mass-bucket re-weld — sees
 /// the same sites with zero per-path bookkeeping; `WeldedBody::decel`
-/// is `#[serde(skip)]` for exactly this reason. The pull-path budget
-/// is not the craft's to give: the sites start each tick unbounded and
+/// is `#[serde(skip)]` for exactly this reason. The budgets are not the
+/// craft's to give: the sites start each tick unbounded and
 /// [`reef_pull_budgets`] fills them in from the tick's other loads.
 fn refresh_decel_sites(
     body: &mut WeldedBody,
@@ -9524,6 +9556,7 @@ fn refresh_decel_sites(
     let Ok(transforms) = csp_phys::weld::body_transforms(&craft.graph, &craft.parts) else {
         return;
     };
+    let axis = craft_axis(&craft.graph, &transforms);
     for (id, node) in &craft.graph.nodes {
         let Some(ep) = craft.parts.get(node.effective_index as usize) else {
             continue;
@@ -9532,11 +9565,14 @@ fn refresh_decel_sites(
             continue;
         };
         let local_pos = transforms[id].apply(ep.com);
+        let axis_pos = axis.point + axis.dir * ((local_pos - axis.point).dot(axis.dir));
         let s = &ep.structural;
         let rec = deployed.get(id);
         body.decel.push(csp_phys::DecelSite {
             node: *id,
             local_pos,
+            axis_pos,
+            axis_dir: axis.dir,
             packed_drag_area_m2: spec.packed_drag_area_m2,
             deployed_drag_area_m2: spec.deployed_drag_area_m2,
             deploy_alt_m: spec.deploy_alt_m,
@@ -9547,74 +9583,78 @@ fn refresh_decel_sites(
                 .and_then(|r| r.opened_tick)
                 .map(|t| SimTime::from_ticks(t).seconds()),
             reef_n: s.max_axial_n.min(s.max_shear_n) * DECEL_REEF_MARGIN,
-            reef_torque_nm: s.max_torque_nm * DECEL_REEF_MARGIN,
-            // The lever runs from the joint's attach point to the site —
-            // the `p_J` the joint eval's own torque arm measures about
-            // (`PartNode::attach_point`; C14-F4), never the node origin:
-            // that is the part's centre for every box and cylinder, a
-            // lever of zero that left the torque channel out of the reef
-            // and let a radial mount's canopy tear it off. The backend
-            // spends the torque bound only across the pull.
-            reef_lever: local_pos - node.attach_point(*id, &transforms),
-            pull_budget_n: f64::INFINITY,
+            packed_budget_n: f64::INFINITY,
+            canopy_budget_n: f64::INFINITY,
         });
     }
 }
 
-/// The pull-path reef (C14-F1's companion): what this tick's other
-/// loads leave every §3.1 decelerator site of the body, written into
-/// [`csp_phys::DecelSite::pull_budget_n`] for the step about to read it
-/// — in two readings. The model's ([`pull_first_pass`]):
-/// [`csp_phys::JointModel::pull_budgets`] over the body's sites
+/// The craft's longitudinal axis (§3.1 rule A), body frame: the line
+/// through the root part's centre (`point`) along its own `+z` (`dir`,
+/// unit) — the axis a stack part's `top` and `bottom` nodes are
+/// authored on, so a craft built in the editor stands on it.
+struct CraftAxis {
+    point: DVec3,
+    dir: DVec3,
+}
+
+/// [`CraftAxis`] of the craft `transforms` is the skeleton of.
+fn craft_axis(
+    graph: &csp_phys::PartGraph,
+    transforms: &BTreeMap<csp_phys::PartNodeId, csp_phys::PartTransform>,
+) -> CraftAxis {
+    CraftAxis {
+        point: transforms[&graph.root].offset,
+        dir: transforms[&graph.root].apply_dir(DVec3::Z),
+    }
+}
+
+/// The decelerator budgets (C14-F1's companion): what this tick's
+/// other loads leave every term of every §3.1 decelerator site of the
+/// body, written into [`csp_phys::DecelSite::packed_budget_n`] and
+/// [`csp_phys::DecelSite::canopy_budget_n`] for the step about to read
+/// it — in two readings. The model's ([`pull_first_pass`]):
+/// [`csp_phys::JointModel::pull_budgets`] over the body's terms
 /// together. Then the evaluation's ([`pull_readback`]): a copy of the
 /// craft flown one tick under those budgets and read with the §2.4
 /// evaluation's own arithmetic, the budgets cut to what that reading
 /// leaves, twice over.
 ///
-/// The model's rest is every external force but the sites' own drag,
-/// read off a probe of the body with its sites taken out
-/// (`external_loads`: aero, thrust, gravity — the solved contacts are
-/// the step's to produce), and the pull the flow direction the
-/// backend's own force accumulation reads. It is read twice: where the
-/// forces act, and one tick on ([`csp_phys::SimpleBackend::coast_ahead`],
-/// the backend's own step of the probe under them) — the §2.4
-/// evaluation reads its aero at the pose the step lands in, and a stack
-/// swinging under an off-axis canopy turns a degree a tick, which moved
-/// that reading 5% of a joint's limit. The lesser budget is the site's.
+/// Each term is bounded where it acts, and the two do not act alike.
+/// A canister's own drag acts where the canister is, so off the craft's
+/// axis it is a pitch moment on every joint below the mount: on the
+/// Stock Hopper at 250 m/s its 12 kN broke the stack on the spawn tick,
+/// before any canopy opened. The canopy's pull acts on the craft's axis
+/// (rule A) and levers nothing through the mount, but it levers the
+/// hang: a canopy catching on a craft that leans turns the whole stack
+/// about the CoM at its first tick, and the joints below carry the
+/// turn. Unbounded, the Stock Hopper broke at the 16 km gate from a
+/// 20 km apogee, its top chute catching 18° off the flow. Aligned, a
+/// canopy's budget is far past anything its mount's reef lets through
+/// and never binds — the mount's lever no longer starves it.
 ///
-/// The sites are budgeted together, because they pull together. Read
-/// one at a time, each took what the stack takes from ONE chute: two
-/// radial chutes on the Stock Hopper turned the battery joint with the
-/// sum of both pulls and met its torque rating (99.9%) 3.5 s after
-/// their catch, and broke the lower stack off the pod. Now every
-/// site's own budget carries the one scale that keeps every joint
-/// inside the derate with all of them pulling.
+/// The terms are budgeted together, because they drag together. Read
+/// one at a time, two radial canisters on the Stock Hopper loaded the
+/// battery joint with the sum of both pulls and met its torque rating
+/// 3.5 s after their catch. Now every term's own budget carries the one
+/// scale that keeps every joint inside the derate with all of them
+/// dragging.
 ///
 /// The model is an approximation of the evaluation — the rest under a
 /// rigid response it derives itself, the spin terms read at the
-/// pre-step spin — and under a swinging stack it reads low. With its
-/// top chute and one radial canister the Stock Hopper's model held the
-/// battery joint at 90% for ticks on end while the evaluation read 91%
-/// rising through 100%, and the lower stack broke off 1.2 to 7.3 s
-/// after the catch from every apogee from 20 km to 70 km, the radial
-/// canopy deployed or the canister packed; the model was LOOSENING the
-/// top site as the swing built (26 kN to 56 kN) — its rest load moves
-/// with the swing one way, the evaluation's another.
-/// Read back, the model's own budgets stood at 91% to 120% of that
-/// joint. So the reef no longer trusts the model for the last word:
-/// [`pull_readback`] flies a copy of the craft under the budgets the
-/// step is about to use and reads it exactly as the evaluation will,
-/// and every finite budget takes the one scale that brings that
-/// reading back inside the derate. Twice, because the reading is not
-/// linear in the scale — the smaller pull moves the craft it is read
-/// under — and the cut lands on what each site can actually pull, not
-/// on the stamp: a budget above the site's own pull (the mount's reef
-/// caps the canopy under it) is cut in name only, and left the top
-/// site pulling its capped 38 kN under a budget falling from 49.7 to
-/// 39.6 kN while the joint it loads read 101% and let go.
+/// pre-step spin, a canopy's damping left out of it on purpose
+/// ([`csp_phys::JointModel::pull_budgets`]) — and under a swinging stack
+/// it reads low. So the budget does not trust the model for the last
+/// word: [`pull_readback`] flies a copy of the craft under the budgets
+/// the step is about to use and reads it exactly as the evaluation will,
+/// and every finite budget takes the one scale that brings that reading
+/// back inside the derate. Twice, because the reading is not linear in
+/// the scale — the smaller drag moves the craft it is read under — and
+/// the cut lands on what each term actually drags, not on the stamp: a
+/// budget above the drag is cut in name only.
 ///
 /// Without atmospheric flow no site drags: the sites keep the unbounded
-/// budget the refresh stamps and there is nothing to bound.
+/// budgets the refresh stamps and there is nothing to bound.
 fn reef_pull_budgets(
     backend: &csp_phys::SimpleBackend,
     body: &mut WeldedBody,
@@ -9628,32 +9668,40 @@ fn reef_pull_budgets(
     let Some(first) = pull_first_pass(backend, body, craft, &transforms)? else {
         return Ok(());
     };
-    for (site, budget) in body.decel.iter_mut().zip(first) {
-        site.pull_budget_n = budget;
+    for (site, (packed, canopy)) in body.decel.iter_mut().zip(first) {
+        site.packed_budget_n = packed;
+        site.canopy_budget_n = canopy;
     }
     for _ in 0..2 {
         let scale = pull_readback(backend, body, craft, &transforms)?;
         if scale >= 1.0 {
             break;
         }
-        // The cut lands on what each site can actually pull: the drag
-        // it applies now is the lesser of its budget and what it can
-        // pull, so scaling that is scaling the pull the step takes.
-        let pulls = backend.decel_pulls(body);
-        for (site, pull) in body.decel.iter_mut().zip(pulls) {
-            if site.pull_budget_n.is_finite() {
-                site.pull_budget_n = scale * pull;
+        // The cut lands on what each term actually drags: the lesser of
+        // its budget and its own drag, so scaling that is scaling the
+        // drag the step takes.
+        let drags = backend.decel_drags(body);
+        for (site, drag) in body.decel.iter_mut().zip(drags) {
+            if site.packed_budget_n.is_finite() {
+                site.packed_budget_n = scale * drag.packed_n;
+            }
+            if site.canopy_budget_n.is_finite() {
+                site.canopy_budget_n = scale * drag.canopy_n;
             }
         }
     }
     Ok(())
 }
 
-/// The pull-path reef's first reading ([`reef_pull_budgets`]): the
-/// joint-load model's own budget for every site, in `body.decel`'s
-/// order — [`csp_phys::JointModel::pull_budgets`] over the sites
-/// together, read where the forces act and one tick on, the lesser of
-/// the two. `None` without atmospheric flow — the same gate the force
+/// The decelerator budgets' first reading ([`reef_pull_budgets`]): the
+/// joint-load model's own budget for every term of the body's sites, in
+/// the sites' order — each site's packed term, then its canopy's, read
+/// where the craft takes it and by the arm it restores with —
+/// [`csp_phys::JointModel::pull_budgets`] over the terms together, read
+/// where the forces act and one tick on, the lesser of the two. A site
+/// with no packed area has no packed term and one whose canopy has not
+/// caught has none either: an unbounded budget for a term that does not
+/// drag. `None` without atmospheric flow — the same gate the force
 /// model applies, when no site drags at all. `Fatal` on a contract
 /// violation — the in-range channel.
 fn pull_first_pass(
@@ -9661,9 +9709,9 @@ fn pull_first_pass(
     body: &WeldedBody,
     craft: &CraftDef,
     transforms: &BTreeMap<csp_phys::PartNodeId, csp_phys::PartTransform>,
-) -> Result<Option<Vec<f64>>, SimError> {
+) -> Result<Option<Vec<(f64, f64)>>, SimError> {
     let fatal = |e: csp_phys::WeldError| SimError::Fatal(e.reason());
-    let Some(drag) = backend.decel_pull(body).map(|pull| pull * -1.0) else {
+    let Some(drag) = backend.decel_pull_dir(body).map(|pull| pull * -1.0) else {
         return Ok(None);
     };
     // The body without its sites, and the loads on it where they act.
@@ -9673,7 +9721,10 @@ fn pull_first_pass(
     // ... and one tick on, under them alone.
     backend.coast_ahead(&mut probe);
     let ahead = external_budget(backend, &probe, craft, &[], &[], transforms)?;
-    let drag_ahead = backend.decel_pull(&probe).map_or(drag, |pull| pull * -1.0);
+    let drag_ahead = backend
+        .decel_pull_dir(&probe)
+        .map_or(drag, |pull| pull * -1.0);
+    let drags = backend.decel_drags(body);
     // The forces the step integrates, said in the frame the step lands
     // in — what the evaluation reads the loads beside.
     let frame = probe.rot.conjugate() * body.rot;
@@ -9688,6 +9739,7 @@ fn pull_first_pass(
                         force: frame.rotate(f.force),
                         torque: frame.rotate(f.torque),
                         ground: f.ground,
+                        canopy: f.canopy,
                     })
                     .collect(),
             )
@@ -9695,46 +9747,81 @@ fn pull_first_pass(
         .collect();
     let model = csp_phys::JointModel::new(body, &craft.graph, &craft.parts, transforms);
     let model_ahead = csp_phys::JointModel::new(&probe, &craft.graph, &craft.parts, transforms);
-    // Every site pulling the `drag` way, in `body.decel`'s order.
-    let sites = |drag: DVec3| {
+    // Every term the body's sites drag with, in the sites' order — the
+    // canister's own at the canister, the canopy's on the axis, carried
+    // up it by the arm its steadying restores with — each pulling the
+    // `drag` way.
+    let terms = |drag: DVec3| {
         body.decel
             .iter()
-            .map(|site| csp_phys::PullSite {
-                node: site.node,
-                pos: site.local_pos,
-                drag,
+            .zip(&drags)
+            .flat_map(|(site, drag_with)| {
+                [
+                    (site.packed_drag_area_m2 > 0.0).then_some(csp_phys::PullSite {
+                        node: site.node,
+                        pos: site.local_pos,
+                        drag,
+                    }),
+                    site.open_at_s.is_some().then_some(csp_phys::PullSite {
+                        node: site.node,
+                        pos: site.axis_pos + site.axis_dir * drag_with.steer_arm_m,
+                        drag,
+                    }),
+                ]
+                .into_iter()
+                .flatten()
             })
             .collect::<Vec<_>>()
     };
     let here = model
-        .pull_budgets(&rest, &rest, &sites(drag), DECEL_REEF_MARGIN)
+        .pull_budgets(&rest, &rest, &terms(drag), DECEL_REEF_MARGIN)
         .map_err(fatal)?;
     let there = model_ahead
-        .pull_budgets(&ahead, &response, &sites(drag_ahead), DECEL_REEF_MARGIN)
+        .pull_budgets(&ahead, &response, &terms(drag_ahead), DECEL_REEF_MARGIN)
         .map_err(fatal)?;
-    Ok(Some(
-        here.into_iter()
-            .zip(there)
-            .map(|(here, there)| here.min(there))
-            .collect(),
-    ))
+    let least: Vec<f64> = here
+        .into_iter()
+        .zip(there)
+        .map(|(here, there)| here.min(there))
+        .collect();
+    let mut least = least.into_iter();
+    let budgets = body
+        .decel
+        .iter()
+        .map(|site| {
+            let packed = if site.packed_drag_area_m2 > 0.0 {
+                least.next().unwrap_or(f64::INFINITY)
+            } else {
+                f64::INFINITY
+            };
+            let canopy = if site.open_at_s.is_some() {
+                least.next().unwrap_or(f64::INFINITY)
+            } else {
+                f64::INFINITY
+            };
+            (packed, canopy)
+        })
+        .collect();
+    Ok(Some(budgets))
 }
 
-/// The pull-path reef's second reading ([`reef_pull_budgets`]): a copy
-/// of `body` — its sites carrying the budgets to check — flown one
-/// tick under them ([`csp_phys::SimpleBackend::coast_ahead_with_sites`],
-/// the backend's own step with the decelerator drag kept: the step
-/// about to run, wherever no contact and no water stands behind it),
-/// its joints read with the §2.4 evaluation's own arithmetic
-/// ([`external_budget`], [`measured_loads`] — no solve stands behind
-/// the copy, so it hands no contact or touchdown record), and the one
-/// scale that brings the reading back inside the derate: the least
-/// `DECEL_REEF_MARGIN × limit / reading` over the three channels of
-/// every joint that is not a site's own mount, capped at `1` — a
-/// reading already inside the derate leaves the budgets as they are.
-/// The mount is its canopy's reef's to hold
-/// ([`csp_phys::DecelSite::reef_n`] and co), as in the model. `Fatal`
-/// on a contract violation — the in-range channel.
+/// The decelerator budgets' second reading ([`reef_pull_budgets`]): a
+/// copy of `body` — its sites carrying the budgets to check — flown one
+/// tick under them ([`csp_phys::SimpleBackend::coast_ahead`], the
+/// backend's own step: the step about to run, wherever no contact and
+/// no water stands behind it), its joints read with the §2.4
+/// evaluation's own arithmetic ([`external_budget`], [`measured_loads`]
+/// — no solve stands behind the copy, so it hands no contact or
+/// touchdown record), and the one scale that brings the reading back
+/// inside the derate: the least `DECEL_REEF_MARGIN × limit / reading`
+/// over the three channels of every joint that is not a site's own
+/// mount, capped at `1` — a reading already inside the derate leaves
+/// the budgets as they are. The reading is the whole tick's, the
+/// canopies' steadying included: a joint the swing has brought near its
+/// limit has that much less room for anything the sites drag with. The
+/// mount is its canopy's reef's to hold
+/// ([`csp_phys::DecelSite::reef_n`]), as in the model. `Fatal` on a
+/// contract violation — the in-range channel.
 fn pull_readback(
     backend: &csp_phys::SimpleBackend,
     body: &WeldedBody,
@@ -9743,7 +9830,7 @@ fn pull_readback(
 ) -> Result<f64, SimError> {
     let mut flown = body.clone();
     let (v0, w0) = (flown.vel, flown.ang_vel);
-    backend.coast_ahead_with_sites(&mut flown);
+    backend.coast_ahead(&mut flown);
     let ext = external_budget(backend, &flown, craft, &[], &[], transforms)?;
     let (_, loads) = measured_loads(&flown, craft, &ext, v0, w0, None, transforms)?;
     let mut scale: f64 = 1.0;
@@ -9773,12 +9860,13 @@ fn pull_readback(
     Ok(scale)
 }
 
-/// §3.1 decelerator reef derate (C14-F1): the canopy is clamped to
-/// this fraction of the mount's weakest channel — force or torque
-/// over the arm the pull sees — and the site's whole drag to this
-/// fraction of what every other joint on its pull path takes, a
-/// working-load derate so the joint eval's inertia/weight addends on
-/// top of the bounded canopy load cannot push a channel over its
+/// §3.1 decelerator reef derate (C14-F1): a working load this fraction
+/// of an authored limit. The canopy is clamped to it as a force — this
+/// fraction of its mount's weaker force channel — and so is every term
+/// a site drags with, the canister's own and its canopy's, to this
+/// fraction of what every other joint of the craft takes of it where it
+/// acts: a working-load derate so the joint eval's inertia/weight
+/// addends on top of the bounded load cannot push a channel over its
 /// authored limit.
 const DECEL_REEF_MARGIN: f64 = 0.9;
 
@@ -17358,18 +17446,6 @@ mod tests {
         /// The speed the stack was falling at the tick it first lost
         /// a node — `None` when it held together.
         broke_at_mps: Option<f64>,
-        /// The first node it lost — `None` when it held together.
-        first_loss: Option<FirstLoss>,
-        /// The worst share of its limits each joint carried while the
-        /// craft was whole — from deployment to the first node it lost.
-        peak: Vec<JointShare>,
-        /// The worst share of its limits each joint carried while the
-        /// craft was whole and no tick of the ground had moved it yet:
-        /// the descent itself, touchdown aside.
-        air_peak: Vec<JointShare>,
-        /// A node went on a tick the ground had not moved the craft:
-        /// it came apart in the air.
-        lost_in_air: bool,
         /// The nodes the vessel had when the descent ended.
         end_nodes: usize,
         /// The tick the ground first moved the craft: the nodes it had
@@ -17382,18 +17458,6 @@ mod tests {
         /// local vertical (degrees) before the tick the ground first
         /// moved it. `None` when it never met the ground in the bubble.
         arrival: Option<(f64, f64)>,
-    }
-
-    /// The first node a descent lost.
-    #[derive(Debug)]
-    struct FirstLoss {
-        /// The stack's speed that tick, m/s.
-        speed_mps: f64,
-        /// Its lowest point above the surface before that tick's step, m.
-        clearance_m: f64,
-        /// The ground moved the craft that tick ([`ground_moved`]): it
-        /// came apart at touchdown, not in the air.
-        ground: bool,
     }
 
     /// Whether the ground moved `handle`'s body in the step just taken:
@@ -17419,8 +17483,6 @@ mod tests {
         /// Its altitude and speed.
         alt: f64,
         speed: f64,
-        /// Its lowest point above the surface, m.
-        clearance: f64,
         /// The stack's axis and the direction of the local vertical —
         /// its tilt if this is the tick it meets the ground.
         axis: DVec3,
@@ -17441,7 +17503,6 @@ mod tests {
             w0: body.ang_vel,
             alt: body.com_world().norm() - TERRIN_R,
             speed: body.vel.norm(),
-            clearance: clearance_m(w, body),
             axis: body.rot.rotate(DVec3::Z),
             up: body.com_world() - center,
         }
@@ -17505,23 +17566,6 @@ mod tests {
         arrival.get_or_insert(arrived);
         let slot = touchdown.get_or_insert_with(|| (before.speed, Vec::new()));
         fold_shares(&mut slot.1, shares);
-    }
-
-    /// The craft's lowest collider vertex above the surface, metres —
-    /// how far it is from touchdown, read off the body's pose.
-    fn clearance_m(w: &World, body: &csp_phys::WeldedBody) -> f64 {
-        let env = w.physics.as_ref().unwrap().backend.environment();
-        let seconds = w.clock().seconds();
-        body.collider
-            .hulls
-            .iter()
-            .flat_map(|h| &h.vertices)
-            .map(|v| {
-                let rel = body.pos + body.rot.rotate(*v) - env.body_center;
-                let d = rel.norm();
-                d - env.surface_radius(rel / d, seconds)
-            })
-            .fold(f64::INFINITY, f64::min)
     }
 
     /// A whole craft's per-joint peaks as shares of each limit — axial,
@@ -17645,9 +17689,6 @@ mod tests {
         let mut opening = None;
         let mut min_nodes = nodes;
         let mut broke_at_mps = None;
-        let mut first_loss = None;
-        let (mut peak, mut air_peak): (Vec<JointShare>, Vec<JointShare>) = (Vec::new(), Vec::new());
-        let mut lost_in_air = false;
         let (mut opening_ticks, mut touchdown, mut first_ground, mut arrival) =
             (0_u64, None, None, None);
         for _ in 0..64 * 3_600 {
@@ -17672,22 +17713,9 @@ mod tests {
             let tick = eval_step(&w, body, craft, before.v0, before.w0);
             let shares = joint_shares(craft, &tick.loads);
             let ground = tick.ground || ground_moved(&physics.backend, body, handle);
-            let whole = craft.graph.nodes.len() == nodes;
             if craft.graph.nodes.len() < min_nodes {
                 min_nodes = craft.graph.nodes.len();
-                lost_in_air |= !ground;
                 broke_at_mps = Some(before.speed);
-                first_loss.get_or_insert(FirstLoss {
-                    speed_mps: before.speed,
-                    clearance_m: before.clearance,
-                    ground: ground_moved(&physics.backend, body, handle),
-                });
-            }
-            if whole {
-                fold_shares(&mut peak, &shares);
-                if !ground {
-                    fold_shares(&mut air_peak, &shares);
-                }
             }
             if body.decel.iter().any(|s| s.open_at_s.is_some()) {
                 note_opening(&mut opening, &mut opening_ticks, &before, &shares);
@@ -17717,10 +17745,6 @@ mod tests {
                 Some(VesselState::SurfaceLatched(_))
             ),
             broke_at_mps,
-            first_loss,
-            peak,
-            air_peak,
-            lost_in_air,
             end_nodes,
             first_ground,
             arrival,
@@ -17757,6 +17781,92 @@ mod tests {
         propellant_left: f64,
     ) -> Descent {
         hopper_flight(mounts, stack, alt_m, speed_mps, propellant_left).1
+    }
+
+    /// One flight of rule A's acceptance matrix, as it is reported:
+    /// how the craft arrived and what every joint carried.
+    #[derive(Debug)]
+    struct Landing {
+        /// The flight it was, for the report.
+        label: String,
+        /// The craft's node count when it flew.
+        nodes: usize,
+        /// The fewest nodes the vessel ever had.
+        min_nodes: usize,
+        /// The worst share of its limits any joint carried over the
+        /// second after a canopy caught.
+        opening_worst: f64,
+        /// The speed the craft met the ground with, m/s.
+        touchdown_mps: f64,
+        /// How it arrived: its spin (rad/s) and its tilt off the local
+        /// vertical (degrees) before the tick the ground first moved it.
+        arrival: Option<(f64, f64)>,
+        /// The worst share of its limits any joint carried from the
+        /// first tick the ground moved the craft until it came to rest.
+        touchdown_worst: f64,
+        /// It came to rest latched.
+        latched: bool,
+    }
+
+    /// A [`Descent`] as a [`Landing`], for a craft of `nodes` nodes.
+    fn landing(label: &str, nodes: usize, d: &Descent) -> Landing {
+        Landing {
+            label: label.to_string(),
+            nodes,
+            min_nodes: d.min_nodes,
+            opening_worst: worst_share(&d.opening.2),
+            touchdown_mps: d.touchdown.0,
+            arrival: d.arrival,
+            touchdown_worst: worst_share(&d.touchdown.1),
+            latched: d.latched,
+        }
+    }
+
+    /// One line of the acceptance matrix.
+    fn print_landing(l: &Landing) {
+        let (spin, tilt) = l.arrival.unwrap_or((f64::NAN, f64::NAN));
+        println!(
+            "{} | {:.2} m/s, {:.1} deg, {:.3} rad/s | {:.0}% / {:.0}% | {}/{} nodes, latched {}",
+            l.label,
+            l.touchdown_mps,
+            tilt,
+            spin,
+            l.opening_worst * 100.0,
+            l.touchdown_worst * 100.0,
+            l.min_nodes,
+            l.nodes,
+            l.latched
+        );
+    }
+
+    /// The matrix's verdict on a flight: every node held to touchdown
+    /// and the craft latched.
+    fn assert_landed(l: &Landing) {
+        assert_eq!(l.min_nodes, l.nodes, "{}: a node was lost", l.label);
+        assert!(l.latched, "{}: the craft never latched", l.label);
+    }
+
+    /// The arrival half of the matrix's verdict: the craft hung square to
+    /// the flow and came in under canopy speed — within five degrees of
+    /// the vertical (the stacks within one; a pod alone under a radial
+    /// chute, whose canopy is its only pendulum, at 3.2), with no spin to
+    /// speak of, slower than the crush distance absorbs.
+    fn assert_hangs(l: &Landing) {
+        let (spin, tilt) = l
+            .arrival
+            .unwrap_or_else(|| panic!("{}: the craft never met the ground", l.label));
+        assert!(
+            l.touchdown_mps < 8.0,
+            "{}: touchdown at {} m/s",
+            l.label,
+            l.touchdown_mps
+        );
+        assert!(
+            tilt < 5.0,
+            "{}: arrived {tilt:.1} deg off the vertical",
+            l.label
+        );
+        assert!(spin < 0.02, "{}: arrived spinning at {spin} rad/s", l.label);
     }
 
     /// The session's node carrying the part `part_id`.
@@ -17843,36 +17953,31 @@ mod tests {
     }
 
     /// The chute's site as the tick flies it: the reef the mount's
-    /// ratings leave — 54 kN of force, 7.2 kN·m of torque — over the
-    /// 0.25 m lever from the joint's attach point to the canister's
-    /// centre: along the stack for the top mount, radial for the side
-    /// one. Before M4c that lever ran to the node's ORIGIN — the part's
-    /// centre, zero for every box and cylinder — so the torque channel
-    /// never entered the reef.
+    /// ratings leave — 54 kN of force — and where the craft takes the
+    /// canopy: its projection on the craft's axis, the root part's
+    /// centre line along +z. A top mount sits on it already; the radial
+    /// one, 0.875 m out at the pod's mid-height, is taken at the pod's
+    /// centre.
     #[test]
-    fn chute_reef_lever_runs_from_the_joints_attach_point() {
-        for (mount, lever) in [
-            (ChuteMount::Top, DVec3::new(0.0, 0.0, 0.25)),
-            (SIDE, DVec3::new(0.25, 0.0, 0.0)),
+    fn chute_sites_carry_the_mounts_reef_and_project_onto_the_crafts_axis() {
+        for (mount, off_axis) in [
+            (ChuteMount::Top, DVec3::ZERO),
+            (SIDE, DVec3::new(0.875, 0.0, 0.0)),
         ] {
             let session = hopper_session(&[mount], true);
             let craft = session_craft(&session);
-            let chute = session
-                .iter()
-                .find(|(_, n)| n.built().part_id.as_str() == "csp.chute.s125")
-                .unwrap()
-                .0;
+            let chute = session_chutes(&session)[0];
             let mut body = csp_phys::weld(&craft.graph, &craft.parts).unwrap();
             refresh_decel_sites(&mut body, &craft, &BTreeMap::new());
             let site = &body.decel[0];
             assert_eq!(site.node, chute);
             assert_eq!(site.reef_n, 54_000.0, "{mount:?}");
-            assert_eq!(site.reef_torque_nm, 7_200.0, "{mount:?}");
             assert!(
-                (site.reef_lever - lever).norm() < 1e-12,
+                (site.local_pos - site.axis_pos - off_axis).norm() < 1e-12,
                 "{mount:?}: {:?}",
-                site.reef_lever
+                site.local_pos - site.axis_pos
             );
+            assert_eq!(site.axis_dir, DVec3::Z);
         }
     }
 
@@ -17886,6 +17991,7 @@ mod tests {
     #[test]
     fn stock_hopper_lands_from_a_250_mps_fall_at_1_5_km() {
         let d = hopper_descent(&[ChuteMount::Top], true, 1_500.0, 250.0, 0.0);
+        print_landing(&landing("top chute, 1.5 km / 250 m/s", 6, &d));
         assert_eq!(d.min_nodes, 6, "every node through the latch");
         assert!(d.latched, "the stack must come to rest latched");
         let (alt, speed, open) = d.opening;
@@ -17902,41 +18008,44 @@ mod tests {
         );
     }
 
-    /// M4c, the reproducer: the same 250 m/s fall with the chute
-    /// mounted radially on the pod's hull. The canopy pulls across its
-    /// 0.25 m lever, so the reef caps it at the mount's 8 kN·m torque
-    /// rating — 29 kN of canopy against 54 kN on the top mount — and
-    /// the chute's own joint holds its canopy: it rides 92–100% of that
-    /// rating through the catch, the derate's working point, where the
-    /// unreefed 54 kN put 3.8× the rating through it and tore the
-    /// canister off on the first canopy tick. The pod comes down under
-    /// it and latches with both nodes.
+    /// §3.1 rule A on the craft a lone chute is all of: a pod with one
+    /// radial chute, dry, falling at 250 m/s at 1.5 km, lands and
+    /// latches with both nodes, hanging within 3.2° of the flow. The canopy's
+    /// pull is taken on the pod's axis, through its centre, so nothing
+    /// of it levers the canister's mount, and the chute's own joint
+    /// reads only the canister — its packed drag across its 0.25 m lever
+    /// — under half of every rating at the catch. Before rule A the
+    /// mount took the pull through that lever and rode 92–100% of its
+    /// torque rating at the catch. A canopy taken through the CoM is no
+    /// pendulum: the steadying couple is what rights the pod.
     #[test]
-    fn radial_chute_holds_its_own_canopy() {
-        let d = hopper_descent(&[SIDE], false, 1_500.0, 250.0, 0.0);
-        assert_eq!(d.min_nodes, 2, "pod and chute through the latch");
-        assert!(d.latched, "the pod must come to rest latched");
-        let (_, _, open) = d.opening;
-        let chute = open.iter().find(|(n, _)| n.0 == 1).unwrap().1;
+    fn a_pod_alone_lands_under_a_radial_chute() {
+        let session = hopper_session(&[SIDE], false);
+        let chute = session_chutes(&session)[0];
+        let d = fly_descent(session_craft(&session), &[chute], 1_500.0, 250.0, 0.0);
+        let mount = share_of(&d.opening.2, chute);
+        let l = landing("pod alone, radial chute, 1.5 km / 250 m/s", 2, &d);
+        print_landing(&l);
+        assert_landed(&l);
+        assert_hangs(&l);
         assert!(
-            chute[2] > 0.9 && chute[2] <= 1.0,
-            "the chute's joint rides its torque rating: {open:?}"
+            mount.iter().all(|share| *share < 0.6),
+            "the chute's own joint at the catch: {mount:?}"
         );
-        assert!(chute[0] <= 0.6 && chute[1] <= 0.6, "{open:?}");
-        assert!(worst_share(&d.touchdown.1) <= 0.6, "{:?}", d.touchdown.1);
     }
 
-    /// M4c, the pull-path reef itself: what the Stock Hopper's site may
-    /// pull before any joint but the chute's own mount is past the
-    /// derate. A top-mounted canopy on an upright stack loads the
-    /// inline joints axially and turns nothing: its budget is far past
-    /// anything the mount's reef lets through. The same canister on the
-    /// pod's side is a pitch moment on every joint below it, and at
-    /// 250 m/s the budget is 9 kN — under the packed term's own drag
-    /// (12 kN), which was breaking the stack before the canopy ever
-    /// opened. A pod alone has nothing beside the mount to bound.
+    /// M4c, the budgets themselves: what the Stock Hopper's canister may
+    /// drag with before any joint but its own mount is past the derate.
+    /// A top-mounted canister on an upright stack loads the inline
+    /// joints axially and turns nothing: its budget is far past anything
+    /// the mount's reef lets through. The same canister on the pod's
+    /// side is a pitch moment on every joint below it, and at 250 m/s
+    /// the budget is 9 kN — under its own packed drag (12 kN), which
+    /// was breaking the stack before the canopy ever opened. A pod alone
+    /// has nothing beside the mount to bound. The canopy's budget is
+    /// unbounded for the tick this reads: not one has caught yet.
     #[test]
-    fn chute_pull_budget_bounds_the_site_by_the_stack_it_acts_on() {
+    fn chute_budget_bounds_each_term_by_what_the_stack_takes_of_it() {
         for (mount, stack) in [(ChuteMount::Top, true), (SIDE, true), (SIDE, false)] {
             let session = hopper_session(&[mount], stack);
             let chute = session_chutes(&session)[0];
@@ -17944,96 +18053,69 @@ mod tests {
             // The spawn's re-weld leaves the sites to the next tick.
             w.step_frame(w.clock().ticks() + 1).unwrap();
             let body = w.vessels()[&VesselId(0)].body().unwrap();
-            let budget = body.decel[0].pull_budget_n;
+            let site = &body.decel[0];
             match (mount, stack) {
                 (ChuteMount::Top, true) => assert!(
-                    budget > 100_000.0,
-                    "an axial canopy leaves the stack's joints their room: {budget}"
+                    site.packed_budget_n > 100_000.0,
+                    "an axial canister leaves the stack's joints their room: {}",
+                    site.packed_budget_n
                 ),
                 (SIDE, true) => assert!(
-                    (8_000.0..10_000.0).contains(&budget),
-                    "a side canister on the stack at 250 m/s: {budget}"
+                    (8_000.0..10_000.0).contains(&site.packed_budget_n),
+                    "a side canister on the stack at 250 m/s: {}",
+                    site.packed_budget_n
                 ),
                 _ => assert_eq!(
-                    budget,
+                    site.packed_budget_n,
                     f64::INFINITY,
-                    "nothing beside the mount feels the pull"
+                    "nothing beside the mount feels the canister"
                 ),
             }
+            assert_eq!(site.canopy_budget_n, f64::INFINITY, "{mount:?}");
         }
     }
 
-    /// M4c, the pull-path reef on the craft a player builds: the Stock
-    /// Hopper with its chute mounted radially on the pod — the side-mount
-    /// canister's own convention — dry, falling at 250 m/s at 1.5 km,
-    /// the chute armed. Before the reef read every joint the stack came
-    /// apart on the spawn tick, chute still packed: the canister's own
-    /// 12 kN of drag 0.9 m off the axis is 105% of the pod-to-canister
-    /// joint's 10 kN·m and 113% of the canister-to-battery joint's
-    /// 8 kN·m, and the canopy on top of it tore the rest off. Reefed to
-    /// what the stack takes, every node holds through the swing the
-    /// off-axis pull puts it through (a 50° swing at its widest) and
-    /// down to the ground: the craft is whole until the tick the ground
-    /// first moves it, two ticks' travel above the surface. The tightest
-    /// joint rides the derate — the budget is what it says, not a cap
-    /// of zero. A lone off-axis chute reefed to 9–16 kN cannot slow
-    /// 2.1 t from 250 m/s inside 1.5 km: the stack arrives at 149 m/s,
-    /// more than twice the 64 m/s the crush distance absorbs, and it
-    /// comes apart on impact.
+    /// §3.1 rule A: a chute on any mount lands the craft. The Stock
+    /// Hopper with one radial chute on the pod and no top chute — the
+    /// side canister's own convention — lands as it does under its top
+    /// chute: from 1.5 km at 250 m/s and from a 70 km apogee, every node
+    /// through the latch, hanging within half a degree of the flow. Before
+    /// rule A the canopy pulled at its mount, and the reef, holding what that
+    /// lever did to the joints below, starved it to 9–16 kN: the stack
+    /// held together and arrived at 149 m/s. With the top chute present
+    /// and never deployed the radial one lands it the same way.
     #[test]
-    fn radial_chute_on_the_full_stack_holds_to_touchdown() {
-        let session = hopper_session(&[SIDE], true);
-        let d = fly_descent(
+    fn a_lone_radial_chute_lands_the_stock_craft() {
+        let mut rows = vec![
+            landing(
+                "radial chute alone, 1.5 km / 250 m/s",
+                6,
+                &hopper_descent(&[SIDE], true, 1_500.0, 250.0, 0.0),
+            ),
+            landing(
+                "radial chute alone, 70 km apogee",
+                6,
+                &hopper_descent(&[SIDE], true, 70_000.0, 0.0, 0.0),
+            ),
+        ];
+        let session = hopper_session(&[ChuteMount::Top, SIDE], true);
+        let armed = fly_descent(
             session_craft(&session),
-            &session_chutes(&session),
-            1_500.0,
-            250.0,
+            &[side_chute(&session)],
+            70_000.0,
+            0.0,
             0.0,
         );
-        let peaks = peaks_by_part(&session, &d.peak);
-        let loss = d.first_loss.expect("the stack must meet the ground");
-        println!(
-            "side chute, full stack, 1.5 km / 250 m/s: peaks while whole, axial/shear/torque in % — {peaks}; first node lost at {:.1} m/s, {:.2} m above the surface; {} nodes after, latched: {}",
-            loss.speed_mps, loss.clearance_m, d.end_nodes, d.latched
-        );
-        // Whole from deployment to touchdown: the first node goes on
-        // the tick the ground first moves the craft — within the
-        // solver's reach, a tick's travel past the step it brakes — not
-        // before it.
-        assert_eq!(
-            d.peak.len(),
-            5,
-            "every joint read while whole: {:?}",
-            d.peak
-        );
-        assert!(
-            loss.ground,
-            "a node was lost in the air at {:.1} m/s, {:.2} m up",
-            loss.speed_mps, loss.clearance_m
-        );
-        assert!(
-            loss.clearance_m <= 2.0 * loss.speed_mps * csp_phys::PHYSICS_DT,
-            "lost a node {:.2} m above the surface at {:.1} m/s",
-            loss.clearance_m,
-            loss.speed_mps
-        );
-        // The reef's working point: the pull rides the tightest joint
-        // near the derate without crossing it.
-        let worst = worst_share(&d.peak);
-        assert!((0.85..1.0).contains(&worst), "{peaks}");
-        // A lone off-axis chute cannot slow the stack: the arrival
-        // outruns the crush distance and the stack comes apart.
-        assert!(
-            loss.speed_mps > 64.0,
-            "touchdown at {:.1} m/s",
-            loss.speed_mps
-        );
-        assert!(
-            d.end_nodes < 6,
-            "a {:.1} m/s arrival is the impact it is: {} nodes left",
-            loss.speed_mps,
-            d.end_nodes
-        );
+        rows.push(landing(
+            "radial chute beside a top chute that never deploys, 70 km apogee",
+            7,
+            &armed,
+        ));
+        for l in &rows {
+            print_landing(l);
+            assert_landed(l);
+            assert_hangs(l);
+        }
     }
 
     /// A catch needs altitude: the same stack from 1.2 km at 250 m/s is
@@ -18143,6 +18225,7 @@ mod tests {
     #[test]
     fn stock_hopper_lands_from_4_km() {
         let d = hopper_descent(&[ChuteMount::Top], true, 4_000.0, 250.0, 0.0);
+        print_landing(&landing("top chute, 4 km / 250 m/s", 6, &d));
         assert_eq!(d.min_nodes, 6);
         assert!(d.latched, "the stack must come to rest latched");
         assert!(worst_share(&d.opening.2) <= 0.6, "{:?}", d.opening);
@@ -18155,11 +18238,11 @@ mod tests {
     /// armed. The canopy catches at the 16 km gate at 886 m/s, the
     /// stack keeps six nodes through a 7 m/s touchdown and the latch,
     /// and every inline joint stays at or below 60% of its limit at the
-    /// catch and at touchdown — the weakest at the catch is the chute's
-    /// own mount, at touchdown the battery's.
+    /// catch and at touchdown.
     #[test]
     fn stock_hopper_returns_from_a_space_apogee_under_its_chute() {
         let d = hopper_descent(&[ChuteMount::Top], true, 70_000.0, 0.0, 0.0);
+        print_landing(&landing("top chute, 70 km apogee", 6, &d));
         assert_eq!(d.min_nodes, 6, "six nodes through the latch");
         assert!(d.latched, "the stack must come to rest latched");
         let (alt, speed, open) = d.opening;
@@ -18176,135 +18259,45 @@ mod tests {
         );
     }
 
-    /// M4c, several chutes: the pull-path reef budgets the sites
-    /// TOGETHER. Two radial chutes — the pod's `+x` and `-y` hull — on
-    /// the stock stack, dropped from 12 km. Budgeted one site at a
-    /// time, each took what the stack takes from ONE off-axis canister
-    /// and the two turns met on the battery joint: 99.9% of its torque
-    /// rating (the canister's 96.8%) 3.5 s after the catch, and the
-    /// lower stack broke off the pod. On one scale over their own
-    /// budgets every node holds — through the opening (31% at its
-    /// worst) and the whole descent, the reef's working point where it
-    /// is for one chute, the battery joint's torque at 94% — until the
-    /// ground: two reefed side canisters still cannot land 2.1 t, and
-    /// the stack arrives at 54 m/s and comes apart on impact.
+    /// §3.1 rule A, several chutes: two radial chutes on perpendicular
+    /// hulls of the pod land the Stock Hopper — from 1.5 km at 250 m/s,
+    /// canisters packed until the catch, and from a 12 km drop. Each
+    /// canopy pulls on the axis, and each canister's own drag is
+    /// budgeted where it acts: one side canister's is 9 kN at 250 m/s,
+    /// under its own 12 kN, and the terms are budgeted together. Before
+    /// rule A the reef capped the canisters' whole drag there: the stack
+    /// held to the ground and arrived at 125 and 56 m/s.
     #[test]
-    fn two_radial_chutes_hold_the_stack_through_the_catch() {
-        let (session, d) = hopper_flight(
-            &[SIDE, ChuteMount::Side(-DVec3::Y)],
-            true,
-            12_000.0,
-            0.0,
-            0.0,
-        );
-        let peaks = peaks_by_part(&session, &d.peak);
-        let (caught_at, caught_speed, open) = d.opening;
-        println!(
-            "two radial chutes, 12 km: caught at {caught_at:.0} m, {caught_speed:.2} m/s; opening {} | peaks while whole {peaks} | first loss {:?} | {} nodes at the end",
-            peaks_by_part(&session, &open),
-            d.first_loss,
-            d.end_nodes
-        );
-        // Whole from the catch to the ground: every joint read while
-        // whole, the reef riding the tightest one near the derate.
-        assert_eq!(
-            d.peak.len(),
-            6,
-            "every joint read while whole: {:?}",
-            d.peak
-        );
-        assert!(worst_share(&open) <= 0.4, "at the catch: {open:?}");
-        assert!(
-            (0.85..1.0).contains(&worst_share(&d.peak)),
-            "peaks while whole: {peaks}"
-        );
-        let battery = share_of(&d.peak, session_part(&session, "csp.battery.z1k"));
-        assert!(
-            (0.85..1.0).contains(&battery[2]),
-            "the battery joint rides its torque rating: {peaks}"
-        );
-        // The first node goes on the ground, not before it.
-        let loss = d.first_loss.expect("the stack must meet the ground");
-        assert!(
-            loss.ground,
-            "a node was lost in the air at {:.1} m/s, {:.2} m up",
-            loss.speed_mps, loss.clearance_m
-        );
-        assert!(
-            loss.clearance_m <= 2.0 * loss.speed_mps * csp_phys::PHYSICS_DT,
-            "lost a node {:.2} m above the surface at {:.1} m/s",
-            loss.clearance_m,
-            loss.speed_mps
-        );
-        assert!(
-            loss.speed_mps > 40.0,
-            "touchdown at {:.1} m/s",
-            loss.speed_mps
-        );
-        assert!(
-            d.end_nodes < 7,
-            "a {:.1} m/s arrival is the impact it is: {} nodes left",
-            loss.speed_mps,
-            d.end_nodes
-        );
+    fn two_radial_chutes_land_the_stock_craft() {
+        let mounts = [SIDE, ChuteMount::Side(DVec3::Y)];
+        for (label, alt_m, speed) in [
+            ("1.5 km / 250 m/s", 1_500.0, 250.0),
+            ("12 km", 12_000.0, 0.0),
+        ] {
+            let d = hopper_descent(&mounts, true, alt_m, speed, 0.0);
+            let l = landing(&format!("two radial chutes, {label}"), 7, &d);
+            print_landing(&l);
+            assert_landed(&l);
+            assert_hangs(&l);
+        }
     }
 
-    /// M4c, several chutes, the spawn: two radial chutes on the stock
-    /// stack falling at 250 m/s at 1.5 km, canisters still packed. The
-    /// packed canister's own drag is 12 kN, past the 9 kN the stack
-    /// takes from one, so the reef is all that holds the spawn tick —
-    /// and read one site at a time it let both pull: the stack went
-    /// from 7 to 3 nodes on the spawn tick, 1.5 km up. Together each
-    /// gets what leaves the battery joint its room with both pulling:
-    /// every node holds from the spawn through the catch — that joint's
-    /// torque peaking at 93% — down to the ground, which the stack
-    /// meets at 125 m/s. Two reefed side canisters cannot slow 2.1 t
-    /// from 250 m/s inside 1.5 km: it comes apart on impact.
+    /// §3.1 rule A: three chutes — the top one and two radial — land the
+    /// Stock Hopper from 1.5 km at 250 m/s, eight nodes through the
+    /// latch.
     #[test]
-    fn two_radial_chutes_hold_the_stack_from_the_spawn() {
-        let (session, d) = hopper_flight(
-            &[SIDE, ChuteMount::Side(DVec3::Y)],
+    fn three_chutes_land_the_stock_craft() {
+        let d = hopper_descent(
+            &[ChuteMount::Top, SIDE, ChuteMount::Side(DVec3::Y)],
             true,
             1_500.0,
             250.0,
             0.0,
         );
-        let peaks = peaks_by_part(&session, &d.peak);
-        println!(
-            "two radial chutes, 1.5 km / 250 m/s: peaks while whole {peaks} | first loss {:?} | {} nodes at the end",
-            d.first_loss, d.end_nodes
-        );
-        assert_eq!(
-            d.peak.len(),
-            6,
-            "every joint read while whole: {:?}",
-            d.peak
-        );
-        assert!(worst_share(&d.peak) < 1.0, "peaks while whole: {peaks}");
-        let battery = share_of(&d.peak, session_part(&session, "csp.battery.z1k"));
-        assert!(
-            (0.85..1.0).contains(&battery[2]),
-            "the battery joint rides its torque rating: {peaks}"
-        );
-        // Whole from the spawn tick: the first node goes at the ground.
-        let loss = d.first_loss.expect("the stack must meet the ground");
-        assert!(
-            loss.clearance_m <= 2.0 * loss.speed_mps * csp_phys::PHYSICS_DT,
-            "lost a node {:.2} m above the surface at {:.1} m/s",
-            loss.clearance_m,
-            loss.speed_mps
-        );
-        assert!(
-            loss.speed_mps > 64.0,
-            "touchdown at {:.1} m/s",
-            loss.speed_mps
-        );
-        assert!(
-            d.end_nodes < 7,
-            "a {:.1} m/s arrival is the impact it is: {} nodes left",
-            loss.speed_mps,
-            d.end_nodes
-        );
+        let l = landing("three chutes, 1.5 km / 250 m/s", 8, &d);
+        print_landing(&l);
+        assert_landed(&l);
+        assert_hangs(&l);
     }
 
     /// M4c, several chutes, the landing: the Stock Hopper with its top
@@ -18350,224 +18343,39 @@ mod tests {
             )
     }
 
-    /// A copy of `pre` whose sites carry `budgets`, in order.
-    fn budgeted(pre: &csp_phys::WeldedBody, budgets: &[f64]) -> csp_phys::WeldedBody {
-        let mut probe = pre.clone();
-        for (site, budget) in probe.decel.iter_mut().zip(budgets) {
-            site.pull_budget_n = *budget;
-        }
-        probe
-    }
-
-    /// The reef reads its budgets back the way the evaluation will, on
-    /// the defect's own flight: the Stock Hopper with its top chute and
-    /// one radial canopy, from a 20 km apogee. The ten seconds after the
-    /// catch are the ticks that broke the stack — the model's budgets
-    /// read over the battery joint's rating where the model said 90%,
-    /// and the lower stack went 1.2 s in. Tick by tick, both readings
-    /// are taken of the craft as it stands: the model's budget read
-    /// 104.0% of the battery joint's torque rating on its worst tick
-    /// (tick 567 after the catch, 53.6 and 5.6 kN for the two canopies),
-    /// the reef's final budget never past 90.0%, and never above the
-    /// model's — the read-back only cuts.
+    /// §3.1 rule A from altitude: the Stock Hopper with its top chute
+    /// and one radial chute beside it, both deployed, falls from rest at
+    /// 20, 50, 60 and 70 km and lands from every one — seven nodes
+    /// through the latch, hanging square to the flow. The canister's own
+    /// drag leans the stack into the 16 km gate, and a catch on a
+    /// leaning craft is what the canopy's budget is for: taken on the
+    /// axis, the canopy rights the stack at the turn the joints below
+    /// can carry. Before rule A the radial canopy pulled at its mount:
+    /// the pair swung under the reef's derate all the way down and came
+    /// apart as it met the ground.
     #[test]
-    fn the_reef_reads_its_budgets_back_the_way_the_evaluation_will() {
-        let session = hopper_session(&[ChuteMount::Top, SIDE], true);
-        let mut w = spawn_descent(
-            session_craft(&session),
-            &session_chutes(&session),
-            20_000.0,
-            0.0,
-            0.0,
-        );
-        let vid = VesselId(0);
-        // The least scale each reading gave: its worst tick of the ten
-        // seconds — and where the model's was, with what was pulling.
-        let (mut model_worst, mut reef_worst) = (1.0_f64, 1.0_f64);
-        let mut model_worst_at = None;
-        let mut caught_ticks = 0_u64;
-        while caught_ticks < 64 * 10 {
-            let Some(v) = w.vessels().get(&vid) else {
-                break;
-            };
-            let VesselState::InBubble(body) = &v.state else {
-                break;
-            };
-            let (pre, craft) = (body.clone(), v.craft.clone().unwrap());
-            if pre.decel.iter().any(|s| s.open_at_s.is_some()) {
-                caught_ticks += 1;
-                let physics = w.physics.as_ref().unwrap();
-                // The reef of the tick about to run, under its own stamp.
-                physics.backend.set_sim_time(w.clock());
-                let transforms =
-                    csp_phys::weld::body_transforms(&craft.graph, &craft.parts).unwrap();
-                let model = pull_first_pass(&physics.backend, &pre, &craft, &transforms)
-                    .unwrap()
-                    .expect("the canopies are in the flow");
-                let mut reefed = pre.clone();
-                reef_pull_budgets(&physics.backend, &mut reefed, &craft).unwrap();
-                let reef: Vec<f64> = reefed.decel.iter().map(|s| s.pull_budget_n).collect();
-                let model_scale = pull_readback(
-                    &physics.backend,
-                    &budgeted(&pre, &model),
-                    &craft,
-                    &transforms,
-                )
-                .unwrap();
-                let reef_scale =
-                    pull_readback(&physics.backend, &reefed, &craft, &transforms).unwrap();
-                if model_scale < model_worst {
-                    model_worst = model_scale;
-                    let pulls = physics.backend.decel_pulls(&budgeted(&pre, &model));
-                    model_worst_at = Some((
-                        caught_ticks,
-                        pre.ang_vel.norm(),
-                        model.clone(),
-                        pulls,
-                        reef.clone(),
-                        reef_scale,
-                    ));
-                }
-                reef_worst = reef_worst.min(reef_scale);
-                for (cut, budget) in reef.iter().zip(&model) {
-                    assert!(
-                        cut <= budget,
-                        "the read-back only cuts: {cut} over {budget}"
-                    );
-                }
-            }
-            w.step_frame(w.clock().ticks() + 1).unwrap();
-        }
-        assert!(
-            caught_ticks >= 64 * 10,
-            "the canopy must catch with ten seconds of flight to read: {caught_ticks} ticks"
-        );
-        assert_eq!(
-            w.vessels()[&vid].craft.as_ref().unwrap().graph.nodes.len(),
-            7,
-            "seven nodes through the ticks that broke the stack"
-        );
-        let (tick, spin, model, pulls, reef, reef_scale) = model_worst_at.unwrap();
-        let model_reading = DECEL_REEF_MARGIN / model_worst;
-        println!(
-            "read-back, top + radial chute from 20 km: the model's worst tick of the ten seconds after the catch is tick {tick} (spinning {spin:.3} rad/s): its budgets {:.1}/{:.1} kN, the sites pulling {:.1}/{:.1} kN, read {:.1}% of a joint's limit; the reef's {:.1}/{:.1} kN read {:.1}% | the reef's worst tick of the ten seconds reads {:.1}%",
-            model[0] / 1_000.0,
-            model[1] / 1_000.0,
-            pulls[0] / 1_000.0,
-            pulls[1] / 1_000.0,
-            model_reading * 100.0,
-            reef[0] / 1_000.0,
-            reef[1] / 1_000.0,
-            (DECEL_REEF_MARGIN / reef_scale) * 100.0,
-            (DECEL_REEF_MARGIN / reef_worst) * 100.0
-        );
-        assert!(
-            model_worst <= DECEL_REEF_MARGIN / 0.97,
-            "the model's budgets must read over 97% of a joint somewhere in the ten seconds: {}",
-            model_reading * 100.0
-        );
-        assert!(
-            reef_worst >= DECEL_REEF_MARGIN / 0.92,
-            "read back, the reef's budgets read {}% of a joint at their worst",
-            (DECEL_REEF_MARGIN / reef_worst) * 100.0
-        );
-    }
-
-    /// One apogee flight's verdict, printed as it is checked. The craft
-    /// held through the catch and the whole descent: no node went on a
-    /// tick before the ground moved it, and the reef rode the battery
-    /// joint at the derate all the way down. What became of it at the
-    /// ground is the touchdown's own story — printed, not asserted.
-    fn assert_held_to_the_ground(
-        craft: &str,
-        session: &csp_phys::CraftSession,
-        alt_m: f64,
-        d: &Descent,
-    ) {
-        let (caught, caught_speed, _) = d.opening;
-        let (spin, tilt) = d.arrival.expect("the stack must reach the ground");
-        let (nodes_at_ground, ground) = d
-            .first_ground
-            .as_ref()
-            .expect("the stack must reach the ground");
-        let loss = d.first_loss.as_ref().map_or("never".to_string(), |l| {
-            format!(
-                "{} at {:.1} m/s, {:.2} m above the surface",
-                if l.ground {
-                    "at the ground"
-                } else {
-                    "IN THE AIR"
-                },
-                l.speed_mps,
-                l.clearance_m
-            )
-        });
-        println!(
-            "{craft} from {alt_m} m: caught at {caught:.0} m, {caught_speed:.1} m/s | in the air {} | met the ground at {:.2} m/s spinning at {:.2} rad/s, {:.0} deg off the vertical: {nodes_at_ground} nodes after that tick {} | first node lost {loss} | {} nodes at the end, latched {}",
-            peaks_by_part(session, &d.air_peak),
-            d.touchdown.0,
-            spin,
-            tilt,
-            peaks_by_part(session, ground),
-            d.end_nodes,
-            d.latched
-        );
-        assert!(
-            !d.lost_in_air,
-            "{craft} from {alt_m} m: a node was lost before the ground moved the craft"
-        );
-        let air = peaks_by_part(session, &d.air_peak);
-        assert!(
-            (0.85..0.95).contains(&worst_share(&d.air_peak)),
-            "{craft} from {alt_m} m: the reef's working point in the air: {air}"
-        );
-    }
-
-    /// The defect's flights. The Stock Hopper, dry, with its top chute
-    /// and one radial chute on the pod, both deployed, falls from rest
-    /// at 20, 50, 60 and 70 km. A radial canister hangs the stack some
-    /// 7 to 9 degrees off the flow on the way down (the top-only Hopper
-    /// hangs within one), so the top canopy catches it off-axis at the
-    /// 16 km gate, at 257 to 812 m/s, and it swings under the pair from
-    /// the first tick — an orbit of the vertical that nothing damps on
-    /// the way down. Read by its model alone the reef held the
-    /// battery joint at 90% while the evaluation read 91% rising
-    /// through 100%, and the lower stack broke off 1.2 to 3.2 s after
-    /// the catch from every one of the four (3.2 s from 70 km, at
-    /// 13,577 m and 721.6 m/s). Read back, all seven nodes hold to the
-    /// ground from all four: in the air the battery joint never passes
-    /// 90.3% of its torque rating.
-    ///
-    /// The touchdown is another matter, printed and not asserted: the
-    /// stack arrives at 5.0 to 5.4 m/s, 6 to 22 degrees off the vertical
-    /// and still turning at 0.6 to 1.6 rad/s, and comes apart as it
-    /// meets the ground or tips over onto it — the pod and both
-    /// canisters left latched in every flight.
-    #[test]
-    fn top_and_radial_chutes_hold_the_stack_from_every_apogee() {
+    fn top_and_radial_chutes_land_the_stock_craft_from_every_apogee() {
         for alt_m in [20_000.0, 50_000.0, 60_000.0, 70_000.0] {
-            let (session, d) = hopper_flight(&[ChuteMount::Top, SIDE], true, alt_m, 0.0, 0.0);
-            assert_held_to_the_ground("top + radial chute, both deployed", &session, alt_m, &d);
+            let (_, d) = hopper_flight(&[ChuteMount::Top, SIDE], true, alt_m, 0.0, 0.0);
+            let l = landing(
+                &format!("top + radial chute, both deployed, from {alt_m} m"),
+                7,
+                &d,
+            );
+            print_landing(&l);
+            assert_landed(&l);
+            assert_hangs(&l);
         }
     }
 
-    /// The defect's flights with the radial canister never deployed:
-    /// the same craft, only the top chute armed, from 20, 50, 60 and
-    /// 70 km. A packed canister's own drag tilts the hang the same way,
-    /// the stack swung the same way, and the lower stack broke
-    /// off 1.2 to 7.3 s after the catch (7.3 s from 70 km, at 10,861 m
-    /// and 598.7 m/s). Read back, all seven nodes hold to the ground
-    /// from all four: in the air the battery joint never passes 90.6%
-    /// of its torque rating.
-    ///
-    /// At the ground (printed, not asserted) it arrives at 7.0 to
-    /// 11.0 m/s — at 46.7 m/s from 70 km, where the reef, holding the
-    /// swinging joint at its derate, starved the canopy through the
-    /// last 700 m — 17 to 41 degrees off the vertical and turning at
-    /// 0.7 to 3.8 rad/s, and comes apart on the ground: two to four
-    /// nodes left latched.
+    /// The same four apogees with the radial canister never deployed:
+    /// only the top chute armed. A packed canister's own drag still
+    /// leans the stack into the catch — the same budget holds it, and
+    /// the craft lands from every one. Before rule A this flight arrived
+    /// at 46.7 m/s from 70 km, the reef starving the canopy to hold the
+    /// swinging joints at their derate, and came apart on the ground.
     #[test]
-    fn top_chute_beside_a_packed_radial_canister_holds_the_stack_from_every_apogee() {
+    fn a_packed_radial_canister_beside_the_top_chute_lands_from_every_apogee() {
         for alt_m in [20_000.0, 50_000.0, 60_000.0, 70_000.0] {
             let session = hopper_session(&[ChuteMount::Top, SIDE], true);
             let d = fly_descent(
@@ -18577,26 +18385,43 @@ mod tests {
                 0.0,
                 0.0,
             );
-            assert_held_to_the_ground("top chute, radial canister packed", &session, alt_m, &d);
+            let l = landing(
+                &format!("top chute, radial canister packed, from {alt_m} m"),
+                7,
+                &d,
+            );
+            print_landing(&l);
+            assert_landed(&l);
+            assert_hangs(&l);
         }
     }
 
+    /// The radial chute of a session that also carries the top one.
+    fn side_chute(session: &csp_phys::CraftSession) -> csp_phys::PartNodeId {
+        session
+            .iter()
+            .find(|(_, n)| {
+                n.built().part_id.as_str() == "csp.chute.s125"
+                    && n.edge().is_some_and(|e| e.parent_node != "top")
+            })
+            .map_or_else(|| panic!("no radial chute on the pod"), |(id, _)| id)
+    }
     /// M4c, the touchdown on a slope: the absorbed stop acts through the
     /// CoM. The Stock Hopper lands at 7 m/s, upright, on three sites of
     /// the authored Terrin terrain — the pad (0.30°) and two slopes of
     /// its relief (1.47°, 4.42°). On a slope the stack stands tilted to
     /// the surface, so the friction across the contact is a sideways
     /// stop; read at the body origin it turned every inline joint with
-    /// the whole craft's stop about the CoM's height — 36% of the
-    /// battery joint's torque rating on the pad, 114% at 1.47° and 122%
-    /// at 4.42°, three nodes gone on the touchdown tick of every site
-    /// sloped 1.47° or more. Through the CoM each joint carries what
-    /// hangs off it: 6% on the pad, 20% and 22% on the slopes (24% and
-    /// 25% the worst joint), six nodes after the touchdown tick on all
-    /// three, and the pad's flight latches whole. What follows the
-    /// touchdown is the stack's own: on the two slopes it tips over
-    /// after it and the pod end meets the ground about 4 s and 3 s
-    /// later — a fall, not the landing.
+    /// the whole craft's stop about the CoM's height — 114% of the
+    /// battery joint's torque rating at 1.47°, three nodes gone on the
+    /// touchdown tick. Through the CoM six nodes come through the
+    /// touchdown tick on all three, no joint past 10% of a limit (the
+    /// battery's torque at 2.4%, 8.6% and 0.2%), and the pad's flight
+    /// latches whole. What follows the touchdown is the stack's own: the
+    /// Hopper is a tall stack on a narrow bell, and on both slopes it
+    /// tips over after it — the fall is what breaks it, two nodes left
+    /// latched — where at rule A's reading it lost those nodes as it
+    /// met the ground, swinging under its canopy.
     #[test]
     fn the_stock_hopper_keeps_its_nodes_through_touchdown_on_a_slope() {
         // The pad, then two slopes of the authored relief.
@@ -18607,15 +18432,15 @@ mod tests {
         ] {
             let (session, measured, d) = hopper_site_flight(lat, lon, 1_500.0, 250.0);
             let battery_id = session_part(&session, "csp.battery.z1k");
+            let l = landing(&format!("top chute, slope {slope}°"), 6, &d);
             let (nodes, shares) = d
                 .first_ground
                 .unwrap_or_else(|| panic!("slope {slope}°: the stack never met the ground"));
             let battery = share_of(&shares, battery_id);
+            print_landing(&l);
             println!(
-                "slope {slope}°: touchdown at {:.2} m/s, {nodes} nodes after the tick, {} | battery torque {:.0}% | {} nodes at the end, latched {}",
-                d.touchdown.0,
+                "  {nodes} nodes after the touchdown tick {}; {} nodes at the end, latched {}",
                 peaks_by_part(&session, &shares),
-                battery[2] * 100.0,
                 d.end_nodes,
                 d.latched
             );
@@ -18631,12 +18456,12 @@ mod tests {
                 worst_share(&shares) <= 0.3,
                 "slope {slope}° at touchdown: {shares:?}"
             );
+            assert!(
+                battery[2] < 0.15,
+                "slope {slope}°: the battery joint's torque at touchdown: {}",
+                battery[2]
+            );
             if slope < 0.5 {
-                assert!(
-                    (0.04..0.08).contains(&battery[2]),
-                    "the pad's battery joint at touchdown: {}",
-                    battery[2]
-                );
                 assert_eq!(d.min_nodes, 6, "the pad: every node through the latch");
                 assert!(d.latched, "the pad: the stack must come to rest latched");
             }

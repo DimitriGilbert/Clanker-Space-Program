@@ -524,6 +524,10 @@ impl HostCore {
             .map_err(|e| BackendError::Session(format!("load {name}: {e}")))?;
         let save = csp_sim::save::decode_save(&bytes)
             .map_err(|e| BackendError::Session(format!("decode {name}: {e}")))?;
+        // The canopy steering is construction config neither the save
+        // nor `self.config` carries (`SimpleBackend`'s, not the
+        // `Environment`'s): the world being replaced hands it on.
+        let canopy_steering = self.world.canopy_steering();
         let mut world = World::restore(
             PatchedConics::new(self.config.orbits.clone()),
             self.config.physics.clone(),
@@ -536,6 +540,9 @@ impl HostCore {
         // postcondition: any channel live state still lacks is a
         // silent-divergence risk, surfaced as a warning.
         world.install_config(&self.config);
+        if let Some(steering) = canopy_steering {
+            world.set_canopy_steering(steering);
+        }
         if let Some(f) = self.reconfigure.as_ref() {
             f(&mut world);
         }

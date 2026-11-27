@@ -1,8 +1,9 @@
 //! The §8.3 `balance.ron` rules: `schema_version` and every numeric
 //! tunable inside the domain its `csp-sim` `*Config::is_valid` mirror
 //! gates at restore, plus the two water tunables `csp-phys`'s `Ocean`
-//! carries into the tick verbatim and the touchdown crush distance its
-//! joint-load evaluation reads.
+//! carries into the tick verbatim, the touchdown crush distance its
+//! joint-load evaluation reads, and the canopy steering its decelerator
+//! force model hangs a craft by.
 
 use crate::resource::ResourceFile;
 
@@ -330,5 +331,12 @@ pub fn validate_balance(
             reason: "> 5 m — the absorption would spread any impact short of 640 m/s over five metres (|Δv|·dt < 2·s at dt = 1/64 s), and nothing would break on touchdown",
         });
     }
+    // §3.1 rule A — a deployed canopy's steadying. Both are magnitudes
+    // that may be authored off (`0` leaves the hang to the pull's own
+    // pendulum, the spin to the air), and neither has a stability
+    // ceiling to gate: `csp-phys` cuts the couple to what the craft's
+    // inertia can follow in a tick (`CANOPY_STEER_RATE_LIMIT_PER_S`).
+    nonneg("canopy_steady_arm_m", b.canopy_steady_arm_m, &mut out);
+    nonneg("canopy_steady_damp_m_s", b.canopy_steady_damp_m_s, &mut out);
     out
 }

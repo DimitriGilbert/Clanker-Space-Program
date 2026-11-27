@@ -286,22 +286,23 @@ click-to-focus, `Tab` cycles focus (`csp-view/src/map.rs`). Two planning windows
 - **Parachute**: the `csp.chute.s125` part (surface-mount). Deploy via **right-click on the
   part → deploy parachute**, the flight **Actions strip**, or — the KSP rule — **SPACE**: a
   chute assigned to a stage fires with it (the Stock Hopper's chute is stage 1) — deployable
-  **only while flying** (in-bubble; `apply_deploy_part`, `csp-sim/src/lib.rs:7211`). The canopy
+  **only while flying** (in-bubble; `apply_deploy_part`, `csp-sim/src/lib.rs`). The canopy
   waits packed until the craft is below **16 km** AND **1200 m/s**
   (`deploy_alt_m`/`deploy_speed_mps` in the part def), so deploy early and let it wait; it is
   reefed to its mount's rating while the craft is fast and lands the dry Stock Hopper at 7 m/s
-  (700 m² of drag area). **Mount it on the stack's top node to land it**: a radial mount's
-  canopy is capped by its mount's torque rating (about half the pull), and its off-axis drag is
-  a pitch moment every joint below has to carry — so the pull-path reef caps a side canister's
-  **whole** drag, packed or open, at what the stack's joints take. On the Stock Hopper that is
-  about 9 kN (the bare canister's own drag at 250 m/s is 12 kN): a side mount no longer breaks
-  the craft, but reefed that low it cannot land it either — from 1.5 km at 250 m/s the stack
-  still arrives at 149 m/s. Several chutes are reefed **together**: each gets its own budget
-  times the one scale that keeps every joint inside its margin with all of them pulling, so
-  two side canisters no longer each take the full budget, and a top chute with a radial one
-  beside it still lands the Hopper. On a lone pod a radial canister holds only to about
-  270 m/s at 1.5 km (280 m/s tears it off): nothing caps its own packed drag there. A catch
-  needs altitude under it — about 1.5 km at 250 m/s, 6 km at 600 m/s; lower and faster than
+  (700 m² of drag area). **A chute on any mount lands the craft**: the canopy's pull is taken
+  on the craft's axis, not at its mount, so a radial canister slows and rights the stack as
+  well as the top one does — one radial chute on the pod brings the Hopper down from 1.5 km
+  at 250 m/s at the top chute's own 7 m/s, and from a 70 km apogee too. (Before, the pull
+  acted at the mount: a side chute held the stack together but could not slow it, and the
+  Hopper arrived at 149 m/s.) What the mount still limits is the canopy itself — reefed to
+  0.9× its weaker force rating, 54 kN for the s125 — and a hot entry still tears the canister
+  off. A canister's own drag, and the turn a canopy gives a craft that leans into its catch,
+  are each held to what the joints below can carry: a side canister does not break a stack by
+  itself, and a leaning catch rights the craft instead of snapping it. Under its canopy the
+  Hopper hangs within about half a degree of the flow and comes in with no spin
+  (`canopy_steady_arm_m`, `canopy_steady_damp_m_s`, `data/balance.ron`). A catch needs
+  altitude under it — about 1.5 km at 250 m/s, 6 km at 600 m/s; lower and faster than
   that it opens too late and the impact breaks the stack.
 - **Touchdown** (M4c landing): the ground stop of a landing is read by the breakup check as if
   spread over 0.5 m of crush (`touchdown_crush_m`, `data/balance.ron`) — a 7 m/s touchdown loads
